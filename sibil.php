@@ -2736,7 +2736,7 @@ function panel_test(array $row): array
 
 const UPDATE_DEFAULT_REPO = 'XuSibiL/SIBILPANEL';
 /* کش فقط برای تیک خودکار/نمایش است؛ هر بررسیِ کاربر همیشه تازه خوانده می‌شود */
-const UPDATE_CACHE_TTL = 300;
+const UPDATE_CACHE_TTL = 1800;   // فقط برای نشان نسخه در پنل مدیریت
 const UPDATE_RAW_CACHE_TTL = 300;
 
 /** مخزن رسمی: مقدار .env وگرنه مخزن پیش‌فرض */
@@ -2871,58 +2871,51 @@ function update_remote_version(bool $force = true): array
     $versionFile = '';
     $contents = '';
     $tags = '';
-    $sources = [];
 
-    /* ۰) Contents API — همان لحظهٔ پوش به‌روز است (بدون کش CDN) */
-    $contents = update_version_contents_api($repo, update_branch());
-    if ($contents !== '') {
-        $sources[] = 'contents-api';
-    }
-
-    /* ۱) ریلیز رسمی */
-    [$body, $status] = update_http_get(update_bust_url(
-        'https://api.github.com/repos/' . $repo . '/releases/latest'));
-    if ($status >= 200 && $status < 300 && $body !== '') {
-        $json = json_decode($body, true);
-        $tag = is_array($json) ? (string) ($json['tag_name'] ?? '') : '';
-        if ($tag !== '') {
-            $release = ltrim($tag, 'vV');
-            $sources[] = 'release';
-        }
-    }
-
-    /* ۲) فایل VERSION همان برنچ — منبع اصلی و بی‌واسطه */
+    /* ۱) فایل VERSION خام — سریع و بدون مصرف سهمیهٔ API گیت‌هاب */
     [$raw, $code] = update_http_get(update_bust_url(
         'https://raw.githubusercontent.com/' . $repo . '/' . update_branch() . '/VERSION'), 10);
     $raw = trim($raw);
     if ($code >= 200 && $code < 300 && preg_match('/^\d+(\.\d+)*$/', $raw)) {
         $versionFile = $raw;
-        $sources[] = 'version-file';
     }
 
-    /* ۳) تگ‌ها — فقط اگر دو منبع بالا جواب ندادند */
-    if ($release === '' && $versionFile === '') {
-        [$tagBody, $tagStatus] = update_http_get(update_bust_url(
-            'https://api.github.com/repos/' . $repo . '/tags?per_page=100'), 10);
-        if ($tagStatus >= 200 && $tagStatus < 300 && $tagBody !== '') {
-            $list = json_decode($tagBody, true);
-            if (is_array($list)) {
-                foreach ($list as $row) {
-                    $tags = update_max_version($tags, (string) ($row['name'] ?? ''));
-                }
+    /* ۲) اگر همین حالا نسخهٔ تازه‌تری دیده شد، کار تمام است (بدون درخواست API).
+       وگرنه ممکن است فایل خام از کش CDN عقب باشد؛ پس API را می‌پرسیم:
+       اول ریلیز (بعد از هر انتشار همان لحظه به‌روز)، بعد Contents API. */
+    if ($versionFile === '' || !update_is_newer($versionFile, PANEL_VERSION)) {
+        [$body, $status] = update_http_get(update_bust_url(
+            'https://api.github.com/repos/' . $repo . '/releases/latest'));
+        if ($status >= 200 && $status < 300 && $body !== '') {
+            $json = json_decode($body, true);
+            $tag = is_array($json) ? (string) ($json['tag_name'] ?? '') : '';
+            if ($tag !== '') {
+                $release = ltrim($tag, 'vV');
             }
-            if ($tags !== '') {
-                $sources[] = 'tags';
+        }
+        if ($release === '' || !update_is_newer($release, PANEL_VERSION)) {
+            $contents = update_version_contents_api($repo, update_branch());
+        }
+        if ($release === '' && $contents === '' && $versionFile === '') {
+            [$tagBody, $tagStatus] = update_http_get(update_bust_url(
+                'https://api.github.com/repos/' . $repo . '/tags?per_page=50'), 10);
+            if ($tagStatus >= 200 && $tagStatus < 300 && $tagBody !== '') {
+                $list = json_decode($tagBody, true);
+                if (is_array($list)) {
+                    foreach ($list as $row) {
+                        $tags = update_max_version($tags, (string) ($row['name'] ?? ''));
+                    }
+                }
             }
         }
     }
 
-    $version = update_max_version($contents, $release, $versionFile, $tags);
+    $version = update_max_version($versionFile, $release, $contents, $tags);
 
     if ($version !== '') {
-        $source = $version === $contents ? 'contents-api'
+        $source = $version === $versionFile ? 'version-file'
             : ($version === $release ? 'release'
-                : ($version === $versionFile ? 'version-file' : 'tags'));
+                : ($version === $contents ? 'contents-api' : 'tags'));
         set_put('update_remote', json_encode(
             ['version' => $version, 'source' => $source, 'at' => time()]));
         return ['version' => $version, 'source' => $source, 'cached' => false];

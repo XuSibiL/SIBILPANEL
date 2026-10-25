@@ -177,37 +177,41 @@ _gh_get() {   # _gh_get URL  → بدنه (با هدر no-cache و پارامت�
         "$url$([[ "$url" == *\?* ]] && printf '&' || printf '?')t=$(date +%s)$RANDOM" 2>/dev/null
 }
 
-# نسخهٔ زندهٔ گیت‌هاب: بالاترین مقدار از Contents API، ریلیز، فایل VERSION و تگ‌ها
+# نسخهٔ زندهٔ گیت‌هاب.
+# ترتیب اقتصادی: اول فایل VERSION خام (بدون سهمیهٔ API)؛ فقط وقتی همان نسخهٔ
+# نصب‌شده را نشان می‌دهد و ممکن است کش‌شده باشد، API گیت‌هاب پرسیده می‌شود.
+# نتیجه: در حالت عادی صفر درخواست API، و بلافاصله بعد از انتشار، یک درخواست.
 remote_version_live() {
-    local repo branch tag raw contents tags taglist v
+    local repo branch tag contents raw taglist v
     repo="$(git_repo)"
     branch="$(git_branch)"
 
-    # ۱) Contents API — همان لحظهٔ پوش به‌روز می‌شود
-    #    (raw.githubusercontent تا ۵ دقیقه `x-cache: HIT` می‌دهد و نسخهٔ کهنه
-    #     را برمی‌گرداند؛ این منبع آن مشکل را دور می‌زند)
-    contents="$(_gh_get "https://api.github.com/repos/$repo/contents/VERSION?ref=$branch" \
-        | sed -n 's/.*"content" *: *"\([^"]*\)".*/\1/p' | head -1 | sed 's/\\n//g')"
-    if [[ -n "$contents" ]]; then
-        contents="$(printf '%s' "$contents" | base64 -d 2>/dev/null | tr -d ' \r\n')"
-    fi
-    [[ "$contents" =~ ^[0-9]+(\.[0-9]+)*$ ]] || contents=""
-
-    # ۲) ریلیز رسمی (اگر منتشر شده باشد)
-    tag="$(_gh_get "https://api.github.com/repos/$repo/releases/latest" \
-        | sed -n 's/.*"tag_name" *: *"\([^"]*\)".*/\1/p' | head -1)"
-
-    # ۳) فایل VERSION خام — سریع، ولی ممکن است چند دقیقه عقب باشد
+    # ۱) فایل VERSION خام (سریع، بدون سهمیه)
     raw="$(_gh_get "https://raw.githubusercontent.com/$repo/$branch/VERSION" | head -1)"
 
+    tag=""
+    contents=""
     taglist=""
-    if [[ -z "$contents" && -z "$tag" && -z "$raw" ]]; then
-        # ۴) آخرین تگ‌ها (اگر هیچ منبع دیگری جواب نداد)
-        taglist="$(_gh_get "https://api.github.com/repos/$repo/tags?per_page=100" \
-            | sed -n 's/.*"name" *: *"\([^"]*\)".*/\1/p' | tr '\n' ' ')"
+    # ۲) فقط اگر خام نسخهٔ تازه‌تری نشان نداد، API را می‌پرسیم
+    #    (ریلیز، بعد Contents API — که برخلاف فایل خام هیچ کش CDN ندارد)
+    if [[ -z "$raw" ]] || ! version_gt "$raw" "$VERSION"; then
+        tag="$(_gh_get "https://api.github.com/repos/$repo/releases/latest" \
+            | sed -n 's/.*"tag_name" *: *"\([^"]*\)".*/\1/p' | head -1)"
+        if [[ -z "$tag" ]] || ! version_gt "${tag#v}" "$VERSION"; then
+            contents="$(_gh_get "https://api.github.com/repos/$repo/contents/VERSION?ref=$branch" \
+                | sed -n 's/.*"content" *: *"\([^"]*\)".*/\1/p' | head -1 | sed 's/\\n//g')"
+            if [[ -n "$contents" ]]; then
+                contents="$(printf '%s' "$contents" | base64 -d 2>/dev/null | tr -d ' \r\n')"
+            fi
+            [[ "$contents" =~ ^[0-9]+(\.[0-9]+)*$ ]] || contents=""
+        fi
+        if [[ -z "$tag" && -z "$contents" && -z "$raw" ]]; then
+            taglist="$(_gh_get "https://api.github.com/repos/$repo/tags?per_page=50" \
+                | sed -n 's/.*"name" *: *"\([^"]*\)".*/\1/p' | tr '\n' ' ')"
+        fi
     fi
 
-    v="$(version_max "$contents" "$tag" "$raw" $taglist)"
+    v="$(version_max "$raw" "$tag" "$contents" $taglist)"
     printf '%s' "$v"
 }
 

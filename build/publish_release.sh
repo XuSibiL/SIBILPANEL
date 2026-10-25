@@ -114,10 +114,17 @@ sha="$(api GET "/repos/$REPO/commits/$BRANCH" | json_get sha)"
 [[ -n "$sha" ]] || die "cannot read the head of branch $BRANCH"
 ok "commit $BRANCH: ${sha:0:8}"
 
-# نسخهٔ همان کامیت باید برابر VERSION محلی باشد، وگرنه ریلیز گمراه‌کننده است
-remoteVersion="$(curl -fsS --max-time 15 -H 'Cache-Control: no-cache' \
-    "https://raw.githubusercontent.com/$REPO/$BRANCH/VERSION?t=$(date +%s)" 2>/dev/null \
-    | tr -d ' \r\n' || true)"
+# نسخهٔ همان کامیت باید برابر VERSION محلی باشد، وگرنه ریلیز گمراه‌کننده است.
+# منبع: Contents API (همان لحظهٔ پوش)، چون raw.githubusercontent تا ۵ دقیقه
+# نسخهٔ کهنه را از کش برمی‌گرداند.
+remoteVersion="$(api GET "/repos/$REPO/contents/VERSION?ref=$BRANCH" 2>/dev/null \
+    | sed -n 's/.*"content" *: *"\([^"]*\)".*/\1/p' | head -1 | sed 's/\\n//g' \
+    | base64 -d 2>/dev/null | tr -d ' \r\n' || true)"
+if [[ -z "$remoteVersion" ]]; then
+    remoteVersion="$(curl -fsS --max-time 15 -H 'Cache-Control: no-cache' \
+        "https://raw.githubusercontent.com/$REPO/$BRANCH/VERSION?t=$(date +%s)" 2>/dev/null \
+        | tr -d ' \r\n' || true)"
+fi
 if [[ -n "$remoteVersion" && "$remoteVersion" != "$VERSION" ]]; then
     die "VERSION on GitHub is $remoteVersion but locally $VERSION — push the commit first"
 fi
