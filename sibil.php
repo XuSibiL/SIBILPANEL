@@ -21,7 +21,7 @@
 
 declare(strict_types=1);
 
-const PANEL_VERSION = '3.16.3';
+const PANEL_VERSION = '3.16.4';
 const IRAN_OFFSET   = 3.5 * 3600;
 const DAY           = 86400;
 
