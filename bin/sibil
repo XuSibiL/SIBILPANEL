@@ -1,0 +1,1116 @@
+#!/usr/bin/env bash
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Panel Service · CLI   (PHP edition)
+#  Terminal control panel: status, update, backup, restore, logs, doctor, ssl
+#
+#  Run:             sibil
+#  Direct:          sibil status | update | restart | start | stop | logs
+#                   sibil backup | restore | domain | config | doctor | deps
+#                   sibil ssl | fix | install | remove | help | version
+# ═══════════════════════════════════════════════════════════════════════════════
+set -uo pipefail
+
+# سازگاری با کلیدهای قدیمی
+# مسیر نصب؛ نصب‌کننده همین خط را با مسیر واقعی جایگزین می‌کند
+PANEL_HOME_DEFAULT="${PANEL_HOME_DEFAULT:-/opt/sibil}"
+export PANEL_HOME="${PANEL_HOME:-${SIBIL_HOME:-$PANEL_HOME_DEFAULT}}"
+export PANEL_BOT_TOKEN="${PANEL_BOT_TOKEN:-${SIBIL_BOT_TOKEN:-}}"
+export PANEL_ADMINS="${PANEL_ADMINS:-${SIBIL_ADMINS:-}}"
+export PANEL_DB="${PANEL_DB:-${SIBIL_DB:-}}"
+export PANEL_WEB_URL="${PANEL_WEB_URL:-${SIBIL_WEB_URL:-}}"
+export PANEL_WEB_PORT="${PANEL_WEB_PORT:-${SIBIL_WEB_PORT:-}}"
+export PANEL_DOMAIN="${PANEL_DOMAIN:-${SIBIL_DOMAIN:-}}"
+export PANEL_PHP_BIN="${PANEL_PHP_BIN:-${SIBIL_PHP_BIN:-}}"
+PANEL="${PANEL_HOME}"
+# نسخه از خودِ ربات خوانده می‌شود؛ هیچ عددی در این اسکریپت هاردکد نیست
+detect_version() {
+    local v=""
+    for f in "$PANEL_HOME/VERSION" "$(dirname "${BASH_SOURCE[0]:-$0}")/VERSION"; do
+        [[ -f "$f" ]] && { v="$(tr -d ' \r\n' <"$f")"; break; }
+    done
+    if [[ -z "$v" && -f "$PANEL_HOME/sibil.php" ]]; then
+        v="$(grep -m1 "const PANEL_VERSION" "$PANEL_HOME/sibil.php" 2>/dev/null \
+            | sed "s/.*'\(.*\)'.*/\1/")"
+    fi
+    if [[ -z "$v" && -f "$(dirname "${BASH_SOURCE[0]:-$0}")/sibil.php" ]]; then
+        v="$(grep -m1 "const PANEL_VERSION" "$(dirname "${BASH_SOURCE[0]:-$0}")/sibil.php" \
+             | sed "s/.*'\(.*\)'.*/\1/")"
+    fi
+    printf '%s' "${v:-0.0.0}"
+}
+VERSION="$(detect_version)"
+APP="$PANEL_HOME/sibil.php"
+ENV_FILE="$PANEL_HOME/.env"
+DB_FILE="$PANEL_HOME/sibil.sqlite3"
+LOG_FILE="$PANEL_HOME/sibil.log"
+SERVICE="sibil"
+WEB_SERVICE="sibil-web"
+PID_FILE="$PANEL_HOME/sibil.pid"
+CLI_PATH="${PANEL_CLI_PATH:-/usr/local/bin/sibil}"
+UPDATE_URL_FILE="$PANEL_HOME/.installer-url"
+DEFAULT_UPDATE_URL="${PANEL_UPDATE_URL:-}"
+
+# نام نمایشی از .env خوانده می‌شود؛ هیچ نام برندی در کد نیست
+brand_name() {
+    local n=""
+    [[ -f "$ENV_FILE" ]] && n="$(grep -E '^PANEL_BOT_NAME=' "$ENV_FILE" 2>/dev/null \
+        | head -1 | cut -d= -f2- | tr -d '"')"
+    [[ -n "$n" ]] || n="Panel Service"
+    printf '%s' "$n"
+}
+
+PHP_BIN=""
+if [[ -f "$ENV_FILE" ]]; then
+    PHP_BIN="$(grep -E '^PANEL_PHP_BIN=' "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"')"
+    [[ -x "$PHP_BIN" ]] || PHP_BIN=""
+fi
+[[ -n "$PHP_BIN" ]] || PHP_BIN="$(command -v php || echo php)"
+
+if [[ -t 1 && "${TERM:-dumb}" != "dumb" ]]; then
+    B=$'\033[1m'; DIM=$'\033[2m'; R=$'\033[0m'
+    RED=$'\033[31m'; GRN=$'\033[32m'; YEL=$'\033[33m'; BLU=$'\033[34m'
+    MAG=$'\033[35m'; CYN=$'\033[36m'
+else
+    B=""; DIM=""; R=""; RED=""; GRN=""; YEL=""; BLU=""; MAG=""; CYN=""
+fi
+
+say()  { printf '%s\n' "$*"; }
+step() { printf '\n%s▸ %s%s\n' "$CYN$B" "$*" "$R"; }
+ok()   { printf '  %s✓%s %s\n' "$GRN" "$R" "$*"; }
+warn() { printf '  %s!%s %s\n' "$YEL" "$R" "$*"; }
+bad()  { printf '  %s✗%s %s\n' "$RED" "$R" "$*"; }
+line() { printf '%s\n' "  ─────────────────────────────────────────────"; }
+
+is_root() { [[ ${EUID:-$(id -u)} -eq 0 ]]; }
+# آیا می‌توان از کاربر ورودی گرفت؟ (اسکریپت/CI نه)
+have_tty() { [[ -e /dev/tty ]] && { [[ -t 0 ]] || [[ -t 1 ]]; }; }
+has_systemd() { command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; }
+
+db_query() {
+    # db_query "<SQL>"  → هر خط یک ردیف (ستون‌ها با | جدا می‌شوند)
+    "$PHP_BIN" -r '
+        $db = $argv[1]; $sql = $argv[2];
+        if (!is_file($db)) { exit(0); }
+        try {
+            $pdo = new PDO("sqlite:" . $db, null, null, [
+                PDO::ATTR_ERRMODE => PDO::ERRMODE_SILENT,
+                PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+            ]);
+            $rows = $pdo->query($sql);
+            if ($rows === false) { exit(0); }
+            foreach ($rows as $row) {
+                echo implode("|", array_map(fn($v) => (string) $v, array_slice($row, 0, 8))) . "\n";
+            }
+        } catch (Throwable $e) { exit(0); }
+    ' "$DB_FILE" "$1" 2>/dev/null
+}
+
+env_get() {
+    [[ -f "$ENV_FILE" ]] || return 0
+    grep -E "^$1=" "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"'"'"
+}
+
+env_set() {
+    local key="$1" value="$2"
+    [[ -f "$ENV_FILE" ]] || touch "$ENV_FILE"
+    if grep -qE "^$key=" "$ENV_FILE"; then
+        sed -i "s|^$key=.*|$key=\"$value\"|" "$ENV_FILE"
+    else
+        printf '%s="%s"\n' "$key" "$value" >>"$ENV_FILE"
+    fi
+}
+
+banner() {
+    local title="$(brand_name) · v$VERSION"
+    local width=38 len pad_l pad_r inner
+    len=${#title}
+    pad_l=$(( (width - len) / 2 ))
+    pad_r=$(( width - len - pad_l ))
+    inner="$(printf '%*s%s%*s' "$pad_l" '' "$title" "$pad_r" '')"
+    printf '%s%s\n' "$MAG$B" "  ╔══════════════════════════════════════╗"
+    printf '%s\n' "  ║${inner}║"
+    printf '%s\n' "  ╚══════════════════════════════════════╝$R"
+}
+
+# ── بررسی نسخهٔ منتشرشده (کش یک‌ساعته، بدون فشار به API) ────────────────────
+REMOTE_CACHE="$PANEL_HOME/.update-cache"
+REMOTE_TTL=3600
+DEFAULT_GITHUB_REPO="XuSibiL/SIBILPANEL"
+
+version_gt() {   # version_gt A B  → A > B ?
+    [[ "$1" == "$2" ]] && return 1
+    local IFS=.
+    local -a a=($1) b=($2)
+    local i
+    for i in 0 1 2; do
+        local x="${a[$i]:-0}" y="${b[$i]:-0}"
+        ((10#$x > 10#$y)) && return 0
+        ((10#$x < 10#$y)) && return 1
+    done
+    return 1
+}
+
+remote_version() {
+    # ۱) ریلیز گیت‌هاب  ۲) فایل VERSION برنچ  ۳) فایل نصب (سازگاری عقب‌رو)
+    local repo branch url cached_at cached_v now="$(date +%s)" want=""
+    repo="${PANEL_UPDATE_REPO:-}"
+    if [[ -z "$repo" ]]; then
+        repo="$(env_get PANEL_UPDATE_REPO 2>/dev/null)"
+    fi
+    [[ -z "$repo" ]] && repo="$DEFAULT_GITHUB_REPO"
+    repo="${repo#https://github.com/}"; repo="${repo#http://github.com/}"
+    repo="${repo%.git}"; repo="${repo%/}"
+    branch="${PANEL_UPDATE_BRANCH:-}"
+    if [[ -z "$branch" ]]; then
+        branch="$(env_get PANEL_UPDATE_BRANCH 2>/dev/null)"
+    fi
+    [[ -z "$branch" ]] && branch="main"
+
+    if [[ -f "$REMOTE_CACHE" ]]; then
+        cached_at="$(sed -n '1p' "$REMOTE_CACHE" 2>/dev/null)"
+        cached_v="$(sed -n '2p' "$REMOTE_CACHE" 2>/dev/null)"
+        if [[ -n "$cached_at" && -n "$cached_v" ]] && ((now - cached_at < REMOTE_TTL)); then
+            printf '%s' "$cached_v"
+            return 0
+        fi
+    fi
+
+    if command -v curl >/dev/null 2>&1; then
+        want="$(curl -fsS --max-time 8 "https://api.github.com/repos/$repo/releases/latest" 2>/dev/null \
+            | sed -n 's/.*"tag_name" *: *"v\?\([0-9.]*\)".*/\1/p' | head -1)"
+        if [[ -z "$want" ]]; then
+            want="$(curl -fsS --max-time 10 \
+                "https://raw.githubusercontent.com/$repo/$branch/VERSION" 2>/dev/null \
+                | tr -d ' \r\n' | grep -Eo '^[0-9]+(\.[0-9]+)*$' | head -1)"
+        fi
+    fi
+
+    if [[ -z "$want" ]]; then
+        url="$(cat "$UPDATE_URL_FILE" 2>/dev/null)"
+        [[ -z "$url" ]] && url="$DEFAULT_UPDATE_URL"
+        if [[ -n "$url" ]] && command -v curl >/dev/null 2>&1; then
+            want="$(curl -fsS --max-time 12 -r 0-4096 "$url" 2>/dev/null \
+                | sed -n 's/^VERSION="\([0-9.]*\)".*/\1/p' | head -1)"
+        fi
+    fi
+
+    if [[ -n "$want" ]]; then
+        mkdir -p "$PANEL_HOME" 2>/dev/null
+        printf '%s\n%s\n' "$now" "$want" >"$REMOTE_CACHE" 2>/dev/null || true
+    fi
+    printf '%s' "$want"
+}
+
+update_available() {
+    local remote
+    remote="$(remote_version)"
+    [[ -n "$remote" ]] && version_gt "$remote" "$VERSION"
+}
+
+update_label() {
+    local remote
+    remote="$(remote_version)"
+    [[ -n "$remote" ]] && version_gt "$remote" "$VERSION" \
+        && printf ' %s●%s %s(new v%s)%s' "$YEL" "$R" "$DIM" "$remote" "$R"
+    return 0
+}
+
+update_marker() {
+    # نشانگر زرد «آپدیت موجود است»
+    local remote
+    remote="$(remote_version)"
+    [[ -n "$remote" ]] && version_gt "$remote" "$VERSION" && printf '%s●%s' "$YEL" "$R"
+    return 0
+}
+
+service_active() {
+    if has_systemd; then
+        systemctl is-active --quiet "$SERVICE" 2>/dev/null
+    else
+        [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null
+    fi
+}
+
+bot_pids() {
+    pgrep -fa "php.*$APP" 2>/dev/null | grep -v pgrep | awk '{print $1}'
+}
+
+check_env() {
+    if [[ ! -f "$ENV_FILE" ]]; then
+        bad "no configuration found at $ENV_FILE"
+        say "  run the installer first:  sudo bash sibil-installer.sh"
+        return 1
+    fi
+    [[ -f "$APP" ]] || { bad "bot code missing: $APP"; return 1; }
+    return 0
+}
+
+# ── commands ─────────────────────────────────────────────────────────────────
+cmd_start() {
+    check_env || return 1
+    if service_active; then ok "already running"; return 0; fi
+    if has_systemd && is_root; then
+        systemctl reset-failed "$SERVICE" >/dev/null 2>&1 || true
+        systemctl start "$SERVICE" && ok "bot service started"
+        systemctl start "$WEB_SERVICE" 2>/dev/null && ok "payment web endpoint started"
+    else
+        ( cd "$PANEL_HOME" && nohup "$PHP_BIN" "$APP" --poll >>"$LOG_FILE" 2>&1 & echo $! >"$PID_FILE" )
+        ok "bot started (pid $(cat "$PID_FILE" 2>/dev/null))"
+    fi
+}
+
+cmd_stop() {
+    if has_systemd && is_root; then
+        systemctl stop "$SERVICE" 2>/dev/null && ok "bot service stopped"
+        systemctl stop "$WEB_SERVICE" 2>/dev/null && ok "web endpoint stopped"
+    else
+        local pids; pids="$(bot_pids)"
+        [[ -n "$pids" ]] && kill $pids 2>/dev/null && ok "bot stopped" || ok "was not running"
+        rm -f "$PID_FILE"
+    fi
+}
+
+# حذف وبهوک تلگرام — این ربات با long polling کار می‌کند
+reset_webhook() {
+    local token
+    token="$(env_get PANEL_BOT_TOKEN)"
+    [[ -n "$token" ]] || return 0
+    curl -fsS --max-time 10 "https://api.telegram.org/bot$token/deleteWebhook?drop_pending_updates=false" \
+        >/dev/null 2>&1 && return 0 || return 1
+}
+
+# هم‌تراز کردن دیتابیس با کد فعلی (idempotent، هیچ داده‌ای پاک نمی‌شود)
+cmd_migrate() {
+    check_env || return 1
+    step "Database migration"
+    if [[ -f "$PANEL_HOME/migration.php" ]]; then
+        PANEL_HOME="$PANEL_HOME" PANEL_ENV="$ENV_FILE" "$PHP_BIN" "$PANEL_HOME/migration.php" "$@"
+    else
+        PANEL_HOME="$PANEL_HOME" PANEL_ENV="$ENV_FILE" "$PHP_BIN" "$APP" --migrate
+    fi
+    local rc=$?
+    [[ $rc -eq 0 ]] && ok "database is up to date" || bad "migration failed — see logs/bot_error.log"
+    return $rc
+}
+
+cmd_restart() {
+    check_env || return 1
+    if has_systemd && is_root; then
+        systemctl reset-failed "$SERVICE" >/dev/null 2>&1 || true
+        systemctl restart "$SERVICE" && ok "bot service restarted"
+        systemctl reset-failed "$WEB_SERVICE" >/dev/null 2>&1 || true
+        systemctl restart "$WEB_SERVICE" 2>/dev/null && ok "payment web endpoint restarted"
+    else
+        cmd_stop; sleep 1; cmd_start
+    fi
+    # وبهوک قبلی پاک می‌شود تا هیچ آپدیتی گم نشود
+    if reset_webhook; then
+        ok "telegram webhook cleared (long polling mode)"
+    else
+        warn "webhook could not be cleared (network or token) — run: sibil doctor"
+    fi
+}
+
+cmd_status() {
+    banner
+    step "Service"
+    if service_active; then ok "bot: running"; else bad "bot: stopped"; fi
+    if has_systemd; then
+        local enabled since
+        enabled="$(systemctl is-enabled "$SERVICE" 2>/dev/null | head -1)"
+        case "$enabled" in not-found|"") enabled="service not installed" ;; esac
+        since="$(systemctl show -p ActiveEnterTimestamp --value "$SERVICE" 2>/dev/null)"
+        say "  ${enabled:-not installed}${since:+ · active since $since}"
+    fi
+    if has_systemd && systemctl is-active --quiet "$WEB_SERVICE" 2>/dev/null; then
+        ok "web endpoint: running ($(env_get PANEL_WEB_URL))"
+    else
+        warn "web endpoint: stopped (payment callbacks need it)"
+    fi
+    local pids; pids="$(bot_pids | tr '\n' ' ')"
+    [[ -n "${pids// /}" ]] && say "  processes: $pids"
+    step "Configuration"
+    if [[ -f "$ENV_FILE" ]]; then
+        local token admins domain
+        token="$(env_get PANEL_BOT_TOKEN)"
+        admins="$(env_get PANEL_ADMINS)"; [[ -z "$admins" ]] && admins="$(env_get PANEL_ADMIN_IDS)"
+        domain="$(env_get PANEL_DOMAIN)"
+        say "  token   : ${token:0:10}…$([[ ${#token} -gt 10 ]] && echo '' || echo ' (missing)')"
+        say "  admins  : ${admins:-—}"
+        say "  domain  : ${domain:-—}"
+    else
+        bad "no $ENV_FILE"
+    fi
+    step "Data"
+    if [[ -f "$DB_FILE" ]]; then
+        say "  database: $DB_FILE ($(du -h "$DB_FILE" 2>/dev/null | cut -f1))"
+        local q
+        q="$(db_query "SELECT (SELECT COUNT(*) FROM users) || ' users · ' || (SELECT COUNT(*) FROM panels) || ' panels · ' || (SELECT COUNT(*) FROM pg_panels) || ' panguards'")"
+        [[ -n "$q" ]] && say "  $q"
+        local pend
+        pend="$(db_query "SELECT COUNT(*) FROM receipts WHERE status='pending'")"
+        [[ -n "$pend" && "$pend" != "0" ]] && warn "pending receipts: $pend"
+    else
+        warn "database not created yet"
+    fi
+    step "Server"
+    if command -v free >/dev/null 2>&1; then
+        say "  RAM : $(free -h 2>/dev/null | awk 'NR==2{print $3" used / "$2" total"}')"
+    fi
+    if command -v df >/dev/null 2>&1; then
+        say "  DISK: $(df -h "$PANEL_HOME" 2>/dev/null | awk 'NR==2{print $3" used / "$2" total ("$5")"}')"
+    fi
+    say "  LOAD: $(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null || echo '—') · $(nproc 2>/dev/null || echo '?') cpu"
+    step "TLS"
+    local dom
+    dom="$(env_get PANEL_DOMAIN)"
+    if [[ -n "$dom" ]]; then
+        local cert="/etc/letsencrypt/live/$dom/cert.pem"
+        if [[ -f "$cert" ]] && command -v openssl >/dev/null 2>&1; then
+            local end days
+            end="$(openssl x509 -enddate -noout -in "$cert" 2>/dev/null | cut -d= -f2)"
+            if [[ -n "$end" ]]; then
+                days="$(( ( $(date -d "$end" +%s 2>/dev/null || echo 0) - $(date +%s) ) / 86400 ))"
+                if ((days > 14)); then ok "certificate for $dom valid for $days day(s)"
+                else warn "certificate for $dom expires in $days day(s) — run: sudo sibil ssl"; fi
+            fi
+        else
+            warn "no Let's Encrypt certificate found for $dom"
+        fi
+    else
+        warn "no domain set (online gateways need HTTPS)"
+    fi
+    step "Logs (last 3 lines each)"
+    for f in "$ERR_LOG" "$PAY_LOG"; do
+        [[ -f "$f" ]] && { say "  ${DIM}$(basename "$f")${R}"; tail -n 3 "$f" | sed 's/^/    /'; }
+    done
+    step "Log (last 5 lines)"
+    [[ -f "$LOG_FILE" ]] && tail -n 5 "$LOG_FILE" | sed 's/^/  /' || say "  no log yet"
+}
+
+ERR_LOG="$PANEL_HOME/logs/bot_error.log"
+PAY_LOG="$PANEL_HOME/logs/payments.log"
+DEV_LOG="$PANEL_HOME/logs/device_guard.log"
+
+cmd_logs() {
+    # بدون آرگومان: زیرمنوی انتخاب فایل لاگ
+    if [[ -z "${1:-}" ]] && ! have_tty; then
+        cmd_logs err
+        return 0
+    fi
+    if [[ -z "${1:-}" ]]; then
+        step "Logs"
+        say "  ${B}[1]${R} bot errors   $ERR_LOG"
+        say "  ${B}[2]${R} payments     $PAY_LOG"
+        say "  ${B}[3]${R} device guard $DEV_LOG"
+        say "  ${B}[4]${R} service log  $LOG_FILE"
+        local pick
+        read -r -p "  choose [1/2/3/4]: " pick </dev/tty || return 0
+        case "$pick" in
+            2) cmd_logs pay ;;
+            3) cmd_logs dev ;;
+            4) cmd_logs service ;;
+            *) cmd_logs err ;;
+        esac
+        return 0
+    fi
+    local file lines="${2:-50}"
+    case "$1" in
+        pay|payments) file="$PAY_LOG" ;;
+        dev|device|devices) file="$DEV_LOG" ;;
+        service)      file="$LOG_FILE" ;;
+        *)            file="$ERR_LOG" ;;
+    esac
+    [[ -f "$file" ]] || { warn "no log yet: $file"; say "  (it appears after the first event)"; return 0; }
+    say "  ${DIM}$file — Ctrl+C to leave${R}"
+    tail -n "$lines" -f "$file"
+}
+
+backup_ext() {
+    # پسوند اختصاصی این ربات (از تنظیمات دیتابیس، پیش‌فرض panelbak)
+    local ext
+    ext="$("$PHP_BIN" -r '
+        $db = $argv[1];
+        $ext = "panelbak";
+        if (is_file($db)) {
+            try {
+                $p = new PDO("sqlite:" . $db, null, null, [PDO::ATTR_ERRMODE => PDO::ERRMODE_SILENT]);
+                $v = $p->query("SELECT value FROM settings WHERE key=" . $p->quote("backup_ext"))->fetchColumn();
+                if (is_string($v) && $v !== "") { $ext = strtolower(preg_replace("/[^a-z0-9]/i", "", $v)); }
+            } catch (Throwable $e) {}
+        }
+        echo $ext;
+    ' "$DB_FILE" 2>/dev/null)"
+    [[ -n "$ext" ]] || ext="panelbak"
+    printf '%s' "$ext"
+}
+
+backup_dir() {
+    local dir="${PANEL_BACKUP_DIR:-}"
+    if [[ -z "$dir" ]]; then
+        if is_root; then dir="/var/backups/sibil"; else dir="$PANEL_HOME/backups"; fi
+    fi
+    mkdir -p "$dir" 2>/dev/null || dir="$PANEL_HOME/backups"
+    mkdir -p "$dir" 2>/dev/null || true
+    chmod 700 "$dir" 2>/dev/null || true
+    printf '%s' "$dir"
+}
+
+cmd_backup_create() {
+    check_env || return 1
+    local dir ext stamp jstamp day out raw envout
+    dir="$(backup_dir)"
+    mkdir -p "$dir"
+    ext="$(backup_ext)"
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    day="$(date +%Y-%m-%d)"
+    jstamp="$("$PHP_BIN" "$APP" --stamp 2>/dev/null | tr -dc '0-9-')"
+    if [[ ! -f "$DB_FILE" ]]; then
+        bad "nothing to back up (no database yet)"
+        return 1
+    fi
+    # نام استاندارد و تاریخ‌دار: sibil-backup-YYYY-MM-DD.sqlite3 (بازشو با sqlite3)
+    out="$dir/sibil-backup-$day.sqlite3"
+    [[ -e "$out" ]] && out="$dir/sibil-backup-$day-$stamp.sqlite3"
+    raw="$(mktemp)"
+    if "$PHP_BIN" "$APP" --dump "$raw" >/dev/null 2>&1; then
+        :
+    else
+        # کپی امن با VACUUM INTO (بدون قفل‌شدن ربات در حال اجرا)
+        "$PHP_BIN" -r '
+            $src = $argv[1]; $dst = $argv[2];
+            try {
+                $p = new PDO("sqlite:" . $src);
+                $p->exec("VACUUM INTO " . $p->quote($dst));
+            } catch (Throwable $e) { copy($src, $dst); }
+        ' "$DB_FILE" "$raw" 2>/dev/null || cp -f "$DB_FILE" "$raw"
+    fi
+    if cp -f "$raw" "$out" 2>/dev/null; then :; else cp -f "$DB_FILE" "$out"; fi
+    rm -f "$raw"
+    if [[ ! -s "$out" ]]; then
+        bad "backup failed: could not write $out"
+        return 1
+    fi
+    chmod 600 "$out" 2>/dev/null || true
+    # فایل تنظیمات هم کنار بکاپ نگه داشته می‌شود
+    if [[ -f "$ENV_FILE" ]]; then
+        envout="$dir/env-$day.env"
+        [[ -e "$envout" ]] && envout="$dir/env-$day-$stamp.env"
+        cp -f "$ENV_FILE" "$envout" 2>/dev/null && chmod 600 "$envout" 2>/dev/null || true
+    fi
+    local size
+    size="$(du -h "$out" 2>/dev/null | cut -f1)"
+    ok "backup written: $out ($size)"
+    say "  contains : users, wallets, orders, receipts, panels, KYC (data only, no source)"
+    say "  restore  : sibil restore $out"
+    ls -1t "$dir" 2>/dev/null | head -5 | sed 's/^/  · /'
+}
+
+cmd_backup_import() {
+    local file="${1:-}" ext tmp keep was_running=0
+    ext="$(backup_ext)"
+    service_active && was_running=1
+    if [[ -z "$file" ]]; then
+        say "  path of the backup file to import:"
+        read -r -p "  > " file </dev/tty || return 1
+        file="$(printf '%s' "$file" | tr -d '\r' | tr -d '\042' | tr -d "\047" | sed -e 's/^ *//' -e 's/ *$//')"
+        file="${file/#\~/$HOME}"
+    fi
+    [[ -n "$file" ]] || { warn "no file given"; return 1; }
+    [[ -f "$file" ]] || { bad "file not found: $file"; return 1; }
+    local fext fname
+    fname="$(basename "$file")"
+    fext="$(printf '%s' "${file##*.}" | tr '[:upper:]' '[:lower:]')"
+    case "$fname" in
+        *.sql.gz) fext="sql.gz" ;;
+    esac
+    if [[ "$fext" != "$ext" && "$fext" != "sql.gz" && "$fext" != "sqlite3" && "$fext" != "db" ]]; then
+        bad "wrong file type: .$fext — accepted: .sqlite3, .db, .$ext"
+        return 1
+    fi
+    step "Reading $file"
+    tmp="$(mktemp)"
+    if head -c 2 "$file" | od -An -tx1 | tr -d ' \n' | grep -q '^1f8b'; then
+        gzip -dc "$file" > "$tmp" 2>/dev/null || { bad "cannot unpack the backup"; rm -f "$tmp"; return 1; }
+    else
+        cp -f "$file" "$tmp"
+    fi
+    if ! head -c 15 "$tmp" | grep -q 'SQLite format 3'; then
+        bad "this file is not a database of this bot"
+        rm -f "$tmp"
+        return 1
+    fi
+    local q
+    q="$("$PHP_BIN" -r '$p=new PDO("sqlite:".$argv[1]);echo (int)$p->query("SELECT COUNT(*) FROM users")->fetchColumn();' "$tmp" 2>/dev/null)"
+    [[ -n "$q" ]] || { bad "wrong file type — the database inside this backup is unreadable"; rm -f "$tmp"; return 1; }
+
+    step "Safety copy of the current data"
+    cmd_backup_create >/dev/null 2>&1 && ok "current data saved to $PANEL_HOME/backups" || warn "could not save a safety copy"
+
+    step "Importing the old bot data into this bot"
+    cmd_stop >/dev/null 2>&1 || true
+    keep="$(mktemp)"; [[ -f "$DB_FILE" ]] && cp -f "$DB_FILE" "$keep" || true
+    cp -f "$tmp" "$DB_FILE" || { bad "could not replace the database"; rm -f "$tmp" "$keep"; return 1; }
+    rm -f "$tmp"
+    if ! "$PHP_BIN" "$APP" --migrate >/dev/null 2>&1; then
+        warn "database upgrade failed — rolling back"
+        [[ -s "$keep" ]] && cp -f "$keep" "$DB_FILE"
+        rm -f "$keep"
+        [[ "$was_running" == "1" ]] && cmd_start >/dev/null 2>&1
+        bad "import cancelled"
+        return 1
+    fi
+    rm -f "$keep"
+    ok "imported $q user account(s) and all their data"
+    say "  bot token / domain of THIS server were kept (see sibil config)"
+    if reset_webhook; then
+        ok "telegram webhook cleared (no updates will be lost)"
+    else
+        warn "webhook could not be cleared — run: sibil doctor"
+    fi
+    if [[ "$was_running" == "1" ]]; then
+        cmd_start >/dev/null 2>&1 || true
+        ok "bot restarted with the imported data"
+    else
+        ok "start the bot when you are ready:  sibil start"
+    fi
+}
+
+cmd_backup() {
+    local arg="${1:-}"
+    step "Backup"
+    if [[ -z "$arg" ]] && ! have_tty; then
+        # شل غیرتعاملی: پیش‌فرض «همین حالا بکاپ بگیر»
+        cmd_backup_create
+        return $?
+    fi
+    if [[ -z "$arg" ]]; then
+        say "  ${B}[1]${R} Backup Now            (پشتیبان‌گیری فوری)"
+        say "  ${B}[2]${R} Import / Restore Backup (بازیابی بکاپ)"
+        local pick
+        read -r -p "  choose [1/2]: " pick </dev/tty || return 1
+        case "$pick" in
+            2) cmd_backup_import "" ; return $? ;;
+            *) cmd_backup_create ; return $? ;;
+        esac
+    fi
+    if [[ "$arg" == "create" ]]; then cmd_backup_create; return $?; fi
+    cmd_backup_import "$arg"
+}
+
+cmd_restore() {
+    cmd_backup_import "${1:-}"
+}
+
+# ── GitHub update ────────────────────────────────────────────────────────────
+git_repo() {
+    local repo="${PANEL_UPDATE_REPO:-}"
+    [[ -z "$repo" ]] && repo="$(env_get PANEL_UPDATE_REPO 2>/dev/null)"
+    [[ -z "$repo" ]] && repo="$DEFAULT_GITHUB_REPO"
+    repo="${repo#https://github.com/}"; repo="${repo#http://github.com/}"
+    repo="${repo%.git}"; repo="${repo%/}"
+    printf '%s' "$repo"
+}
+
+git_branch() {
+    local branch="${PANEL_UPDATE_BRANCH:-}"
+    [[ -z "$branch" ]] && branch="$(env_get PANEL_UPDATE_BRANCH 2>/dev/null)"
+    printf '%s' "${branch:-main}"
+}
+
+# فایل‌هایی که آپدیت هرگز به آن‌ها دست نمی‌زند: .env · دیتابیس · لاگ · بکاپ · آپلود
+UPDATE_KEEP=(.env .env.local .installer-url sibil.sqlite3 panel.sqlite3 sibil.pid
+             logs backups uploads tests release)
+
+code_backup() {
+    # یک نسخهٔ پشتیبان از «کد» فعلی، قبل از جایگزینی
+    local stamp dest
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    dest="$PANEL_HOME/backups/code-v$VERSION-$stamp.tar.gz"
+    mkdir -p "$PANEL_HOME/backups" 2>/dev/null
+    tar -czf "$dest" -C "$PANEL_HOME" \
+        sibil.php migration.php install.sh VERSION 2>/dev/null
+    if [[ -s "$dest" ]]; then
+        say "  code backup: $dest"
+    else
+        warn "could not write a code backup (continuing)"
+    fi
+}
+
+update_archive() {
+    local url="${PANEL_UPDATE_ARCHIVE_URL:-}"
+    [[ -n "$url" ]] && { printf '%s' "$url"; return 0; }
+    url="$(env_get PANEL_UPDATE_ARCHIVE_URL 2>/dev/null)"
+    [[ -n "$url" ]] && { printf '%s' "$url"; return 0; }
+    printf 'https://codeload.github.com/%s/tar.gz/refs/heads/%s' "$(git_repo)" "$(git_branch)"
+}
+
+github_update() {
+    local repo branch remote tmp root f
+    repo="$(git_repo)"
+    branch="$(git_branch)"
+    remote="$(remote_version)"
+    if [[ -n "$remote" ]] && ! version_gt "$remote" "$VERSION"; then
+        ok "You are on the latest version (v$VERSION) — nothing to update."
+        return 0
+    fi
+    [[ -n "$remote" ]] && step "Updating v$VERSION -> v$remote  (github.com/$repo, branch $branch)" \
+        || step "Updating from github.com/$repo (branch $branch)"
+
+    command -v curl >/dev/null 2>&1 || { bad "curl is required for the update"; return 1; }
+    tmp="$(mktemp -d)"
+    local archive; archive="$(update_archive)"
+    if ! curl -fsSL --max-time 120 "$archive" -o "$tmp/code.tgz"; then
+        bad "download failed: $archive"
+        rm -rf "$tmp"
+        return 1
+    fi
+    if ! tar -xzf "$tmp/code.tgz" -C "$tmp" 2>/dev/null; then
+        bad "the downloaded archive could not be extracted"
+        rm -rf "$tmp"
+        return 1
+    fi
+    root="$(find "$tmp" -maxdepth 1 -mindepth 1 -type d | head -1)"
+    if [[ -z "$root" || ! -f "$root/sibil.php" ]]; then
+        bad "the archive does not contain the bot files"
+        rm -rf "$tmp"
+        return 1
+    fi
+    if ! "${PHP_BIN:-php}" -l "$root/sibil.php" >/dev/null 2>&1; then
+        bad "the downloaded code failed the syntax check — nothing was changed"
+        rm -rf "$tmp"
+        return 1
+    fi
+
+    code_backup
+
+    # فقط فایل‌های کد جایگزین می‌شوند؛ داده و تنظیمات سر جای خودشان می‌مانند
+    local items=(sibil.php migration.php install.sh deploy.sh README.md LICENSE VERSION
+                 .env.example src bin build docs .github dist)
+    local copied=0
+    for f in "${items[@]}"; do
+        [[ -e "$root/$f" ]] || continue
+        if [[ -d "$root/$f" ]]; then
+            mkdir -p "$PANEL_HOME/$f"
+            cp -Rf "$root/$f/." "$PANEL_HOME/$f/" && copied=$((copied + 1))
+        else
+            cp -f "$root/$f" "$PANEL_HOME/$f" && copied=$((copied + 1))
+        fi
+    done
+    rm -rf "$tmp"
+    ((copied >= 3)) || { bad "nothing was copied — the update was aborted"; return 1; }
+    ok "code replaced ($copied items) — .env, database, logs and backups untouched"
+
+    VERSION="$(detect_version)"
+    if check_env >/dev/null 2>&1 && "${PHP_BIN:-php}" "$APP" --migrate >/dev/null 2>&1; then
+        ok "database migrated to the v$VERSION schema"
+    else
+        warn "database migration reported a problem — run: sudo sibil migrate"
+    fi
+    rm -f "$REMOTE_CACHE" 2>/dev/null || true
+
+    if service_active; then
+        cmd_restart >/dev/null 2>&1 || warn "restart manually: sudo sibil restart"
+        ok "service restarted on v$VERSION"
+    else
+        warn "service is not running — start it with: sudo sibil start"
+    fi
+    ok "update finished: v$VERSION (data kept)"
+    return 0
+}
+
+cmd_update() {
+    # مسیر اصلی: گیت‌هاب. اگر مخزن در دسترس نبود، نصب‌کنندهٔ تک‌فایلی
+    github_update && return 0
+    local url remote
+    url="${1:-$(cat "$UPDATE_URL_FILE" 2>/dev/null)}"
+    [[ -z "$url" ]] && url="$DEFAULT_UPDATE_URL"
+    [[ -z "$url" ]] && return 1
+    remote="$(remote_version)"
+    if [[ -n "$remote" ]] && ! version_gt "$remote" "$VERSION"; then
+        ok "You are on the latest version (v$VERSION) — nothing to update."
+        return 0
+    fi
+    step "Fallback: installing from $url"
+    local tmp; tmp="$(mktemp -d)/installer.sh"
+    if ! curl -fsSL --max-time 60 "$url" -o "$tmp" || [[ ! -s "$tmp" ]]; then
+        bad "download failed: $url"
+        return 1
+    fi
+    bash -n "$tmp" || { bad "downloaded installer is broken"; return 1; }
+    PANEL_SELF_URL="$url" bash "$tmp" --update
+    local rc=$?
+    if [[ $rc -eq 0 ]]; then
+        rm -f "$REMOTE_CACHE" 2>/dev/null || true
+        VERSION="$(detect_version)"
+        cmd_migrate >/dev/null 2>&1 && ok "database migrated to the v$VERSION schema"
+        ok "updated · now running v$VERSION (database and .env were kept)"
+    fi
+    return $rc
+}
+
+cmd_check() {
+    local remote
+    remote="$(remote_version)"
+    say "  local  : v$VERSION"
+    say "  remote : ${remote:+v$remote}${remote:-unavailable}"
+    say "  source : github.com/$(git_repo) (branch $(git_branch))"
+    if [[ -z "$remote" ]]; then
+        warn "could not read the remote version (network or repo access)"
+        return 1
+    fi
+    if version_gt "$remote" "$VERSION"; then
+        say "  status : update available (run: sudo sibil update)"
+        return 0
+    fi
+    ok "you are on the latest version"
+}
+
+cmd_domain() {
+    check_env || return 1
+    local dom="${1:-$(env_get PANEL_DOMAIN)}"
+    if [[ -z "$dom" ]]; then
+        say "usage: sibil domain <your-domain.com>"
+        say "  current: $(env_get PANEL_DOMAIN)"
+        return 1
+    fi
+    env_set PANEL_DOMAIN "$dom"
+    ok "domain saved: $dom"
+    say "  now run:  sudo sibil ssl"
+}
+
+cmd_config() {
+    check_env || return 1
+    step "Configuration editor"
+    say "  file: $ENV_FILE"
+    say "  token, admins, domain, brand and gateway keys live in this file."
+    local mode=""
+    if command -v nano >/dev/null 2>&1; then
+        say ""
+        say "  [1] open in nano (recommended)"
+        say "  [2] change the main values one by one"
+        read -r -p "  choice [1]: " mode </dev/tty || mode=""
+        mode="${mode:-1}"
+    else
+        warn "nano is not installed — falling back to the guided editor"
+        mode="2"
+    fi
+    if [[ "$mode" == "1" ]]; then
+        cp -f "$ENV_FILE" "$ENV_FILE.bak-$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
+        chmod 600 "$ENV_FILE" 2>/dev/null || true
+        nano "$ENV_FILE" </dev/tty >/dev/tty 2>&1 || true
+        cmd_restart
+        return 0
+    fi
+    local keys=(PANEL_BOT_TOKEN PANEL_ADMINS PANEL_DOMAIN PANEL_BRAND)
+    local key current value
+    for key in "${keys[@]}"; do
+        current="$(env_get "$key")"
+        printf '  %s%s%s = %s\n' "$B" "$key" "$R" "${current:-—}"
+        read -r -p "  new value (Enter = keep): " value </dev/tty || value=""
+        [[ -n "$value" ]] && { env_set "$key" "$value"; ok "$key updated"; }
+    done
+    cmd_restart
+}
+
+cmd_deps() {
+    step "Checking and installing dependencies"
+    local -a pkgs=(php-cli php-sqlite3 php-curl php-mbstring php-xml php-zip php-fpm
+                   curl jq git cron certbot)
+    if command -v apt-get >/dev/null 2>&1; then
+        if is_root; then
+            DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${pkgs[@]}" >/dev/null 2>&1 \
+                && ok "system packages installed" || warn "some packages could not be installed"
+        else
+            warn "run as root to install packages: sudo sibil deps"
+        fi
+    else
+        warn "no apt-get — install manually: ${pkgs[*]}"
+    fi
+    if ! command -v php >/dev/null 2>&1; then
+        bad "php is not installed; install php-cli + php-sqlite3 manually"
+        return 1
+    fi
+    say "  php: $PHP_BIN"
+    for mod in pdo_sqlite sqlite3 json; do
+        "$PHP_BIN" -r "exit(extension_loaded('$mod') ? 0 : 1);" >/dev/null 2>&1 \
+            && ok "$mod" || bad "$mod missing (apt install php-sqlite3)"
+    done
+    [[ -x "$(command -v curl 2>/dev/null)" ]] && ok "curl binary" || warn "curl missing (needed for Telegram)"
+}
+
+cmd_doctor() {
+    banner
+    step "Checks"
+    if command -v php >/dev/null 2>&1; then
+        ok "php: $("$PHP_BIN" -v 2>/dev/null | head -1)"
+    else
+        bad "php is missing (option 4 = install dependencies)"
+    fi
+    "$PHP_BIN" -r 'exit(extension_loaded("pdo_sqlite") ? 0 : 1);' >/dev/null 2>&1 \
+        && ok "pdo_sqlite available" || bad "pdo_sqlite missing (see: sudo sibil deps)"
+    "$PHP_BIN" -r 'exit(function_exists("curl_init") || trim((string)shell_exec("command -v curl")) !== "" ? 0 : 1);' \
+        && ok "http transport ready" || bad "no curl (neither ext-curl nor binary)"
+    [[ -f "$APP" ]] && ok "bot code: $APP" || bad "bot code missing"
+    "$PHP_BIN" -l "$APP" >/dev/null 2>&1 && ok "code syntax ok" || bad "syntax error in $APP"
+    [[ -f "$ENV_FILE" ]] && ok "config: $ENV_FILE" || bad "config missing"
+    local token; token="$(env_get PANEL_BOT_TOKEN)"
+    if [[ -n "$token" ]]; then
+        local api
+        api="$(curl -fsS --max-time 8 "https://api.telegram.org/bot$token/getMe" 2>/dev/null)"
+        if printf '%s' "$api" | grep -q '"ok":true'; then
+            ok "telegram: @$(printf '%s' "$api" | sed -n 's/.*"username":"\([^"]*\)".*/\1/p')"
+        else
+            bad "telegram rejected the token (invalid or revoked)"
+        fi
+    else
+        bad "no bot token in config"
+    fi
+    if has_systemd; then
+        systemctl is-active --quiet "$WEB_SERVICE" 2>/dev/null \
+            && ok "payment web endpoint is running" \
+            || bad "payment web endpoint is down — online gateways cannot confirm"
+    fi
+    local procs; procs="$(bot_pids | wc -l)"
+    [[ "$procs" -le 1 ]] && ok "bot processes: $procs" || bad "$procs bot processes are running (409 conflicts) — fix: sudo sibil fix"
+    if [[ -f "$DB_FILE" ]]; then
+        ok "database: $DB_FILE"
+        sed -n '/Data/,$p' <(cmd_status 2>/dev/null) | head -6 | sed 's/^/  /'
+    fi
+    step "Network"
+    local p80=0 p443=0
+    if command -v ss >/dev/null 2>&1; then
+        ss -ltn 2>/dev/null | grep -qE '(:80|:80 )' && p80=1
+        ss -ltn 2>/dev/null | grep -qE '(:443|:443 )' && p443=1
+    fi
+    [[ $p80 -eq 1 ]] && ok "port 80 is open (HTTP / certificate renewal)" \
+        || warn "nothing is listening on port 80 (Let's Encrypt renewal needs it)"
+    [[ $p443 -eq 1 ]] && ok "port 443 is open (HTTPS webhook)" \
+        || warn "nothing is listening on port 443"
+    if command -v caddy >/dev/null 2>&1; then
+        if systemctl is-active --quiet caddy 2>/dev/null; then
+            ok "caddy is running (TLS + reverse proxy on 80/443)"
+        else
+            warn "caddy installed but not running — run: sudo systemctl start caddy"
+        fi
+    else
+        warn "caddy not installed — HTTPS/webhook needs it (sudo sibil deps)"
+    fi
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
+        say "  ufw: $(ufw status 2>/dev/null | grep -cE '80|443') allow rule(s) for 80/443"
+    fi
+    step "Disk and permissions"
+    local free_pct
+    free_pct="$(df -P "$PANEL_HOME" 2>/dev/null | awk 'NR==2{gsub("%","",$5); print $5}')"
+    if [[ -n "$free_pct" ]]; then
+        if ((free_pct >= 90)); then bad "disk is ${free_pct}% full"; else ok "disk used: ${free_pct}%"; fi
+    fi
+    if [[ -d "$PANEL_HOME" ]]; then
+        local perms
+        perms="$(stat -c '%a' "$PANEL_HOME" 2>/dev/null)"
+        [[ -n "$perms" ]] && say "  $PANEL_HOME → $perms ($(stat -c '%U:%G' "$PANEL_HOME" 2>/dev/null))"
+    fi
+    for d in logs backups; do
+        [[ -d "$PANEL_HOME/$d" ]] && ok "$d/ exists" || warn "$d/ missing (created on first use)"
+    done
+    [[ -f "$PANEL_HOME/.htaccess" ]] && ok ".htaccess deny rules installed" \
+        || warn ".htaccess missing — run: sudo sibil fix"
+    step "Telegram webhook info"
+    local token2 wh
+    token2="$(env_get PANEL_BOT_TOKEN)"
+    if [[ -n "$token2" ]]; then
+        wh="$(curl -fsS --max-time 8 "https://api.telegram.org/bot$token2/getWebhookInfo" 2>/dev/null)"
+        if [[ -n "$wh" ]]; then
+            if printf '%s' "$wh" | grep -q '"url":""'; then
+                ok "webhook: empty — long polling mode (normal for this bot)"
+            else
+                say "  webhook url: $(printf '%s' "$wh" | sed -n 's/.*"url":"\([^"]*\)".*/\1/p')"
+            fi
+            local pending
+            pending="$(printf '%s' "$wh" | sed -n 's/.*"pending_update_count":\([0-9]*\).*/\1/p')"
+            [[ -n "$pending" ]] && say "  pending updates: $pending"
+        else
+            warn "getWebhookInfo returned nothing (network?)"
+        fi
+    fi
+    step "Device guard (logs/device_guard.log)"
+    if [[ -f "$DEV_LOG" ]]; then
+        say "  last events:"
+        tail -n 3 "$DEV_LOG" | sed 's/^/  · /'
+    else
+        say "  no device-guard event yet"
+    fi
+    step "Config check (sibil.php --check)"
+    PANEL_HOME="$PANEL_HOME" PANEL_ENV="$ENV_FILE" PANEL_DB="$DB_FILE" "$PHP_BIN" "$APP" --check 2>&1 | sed 's/^/  /'
+}
+
+cmd_ssl() {
+    command -v caddy >/dev/null 2>&1 || { bad "caddy is not installed (the installer sets it up)"; return 1; }
+    if has_systemd && is_root; then
+        systemctl reload caddy 2>/dev/null || systemctl restart caddy
+        ok "caddy reloaded — certificates are issued automatically"
+    else
+        warn "run as root: sudo sibil ssl"
+    fi
+}
+
+cmd_fix() {
+    step "Repairing permissions and processes"
+    mkdir -p "$PANEL_HOME/logs" "$PANEL_HOME/backups" 2>/dev/null || true
+    chmod 750 "$PANEL_HOME/logs" "$PANEL_HOME/backups" 2>/dev/null || true
+    install_htaccess
+    if is_root; then
+        pkill -f "$APP" 2>/dev/null && warn "stray bot processes killed"
+        [[ -d "$PANEL_HOME" ]] && chown -R sibil:sibil "$PANEL_HOME" 2>/dev/null && ok "ownership fixed"
+        if has_systemd; then
+            systemctl reset-failed "$SERVICE" >/dev/null 2>&1 || true
+            systemctl restart "$SERVICE" && ok "service restarted"
+        fi
+        [[ -f "$LOG_FILE" ]] && { tail -n 15 "$LOG_FILE" | sed 's/^/  /'; }
+    else
+        bad "run as root: sudo sibil fix"
+    fi
+}
+
+cmd_install() {
+    local url="${1:-$DEFAULT_UPDATE_URL}"
+    step "Installing ${APP_NAME} (PHP $VERSION)"
+    local tmp; tmp="$(mktemp -d)/installer.sh"
+    curl -fsSL --max-time 60 "$url" -o "$tmp" || { bad "download failed"; return 1; }
+    sudo bash "$tmp"
+}
+
+cmd_remove() {
+    step "Removing the service"
+    if has_systemd && is_root; then
+        systemctl stop "$SERVICE" 2>/dev/null
+        systemctl disable "$SERVICE" 2>/dev/null
+        rm -f "/etc/systemd/system/$SERVICE.service"
+        systemctl daemon-reload
+    fi
+    pkill -f "$APP" 2>/dev/null || true
+    rm -f "$CLI_PATH" 2>/dev/null
+    ok "service removed · data kept in $PANEL_HOME"
+    say "  to delete everything:  sudo rm -rf $PANEL_HOME"
+}
+
+# ── قواعد امنیتی وب (دسترسی مستقیم به لاگ/بکاپ/کانفیگ بسته می‌شود) ──────────
+install_htaccess() {
+    local target="$PANEL_HOME/.htaccess"
+    cat >"$target" <<'HTACCESS'
+# deny direct web access to private files
+Options -Indexes
+<FilesMatch "(\.env|\.sqlite3|\.sqlite3-.*|\.db|\.sql(\.gz)?|\.panelbak|sibil\.php\.bak.*|\.log)$">
+    Require all denied
+</FilesMatch>
+RedirectMatch 404 /(\.env|logs/|backups/|.*\.sqlite3|.*\.sql(\.gz)?|.*\.panelbak)
+HTACCESS
+    chmod 644 "$target" 2>/dev/null || true
+    ok "web access rules installed: $target"
+
+    # حذف اجرای PHP در پوشهٔ آپلود/موقت
+    local up="$PANEL_HOME/uploads"
+    mkdir -p "$up" 2>/dev/null || true
+    printf 'php_flag engine off\n<FilesMatch "\.(php|phtml|phar)$">\n    Require all denied\n</FilesMatch>\n' \
+        >"$up/.htaccess" 2>/dev/null || true
+}
+
+cmd_help() {
+    banner
+    say ""
+    say "  ${B}usage:${R} sibil [command]"
+    say ""
+    say "    ${B}status${R}     service, config and data summary"
+    say "    ${B}update${R}     fetch the latest release and restart (data kept)"
+    say "    ${B}restart${R}    restart the bot        ${B}start${R} / ${B}stop${R}"
+    say "    ${B}logs${R}       follow bot_error.log / payments.log / device_guard.log"
+    say "    ${B}backup${R}     create a snapshot, or import a backup .$(backup_ext)"
+    say "    ${B}restore${R}    alias of: backup <file>"
+    say "    ${B}domain${R}     set the domain       ${B}ssl${R}   reload Caddy/TLS"
+    say "    ${B}config${R}     edit token/admins/domain"
+    say "    ${B}web${R}        payment callback endpoint status"
+    say "    ${B}doctor${R}     full health check     ${B}deps${R}  install PHP modules"
+    say "    ${B}fix${R}        repair permissions/processes"
+    say "    ${B}migrate${R}    upgrade the database schema (safe, repeatable)"
+    say "    ${B}install${R}    fresh install        ${B}remove${R}  remove the service"
+    say "    ${B}version${R}    print the version    ${B}check${R}   latest release check"
+    say "    ${B}help${R}       this screen"
+    say ""
+}
+
+cmd_menu() {
+    local choice remote
+    # در شل غیرتعاملی (اسکریپت/CI) منو کار نمی‌کند؛ راهنما چاپ می‌شود
+    if [[ ! -e /dev/tty ]] || { [[ ! -t 0 ]] && [[ ! -t 1 ]]; }; then
+        banner
+        warn "no interactive terminal — run: sibil help"
+        return 0
+    fi
+    while true; do
+        clear 2>/dev/null || true
+        banner
+        remote="$(remote_version)"
+        if [[ -n "$remote" ]] && version_gt "$remote" "$VERSION"; then
+            printf '\n  %s● Update v%s is available. You have v%s.%s\n' \
+                "$YEL$B" "$remote" "$VERSION" "$R"
+        fi
+        say ""
+        say "  ${B}1${R}) status         ${B}2${R}) update$(update_label)"
+        say "  ${B}3${R}) backup / import  ${B}4${R}) dependencies   ${B}5${R}) doctor"
+        say "  ${B}6${R}) ssl / domain   ${B}7${R}) logs           ${B}8${R}) restart"
+        say "  ${B}9${R}) config         ${B}0${R}) exit"
+        say ""
+        read -r -p "  choose: " choice </dev/tty || return 0
+        say ""
+        case "$choice" in
+            1) cmd_status ;;
+            2) cmd_update ;;
+            3) cmd_backup "" ;;
+            4) cmd_deps ;;
+            5) cmd_doctor ;;
+            6) cmd_domain ""; cmd_ssl ;;
+            7) cmd_logs "" ;;
+            8) cmd_restart ;;
+            9) cmd_config ;;
+            0|q|exit|"") exit 0 ;;
+            *) warn "unknown choice: $choice" ;;
+        esac
+        [[ -n "${PANEL_NO_PAUSE:-}" ]] && continue
+        say ""
+        read -r -p "  press Enter to return to the menu… " _ </dev/tty 2>/dev/null || true
+    done
+}
+
+case "${1:-menu}" in
+    status)  cmd_status ;;
+    update)  shift; cmd_update "${1:-}" ;;
+    restart) cmd_restart ;;
+    start)   cmd_start ;;
+    stop)    cmd_stop ;;
+    logs)    shift; cmd_logs "${1:-60}" ;;
+    backup)  shift; cmd_backup "${1:-}" ;;
+    restore) shift; cmd_restore "${1:-}" ;;
+    domain)  shift; cmd_domain "${1:-}" ;;
+    config)  cmd_config ;;
+    doctor)  cmd_doctor ;;
+    deps)    cmd_deps ;;
+    migrate|migration) shift; cmd_migrate "$@" ;;
+    ssl)     cmd_ssl ;;
+    fix)     cmd_fix ;;
+    install) shift; cmd_install "${1:-}" ;;
+    remove)  cmd_remove ;;
+    web)
+        port="$(env_get PANEL_WEB_PORT)"; port="${port:-8080}"
+        say "web endpoint : ${WEB_SERVICE} (php -S 0.0.0.0:$port)"
+        say "callback base: $(env_get PANEL_WEB_URL)"
+        say "gateways     : ${PANEL_WEB_URL:-<unset>}/pay/<gateway>"
+        say "variza hook  : ${PANEL_WEB_URL:-<unset>}/pay/variza/webhook"
+        if has_systemd; then systemctl status "$WEB_SERVICE" --no-pager -n 5 2>/dev/null; fi
+        ;;
+    version) say "panel-service $VERSION (PHP edition)" ;;
+    check|update-check) cmd_check ;;
+    help|-h|--help) cmd_help ;;
+    menu)    cmd_menu ;;
+    *) bad "unknown command: $1"; cmd_help; exit 1 ;;
+esac
