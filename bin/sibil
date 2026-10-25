@@ -177,6 +177,22 @@ _gh_get() {   # _gh_get URL  → بدنه (با هدر no-cache و پارامت�
         "$url$([[ "$url" == *\?* ]] && printf '&' || printf '?')t=$(date +%s)$RANDOM" 2>/dev/null
 }
 
+# تگ آخرین ریلیز از خود github.com — بدون مصرف سهمیهٔ API (ریدایرکت ۳۰۲)
+_gh_latest_tag() {   # _gh_latest_tag REPO
+    local repo="$1" target
+    command -v curl >/dev/null 2>&1 || return 0
+    target="$(curl -sS --max-time 10 -o /dev/null -H 'Cache-Control: no-cache' \
+        -w '%{redirect_url}' "https://github.com/$repo/releases/latest" 2>/dev/null)"
+    case "$target" in
+        */releases/tag/*)
+            target="${target##*/releases/tag/}"
+            target="${target%%[?#]*}"
+            target="${target#v}"
+            [[ "$target" =~ ^[0-9]+(\.[0-9]+)*$ ]] && printf '%s' "$target"
+            ;;
+    esac
+}
+
 # نسخهٔ زندهٔ گیت‌هاب.
 # ترتیب اقتصادی: اول فایل VERSION خام (بدون سهمیهٔ API)؛ فقط وقتی همان نسخهٔ
 # نصب‌شده را نشان می‌دهد و ممکن است کش‌شده باشد، API گیت‌هاب پرسیده می‌شود.
@@ -195,8 +211,13 @@ remote_version_live() {
     # ۲) فقط اگر خام نسخهٔ تازه‌تری نشان نداد، API را می‌پرسیم
     #    (ریلیز، بعد Contents API — که برخلاف فایل خام هیچ کش CDN ندارد)
     if [[ -z "$raw" ]] || ! version_gt "$raw" "$VERSION"; then
-        tag="$(_gh_get "https://api.github.com/repos/$repo/releases/latest" \
-            | sed -n 's/.*"tag_name" *: *"\([^"]*\)".*/\1/p' | head -1)"
+        # ۲) تگ آخرین ریلیز از github.com — بدون سهمیهٔ API و همان لحظه به‌روز
+        tag="$(_gh_latest_tag "$repo")"
+        #    اگر ریدایرکت جواب نداد، API رسمی
+        if [[ -z "$tag" ]]; then
+            tag="$(_gh_get "https://api.github.com/repos/$repo/releases/latest" \
+                | sed -n 's/.*"tag_name" *: *"\([^"]*\)".*/\1/p' | head -1)"
+        fi
         if [[ -z "$tag" ]] || ! version_gt "${tag#v}" "$VERSION"; then
             contents="$(_gh_get "https://api.github.com/repos/$repo/contents/VERSION?ref=$branch" \
                 | sed -n 's/.*"content" *: *"\([^"]*\)".*/\1/p' | head -1 | sed 's/\\n//g')"

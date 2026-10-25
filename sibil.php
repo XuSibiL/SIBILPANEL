@@ -21,7 +21,7 @@
 
 declare(strict_types=1);
 
-const PANEL_VERSION = '3.16.4';
+const PANEL_VERSION = '3.16.5';
 const IRAN_OFFSET   = 3.5 * 3600;
 const DAY           = 86400;
 
@@ -2807,6 +2807,61 @@ function update_bust_url(string $url): string
  * `raw.githubusercontent.com` تا ۵ دقیقه پس از پوش، نسخهٔ کهنه را از کش
  * (x-cache: HIT) برمی‌گرداند؛ این مسیر همان لحظه به‌روز است.
  */
+/**
+ * آخرین تگ ریلیز بدون مصرف سهمیهٔ API گیت‌هاب:
+ * صفحهٔ releases/latest با یک ریدایرکت ۳۰۲ به تگ می‌رسد و github.com محدودیتی
+ * مثل api.github.com (۶۰ درخواست در ساعت برای هر IP) ندارد. همان لحظهٔ انتشار به‌روز است.
+ */
+function update_latest_tag_via_redirect(string $repo = ''): string
+{
+    $repo = $repo !== '' ? $repo : update_repo();
+    $base = trim((string) cfg('PANEL_UPDATE_WEB'));
+    if ($base === '') {
+        $base = 'https://github.com';
+    }
+    $url = rtrim($base, '/') . '/' . $repo . '/releases/latest';
+    $target = '';
+
+    /* قلاب تست: در تست‌ها شبکه شبیه‌سازی می‌شود، پس همان mock استفاده می‌شود */
+    if (isset($GLOBALS['panel_http_mock']) && is_callable($GLOBALS['panel_http_mock'])) {
+        [$body] = http_request('HEAD', $url, [], null, false, 10);
+        $body = (string) $body;
+        if (preg_match('~/releases/tag/([^/?\#]+)~', $body, $m)) {
+            $tag = ltrim($m[1], 'vV');
+            return preg_match('/^\d+(\.\d+)*$/', $tag) ? $tag : '';
+        }
+        return '';
+    }
+
+    if (function_exists('curl_init')) {
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_NOBODY         => true,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_FOLLOWLOCATION => false,
+            CURLOPT_TIMEOUT        => 10,
+            CURLOPT_HTTPHEADER     => ['Cache-Control: no-cache', 'User-Agent: panel-updater'],
+        ]);
+        curl_exec($ch);
+        $target = (string) curl_getinfo($ch, CURLINFO_REDIRECT_URL);
+        curl_close($ch);
+    }
+    if ($target === '') {
+        $binary = function_exists('curl_binary') ? curl_binary() : 'curl';
+        if ($binary !== '') {
+            $target = (string) @shell_exec(escapeshellcmd($binary)
+                . ' -sS --max-time 10 -o /dev/null -H ' . escapeshellarg('Cache-Control: no-cache')
+                . ' -w ' . escapeshellarg('%{redirect_url}') . ' ' . escapeshellarg($url) . ' 2>/dev/null');
+        }
+    }
+    $target = trim($target);
+    if ($target !== '' && preg_match('~/releases/tag/([^/?\#]+)~', $target, $m)) {
+        $tag = ltrim($m[1], 'vV');
+        return preg_match('/^\d+(\.\d+)*$/', $tag) ? $tag : '';
+    }
+    return '';
+}
+
 function update_version_contents_api(string $repo, string $branch): string
 {
     [$body, $status] = update_http_get(update_bust_url(
@@ -2884,13 +2939,17 @@ function update_remote_version(bool $force = true): array
        وگرنه ممکن است فایل خام از کش CDN عقب باشد؛ پس API را می‌پرسیم:
        اول ریلیز (بعد از هر انتشار همان لحظه به‌روز)، بعد Contents API. */
     if ($versionFile === '' || !update_is_newer($versionFile, PANEL_VERSION)) {
-        [$body, $status] = update_http_get(update_bust_url(
-            'https://api.github.com/repos/' . $repo . '/releases/latest'));
-        if ($status >= 200 && $status < 300 && $body !== '') {
-            $json = json_decode($body, true);
-            $tag = is_array($json) ? (string) ($json['tag_name'] ?? '') : '';
-            if ($tag !== '') {
-                $release = ltrim($tag, 'vV');
+        /* ۲) تگ آخرین ریلیز از خود github.com (بدون سهمیهٔ API) */
+        $release = update_latest_tag_via_redirect($repo);
+        if ($release === '' || !update_is_newer($release, PANEL_VERSION)) {
+            [$body, $status] = update_http_get(update_bust_url(
+                'https://api.github.com/repos/' . $repo . '/releases/latest'));
+            if ($status >= 200 && $status < 300 && $body !== '') {
+                $json = json_decode($body, true);
+                $tag = is_array($json) ? (string) ($json['tag_name'] ?? '') : '';
+                if ($tag !== '') {
+                    $release = ltrim($tag, 'vV');
+                }
             }
         }
         if ($release === '' || !update_is_newer($release, PANEL_VERSION)) {
