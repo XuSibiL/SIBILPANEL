@@ -57,9 +57,10 @@ silence_needrestart() {
     export NEEDRESTART_SUSPEND=1
 }
 
+BOT_USERNAME_IN="${PANEL_BOT_USERNAME:-}"
 APP_NAME="${PANEL_BOT_NAME:-Panel Service}"
 CHANNEL_DEFAULT="https://t.me/sibilpanel"
-VERSION="3.16.0"
+VERSION="3.16.1"
 # سازگاری با کلیدهای قدیمی
 export PANEL_HOME="${PANEL_HOME:-${SIBIL_HOME:-}}"
 export PANEL_BOT_TOKEN="${PANEL_BOT_TOKEN:-${SIBIL_BOT_TOKEN:-}}"
@@ -625,9 +626,16 @@ prompt_all() {
     local uname
     if uname="$(validate_token "$TOKEN_IN")"; then
         ok "telegram accepted the token (@$uname)"
+        BOT_USERNAME_IN="$uname"
     else
         warn "could not verify the token (network?) — it will be checked again on start"
     fi
+    # روی نصب قبلی، یوزرنیمِ ذخیره‌شده حفظ می‌شود (هیچ‌وقت پاک نمی‌شود)
+    if [[ -z "$BOT_USERNAME_IN" ]]; then
+        BOT_USERNAME_IN="$(grep -h '^PANEL_BOT_USERNAME' "$PANEL_HOME/.env" 2>/dev/null \
+            | cut -d= -f2- | tr -d '"' | sed 's/^@//')"
+    fi
+    [[ -n "$BOT_USERNAME_IN" ]] && ok "bot username: @$BOT_USERNAME_IN (used for referral links)"
     if [[ -z "$ADMINS_IN" ]] && can_prompt; then
         ADMINS_IN="$(ask 'admin numeric IDs (comma separated)')"
     fi
@@ -678,6 +686,11 @@ write_env() {
                 && run "sed -i 's|^PANEL_DOMAIN=.*|PANEL_DOMAIN=\"$DOMAIN_IN\"|' '$PANEL_HOME/.env'" \
                 || run "printf 'PANEL_DOMAIN=\"%s\"\n' '$DOMAIN_IN' >> '$PANEL_HOME/.env'"
         fi
+        # یوزرنیم ربات برای لینک دعوت: اگر نبود اضافه می‌شود، اگر بود دست نمی‌خورد
+        if [[ -n "$BOT_USERNAME_IN" ]] && ! grep -q '^PANEL_BOT_USERNAME=' "$PANEL_HOME/.env"; then
+            run "printf 'PANEL_BOT_USERNAME=\"%s\"\\n' '$BOT_USERNAME_IN' >> '$PANEL_HOME/.env'"
+            ok "bot username added to .env (referral links)"
+        fi
         for pair in "PANEL_SUPPORT_USERNAME:$SUPPORT_IN" "PANEL_CHANNEL_URL:$CHANNEL_IN"; do
             local key="${pair%%:*}" val="${pair#*:}"
             [[ -z "$val" ]] && continue
@@ -702,6 +715,7 @@ PANEL_WEB_PORT="$WEB_PORT_DEFAULT"
 PANEL_WEB_URL="${DOMAIN_IN:+https://$DOMAIN_IN}"
 PANEL_PHP_BIN="${PHP_PATH:-php}"
 PANEL_BOT_NAME="$BRAND_IN"
+PANEL_BOT_USERNAME="$BOT_USERNAME_IN"
 PANEL_SUPPORT_USERNAME="$SUPPORT_IN"
 PANEL_CHANNEL_URL="$CHANNEL_IN"
 PANEL_UPDATE_REPO="${REPO_IN:-XuSibiL/SIBILPANEL}"

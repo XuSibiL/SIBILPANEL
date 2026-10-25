@@ -305,6 +305,9 @@ function settle_payment(array $order, string $source = 'wallet', int $adminId = 
         /* شمارش واریزی + پورسانت معرف (فقط واریزی اول و دوم) */
         try {
             $depositNo = deposit_count_up($tgId);
+            if (ref_mode() === 'cash' && ref_cash_when() === 'purchase') {
+                referral_welcome_cash($tgId);   // پاداش نقدی معلق، با اولین شارژ
+            }
             $commission = referral_deposit_payout($tgId, $amount);
             if ($commission > 0) {
                 log_payment('referral commission', ['user' => $tgId, 'deposit' => $depositNo,
@@ -373,7 +376,12 @@ function settle_payment(array $order, string $source = 'wallet', int $adminId = 
     if ($ok) {
         order_mark((int) $order['id'], 'delivered');
         try {
-            referral_payout($order);
+            /* پاداش نقدی‌ای که مدیر روی «اولین خرید» گذاشته، همین‌جا آزاد می‌شود */
+            if (ref_mode() === 'cash' && ref_cash_when() === 'purchase') {
+                referral_welcome_cash($tgId);
+            } else {
+                referral_payout($order);
+            }
         } catch (Throwable $ex) {
             log_line('warning', 'referral payout failed: ' . $ex->getMessage());
         }

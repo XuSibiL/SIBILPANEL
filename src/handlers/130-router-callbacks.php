@@ -192,8 +192,8 @@ function handle_callback_inner(array $cb): void
                 screen_trial($chatId, $messageId, $uid);
                 return;
             case 'ref':
-                $link = 'https://t.me/' . cfg('PANEL_BOT_USERNAME', '')
-                    . '?start=' . $uid;
+                /* لینک از یوزرنیم رسمی ربات ساخته می‌شود (تنظیمات → .env → getMe) */
+                $link = ref_link($uid);
                 $percent = set_int('ref_percent', 10);
                 $minBuy = set_int('ref_min', 0);
                 $invited = (int) DB::val('SELECT COUNT(*) FROM users WHERE referred_by=?',
@@ -217,14 +217,21 @@ function handle_callback_inner(array $cb): void
                             . '٪ به کیف پولتان اضافه می‌شود'
                             . ($minBuy > 0 ? ' (واریز بالای ' . money($minBuy) . ')' : ''))
                     . "\n\n"
-                    . 'لینک اختصاصی شما:' . "\n<code>" . e($link) . '</code>';
+                    . ($link !== ''
+                        ? 'لینک اختصاصی شما:' . "\n<code>" . e($link) . '</code>'
+                        : '⚠️ لینک دعوت ساخته نشد: یوزرنیم ربات تنظیم نشده است.');
                 if (!set_bool('ref_enabled', true)) {
                     $text .= "\n\n🔴 برنامهٔ دعوت فعلاً خاموش است.";
                 }
-                Tg::show($chatId, $messageId, $text, [
-                    [btn('📤 اشتراک لینک', 'ref:share', null, 'success')],
-                    [btn('« بازگشت', 'home', null, 'danger')],
-                ]);
+                $refRows = [];
+                if ($link !== '') {
+                    $refRows[] = [btn('📤 اشتراک‌گذاری لینک', null,
+                        ref_share_url($link, '🎁 با لینک من در ' . bot_name() . ' عضو شو'),
+                        'success')];
+                    $refRows[] = [btn('📋 فرستادن لینک به دوست', 'ref:share', null, 'primary')];
+                }
+                $refRows[] = [btn('« بازگشت', 'home', null, 'danger')];
+                Tg::show($chatId, $messageId, $text, $refRows);
                 return;
         }
     }
@@ -237,13 +244,27 @@ function handle_callback_inner(array $cb): void
         return;
     }
     if ($head === 'ref') {
-        $link = 'https://t.me/' . cfg('PANEL_BOT_USERNAME', '') . '?start=' . $uid;
-        $share = rawurlencode("🎁 با لینک من عضو شو:\n" . $link);
-        Tg::answer($cbId, 'لینک کپی شد', false);
-        Tg::send($chatId, '📤 لینک خودتان را برای دوستانت بفرستید:' . "\n\n"
-            . '<code>' . e($link) . '</code>',
-            [[btn('📲 اشتراک در تلگرام', null,
-                'https://t.me/share/url?url=' . $share . '&text=' . rawurlencode(bot_name()),
+        $link = ref_link($uid);
+        if ($link === '') {
+            Tg::answer($cbId, '⚠️ یوزرنیم ربات تنظیم نشده است.', true);
+            Tg::show($chatId, $messageId,
+                "⚠️ <b>لینک دعوت ساخته نشد</b>\n\n"
+                . 'یوزرنیم ربات روی سرور تنظیم نشده است. مدیر باید در '. "\n"
+                . '<code>.env</code> مقدار <code>PANEL_BOT_USERNAME</code> را بگذارد '
+                . '(بدون @) یا یک‌بار ربات را ری‌استارت کند تا خودکار خوانده شود.',
+                [[btn('« دعوت دوستان', 'menu:ref', null, 'danger')]]);
+            return;
+        }
+        Tg::answer($cbId, '📤 لینک آمادهٔ ارسال است', false);
+        Tg::send($chatId, '📤 <b>لینک اختصاصی شما</b>' . "\n" . SEP . "\n"
+            . '<code>' . e($link) . '</code>' . "\n\n"
+            . 'با یک ضربه روی لینک کپی می‌شود؛ با دکمهٔ زیر مستقیم در تلگرام '
+            . 'برای دوستتان بفرستید.' . "\n\n"
+            . '🎁 پاداش شما: ' . (ref_mode() === 'cash'
+                ? money(set_int('ref_cash', 10000)) . ' نقدی برای هر عضو جدید'
+                : fa_digits(set_int('ref_percent', 10)) . '٪ از واریزی اول و دوم'),
+            [[btn('📲 ارسال به مخاطب تلگرام', null,
+                ref_share_url($link, '🎁 با لینک من در ' . bot_name() . ' عضو شو'),
                 'success')],
              [btn('« دعوت دوستان', 'menu:ref', null, 'danger')]]);
         return;
@@ -903,6 +924,13 @@ function handle_callback_inner(array $cb): void
                 set_put('ref_mode', $mode === 'cash' ? 'cash' : 'percent');
                 Tg::answer($cbId, $mode === 'cash' ? 'پاداش نقدی ثابت فعال شد'
                     : 'پاداش درصدی فعال شد', false);
+                screen_referral_settings($chatId, $messageId);
+                return;
+            }
+            if ($op === 'when') {
+                set_put('ref_cash_when', ref_cash_when() === 'join' ? 'purchase' : 'join');
+                Tg::answer($cbId, ref_cash_when() === 'join'
+                    ? '💵 پاداش نقدی: لحظهٔ عضویت' : '🛒 پاداش نقدی: اولین خرید', false);
                 screen_referral_settings($chatId, $messageId);
                 return;
             }

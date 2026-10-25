@@ -27,7 +27,8 @@ const SETTING_DEFAULTS = [
     'sales_open'           => '1',
     'ref_percent'          => '10',
     'ref_mode'             => 'percent',      // percent = درصد واریزها · cash = پاداش نقدی ثابت
-    'ref_cash'             => '10000',        // مبلغ پاداش نقدی هر دعوت
+    'ref_cash'             => '10000',
+    'ref_cash_when'        => 'join',        // join = لحظهٔ عضویت · purchase = اولین خرید
     'ref_max_deposits'     => '2',            // قانون طلایی: فقط واریزی اول و دوم
     'web_domain'           => '',
     'web_url'              => '',

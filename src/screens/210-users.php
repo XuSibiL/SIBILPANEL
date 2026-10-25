@@ -1162,7 +1162,8 @@ function screen_referral_settings(int|string $chat, ?int $messageId): void
         . 'وضعیت: ' . ($enabled ? '🟢 فعال' : '🔴 خاموش') . "\n"
         . 'نوع پاداش: ' . ($mode === 'cash' ? '💵 نقدی ثابت' : '💯 درصدی از واریزها') . "\n";
     $text .= $mode === 'cash'
-        ? 'مبلغ پاداش هر دعوت: <b>' . money($cash) . "</b> (همان لحظهٔ استارت با لینک)\n"
+        ? 'مبلغ پاداش هر دعوت: <b>' . money($cash) . '</b> (' . (ref_cash_when() === 'join'
+            ? 'همان لحظهٔ استارت با لینک' : 'با اولین خرید یا شارژ زیرمجموعه') . ")\n"
         : 'درصد پورسانت: <b>' . fa_digits($percent) . "٪</b> — فقط واریزی اول و دوم\n";
     $text .= 'حداقل مبلغ واریز برای پورسانت: ' . money($min) . "\n"
         . 'دعوت‌شده‌ها: ' . fa_digits($invited) . ' · پاداش پرداخت‌شده: ' . money($paid) . "\n"
@@ -1184,12 +1185,25 @@ function screen_referral_settings(int|string $chat, ?int $messageId): void
              null, $mode === 'cash' ? 'success' : 'primary'),
          btn(($mode === 'percent' ? '✅ ' : '') . '💯 درصدی', 'ad:ref:mode:percent',
              null, $mode === 'percent' ? 'success' : 'primary')],
+        [btn('🎯 زمان پرداخت پاداش نقدی: ' . (ref_cash_when() === 'join'
+            ? 'لحظهٔ عضویت' : 'اولین خرید'), 'ad:ref:when', null, 'success')],
         [btn('💵 مبلغ پاداش نقدی', 'ad:ref:cash'), btn('💯 درصد پورسانت', 'ad:ref:percent')],
         [btn('💵 حداقل واریز', 'ad:ref:min'),
          btn('🔢 تعداد واریزی پورسانت', 'ad:ref:maxdep')],
         [btn('« تنظیمات', 'ad:setg:gift', null, 'danger')],
     ];
     Tg::show($chat, $messageId, $text, $buttons);
+}
+
+/**
+ * زمان پرداخت پاداش نقدی — انتخاب مدیر:
+ *  · 'join'     → همان لحظهٔ عضویت با لینک دعوت
+ *  · 'purchase' → با اولین خرید/شارژ زیرمجموعه
+ */
+function ref_cash_when(): string
+{
+    $when = (string) set_get('ref_cash_when', 'join');
+    return in_array($when, ['join', 'purchase'], true) ? $when : 'join';
 }
 
 /** حالت پاداش دعوت: percent (درصد واریزها) یا cash (نقدی ثابت) */
@@ -1213,6 +1227,50 @@ function deposit_count_up(int $tgId): int
         [$tgId]);
     return (int) DB::val('SELECT COALESCE(deposit_count,0) FROM users WHERE tg_id=?',
         [$tgId], 0);
+}
+
+/* ── لینک دعوت ──────────────────────────────────────────────────────────── */
+
+/** پیشوند استاندارد پارامتر استارت برای دعوت */
+const REF_PREFIX = 'ref_';
+
+/** لینک اختصاصی دعوت یک کاربر: https://t.me/<bot>?start=ref_<id> */
+function ref_link(int $tgId): string
+{
+    $handle = bot_username();
+    if ($handle === '' || $tgId <= 0) {
+        return '';
+    }
+    return 'https://t.me/' . $handle . '?start=' . REF_PREFIX . $tgId;
+}
+
+/** پارامتر استارت را به شناسهٔ معرف تبدیل می‌کند (ref_123 · ref-123 · 123) */
+function ref_parse_start(string $payload): int
+{
+    $payload = trim($payload);
+    if ($payload === '') {
+        return 0;
+    }
+    if (preg_match('~^ref[_-]?(\d{4,})$~i', $payload, $m)) {
+        return (int) $m[1];
+    }
+    if (ctype_digit($payload) && strlen($payload) >= 4) {
+        return (int) $payload;
+    }
+    return 0;
+}
+
+/** لینک اشتراک‌گذاری تلگرام برای فرستادن دعوت به دیگران */
+function ref_share_url(string $link, string $text = ''): string
+{
+    if ($link === '') {
+        return '';
+    }
+    $url = 'https://t.me/share/url?url=' . rawurlencode($link);
+    if ($text !== '') {
+        $url .= '&text=' . rawurlencode($text);
+    }
+    return $url;
 }
 
 /**
@@ -1249,8 +1307,9 @@ function referral_welcome_cash(int $newUserId): int
     add_balance($referrer, $cash, 'ref', (string) $newUserId, 'پاداش نقدی دعوت ' . $newUserId);
     log_line('info', 'referral cash reward', ['referrer' => $referrer, 'invited' => $newUserId,
         'amount' => $cash]);
-    Tg::send($referrer, '🎁 <b>' . money($cash) . "</b> پاداش دعوت به کیف پولتان اضافه شد.\n"
-        . 'یک کاربر تازه با لینک شما وارد ربات شد.');
+    Tg::send($referrer, '🎉 کاربری با لینک دعوت شما عضو شد و مبلغ <b>' . money($cash)
+        . "</b> به کیف پول شما اضافه گردید.\n\n"
+        . '💰 موجودی جدید: <b>' . money(balance_of($referrer)) . '</b>');
     post_report('🎁 <b>پاداش دعوت (نقدی)</b>' . "\n"
         . '👤 معرف: <code>' . $referrer . "</code>\n"
         . '🆕 دعوت‌شده: <code>' . $newUserId . "</code>\n"
@@ -1296,8 +1355,10 @@ function referral_deposit_payout(int $tgId, int $amount): int
         'پورسانت واریزی ' . $which . ' کاربر ' . $tgId);
     log_line('info', 'referral deposit commission', ['referrer' => $referrer,
         'invited' => $tgId, 'deposit' => $which, 'amount' => $reward]);
-    Tg::send($referrer, '🎁 <b>' . money($reward) . '</b> پورسانت به کیف پولتان اضافه شد.' . "\n"
-        . 'کاربری که دعوت کرده بودی واریزی شمارهٔ ' . fa_digits($which) . ' را انجام داد.');
+    Tg::send($referrer, '🎉 کاربری که با لینک دعوت شما عضو شده بود واریزی شمارهٔ '
+        . fa_digits($which) . ' را انجام داد و مبلغ <b>' . money($reward)
+        . "</b> به کیف پول شما اضافه گردید.\n\n"
+        . '💰 موجودی جدید: <b>' . money(balance_of($referrer)) . '</b>');
     post_report('🎁 <b>پورسانت دعوت</b>' . "\n"
         . '👤 معرف: <code>' . $referrer . "</code>\n"
         . '🆕 دعوت‌شده: <code>' . $tgId . "</code>\n"

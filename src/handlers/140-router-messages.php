@@ -52,6 +52,8 @@ function handle_message_inner(array $message): void
     }
     $name = trim((string) ($message['from']['first_name'] ?? '') . ' '
         . (string) ($message['from']['last_name'] ?? ''));
+    /* «کاربر تازه» یعنی هنوز هیچ رکوردی برایش نبود — ملاک ثبت دعوت و پاداش */
+    $isNewUser = user_get($uid) === null;
     $userRow = user_ensure($uid, $name, (string) ($message['from']['username'] ?? ''));
     $text = trim((string) ($message['text'] ?? ''));
     $state = State::get($uid);
@@ -77,8 +79,10 @@ function handle_message_inner(array $message): void
     /* ── /start و /help ─────────────────────────────────────────────── */
     if ($text !== '' && str_starts_with($text, '/start')) {
         $payload = trim(substr($text, 6));
-        if ($payload !== '' && ctype_digit($payload) && (int) $payload !== $uid) {
-            referral_credit((int) $payload, $uid);
+        $referrer = ref_parse_start($payload);
+        if ($referrer > 0) {
+            /* فقط کاربر تازه دعوت ثبت می‌کند؛ کاربر قدیمی پاداش دوباره نمی‌گیرد */
+            referral_credit($referrer, $uid, $isNewUser);
         }
         State::clear($uid);
         show_home($chatId, null, $uid);
@@ -400,25 +404,56 @@ function handle_message_inner(array $message): void
     /* غیر از این، ربات ساکت می‌ماند و به پیام‌های آزاد جواب نمی‌دهد */
 }
 
-function referral_credit(int $referrerId, int $newUserId): void
+/**
+ * ثبت دعوت و واریز قطعی پاداش.
+ *  · فقط کاربر تازه ثبت می‌شود (کاربر قدیمی معرف عوض نمی‌کند)
+ *  · کسی با لینک خودش عضو نمی‌شود
+ *  · حالت «نقدی ثابت» → همان لحظهٔ عضویت به کیف پول معرف
+ *  · حالت «درصدی» → با اولین/دومین واریزی زیرمجموعه (در settle_payment)
+ * خروجی: مبلغ پاداش نقدی پرداخت‌شده (۰ = پاداش نقدی نبود یا قبلاً پرداخت شده).
+ */
+function referral_credit(int $referrerId, int $newUserId, bool $isNewUser = true): int
 {
-    if ($referrerId === $newUserId) {
-        return;
+    if ($referrerId <= 0 || $newUserId <= 0 || $referrerId === $newUserId) {
+        return 0;   // دعوت خود
     }
-    $existing = DB::one('SELECT tg_id FROM users WHERE tg_id=?', [$referrerId]);
-    if ($existing === null) {
-        return;
+    if (!set_bool('ref_enabled', true)) {
+        return 0;
     }
-    DB::exec('INSERT OR IGNORE INTO settings(key, value) VALUES(?,?)', ['_ref_' . $newUserId, (string) $referrerId]);
+    if (!$isNewUser) {
+        return 0;   // فقط عضو جدید
+    }
+    if (user_get($referrerId) === null) {
+        return 0;   // معرف در ربات نیست
+    }
+    $user = user_get($newUserId);
+    if ($user === null) {
+        return 0;
+    }
+    $current = (int) ($user['referred_by'] ?? 0);
+    if ($current > 0 && $current !== $referrerId) {
+        return 0;   // قبلاً به کسی نسبت داده شده
+    }
+    DB::exec('INSERT OR IGNORE INTO settings(key, value) VALUES(?,?)',
+        ['_ref_' . $newUserId, (string) $referrerId]);
     $attached = DB::update('UPDATE users SET referred_by=? WHERE tg_id=? '
         . 'AND (referred_by IS NULL OR referred_by=0)', [$referrerId, $newUserId]);
-    if ($attached > 0) {
-        /* حالت «پاداش نقدی ثابت»: همان لحظهٔ استارت با لینک، پاداش واریز می‌شود */
-        try {
-            referral_welcome_cash($newUserId);
-        } catch (Throwable $ex) {
-            log_line('warning', 'referral welcome cash failed: ' . $ex->getMessage());
-        }
+    if ($attached === 0) {
+        return 0;   // پیش‌تر ثبت شده؛ پاداش دوباره پرداخت نمی‌شود
+    }
+    log_line('info', 'referral joined', ['referrer' => $referrerId, 'invited' => $newUserId]);
+    post_report('👥 <b>دعوت تازه</b>' . "\n"
+        . '👤 معرف: <code>' . $referrerId . "</code>\n"
+        . '🆕 دعوت‌شده: <code>' . $newUserId . '</code>', 'sales');
+    if (ref_mode() !== 'cash' || ref_cash_when() !== 'join') {
+        return 0;   // درصدی است، یا مدیر گفته با اولین خرید پرداخت شود
+    }
+    /* پاداش نقدی ثابت: همان لحظهٔ عضویت، با پیام اعلان برای معرف */
+    try {
+        return referral_welcome_cash($newUserId);
+    } catch (Throwable $ex) {
+        log_line('warning', 'referral welcome cash failed: ' . $ex->getMessage());
+        return 0;
     }
 }
 

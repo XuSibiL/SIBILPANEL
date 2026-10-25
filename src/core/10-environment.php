@@ -244,6 +244,40 @@ function brand(): string
     return bot_name();
 }
 
+/**
+ * یوزرنیم ربات بدون @ — برای لینک دعوت و هر لینک عمومی.
+ * ترتیب خواندن: تنظیمات ربات → `.env` → پاسخ getMe (یک‌بار پرسیده و کش می‌شود).
+ * هرگز داخل کد هاردکد نیست؛ اگر هیچ‌کدام نبود رشتهٔ خالی برمی‌گردد تا
+ * لینک خراب (`https://t.me/?start=…`) ساخته نشود.
+ */
+function bot_username(): string
+{
+    if (isset($GLOBALS['__bot_username_cache'])) {
+        return (string) $GLOBALS['__bot_username_cache'];
+    }
+    $handle = trim(ltrim((string) set_get('bot_username', ''), '@'));
+    if ($handle === '') {
+        $handle = trim(ltrim(cfg('PANEL_BOT_USERNAME', ''), '@'));
+    }
+    if ($handle === '' && function_exists('Tg')) {
+        $res = Tg::call('getMe');
+        $name = is_array($res) ? (string) ($res['result']['username'] ?? '') : '';
+        $handle = trim(ltrim($name, '@'));
+        if ($handle !== '' && !Tg::$dry) {
+            set_put('bot_username', $handle);   // کش برای دفعهٔ بعد، بدون تماس اضافه
+        }
+    }
+    $GLOBALS['__bot_username_cache'] = $handle;
+    return $handle;
+}
+
+/** پاک‌کردن کش یوزرنیم (بعد از تغییر توکن ربات) */
+function bot_username_forget(): void
+{
+    unset($GLOBALS['__bot_username_cache']);
+    set_put('bot_username', '');
+}
+
 function db_path(): string
 {
     return cfg('PANEL_DB', panel_home() . '/sibil.sqlite3');

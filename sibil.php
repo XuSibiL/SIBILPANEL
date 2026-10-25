@@ -21,7 +21,7 @@
 
 declare(strict_types=1);
 
-const PANEL_VERSION = '3.16.0';
+const PANEL_VERSION = '3.16.1';
 const IRAN_OFFSET   = 3.5 * 3600;
 const DAY           = 86400;
 
@@ -266,6 +266,40 @@ function bot_name(): string
 function brand(): string
 {
     return bot_name();
+}
+
+/**
+ * یوزرنیم ربات بدون @ — برای لینک دعوت و هر لینک عمومی.
+ * ترتیب خواندن: تنظیمات ربات → `.env` → پاسخ getMe (یک‌بار پرسیده و کش می‌شود).
+ * هرگز داخل کد هاردکد نیست؛ اگر هیچ‌کدام نبود رشتهٔ خالی برمی‌گردد تا
+ * لینک خراب (`https://t.me/?start=…`) ساخته نشود.
+ */
+function bot_username(): string
+{
+    if (isset($GLOBALS['__bot_username_cache'])) {
+        return (string) $GLOBALS['__bot_username_cache'];
+    }
+    $handle = trim(ltrim((string) set_get('bot_username', ''), '@'));
+    if ($handle === '') {
+        $handle = trim(ltrim(cfg('PANEL_BOT_USERNAME', ''), '@'));
+    }
+    if ($handle === '' && function_exists('Tg')) {
+        $res = Tg::call('getMe');
+        $name = is_array($res) ? (string) ($res['result']['username'] ?? '') : '';
+        $handle = trim(ltrim($name, '@'));
+        if ($handle !== '' && !Tg::$dry) {
+            set_put('bot_username', $handle);   // کش برای دفعهٔ بعد، بدون تماس اضافه
+        }
+    }
+    $GLOBALS['__bot_username_cache'] = $handle;
+    return $handle;
+}
+
+/** پاک‌کردن کش یوزرنیم (بعد از تغییر توکن ربات) */
+function bot_username_forget(): void
+{
+    unset($GLOBALS['__bot_username_cache']);
+    set_put('bot_username', '');
 }
 
 function db_path(): string
@@ -978,7 +1012,8 @@ const SETTING_DEFAULTS = [
     'sales_open'           => '1',
     'ref_percent'          => '10',
     'ref_mode'             => 'percent',      // percent = درصد واریزها · cash = پاداش نقدی ثابت
-    'ref_cash'             => '10000',        // مبلغ پاداش نقدی هر دعوت
+    'ref_cash'             => '10000',
+    'ref_cash_when'        => 'join',        // join = لحظهٔ عضویت · purchase = اولین خرید
     'ref_max_deposits'     => '2',            // قانون طلایی: فقط واریزی اول و دوم
     'web_domain'           => '',
     'web_url'              => '',
@@ -11594,6 +11629,9 @@ function settle_payment(array $order, string $source = 'wallet', int $adminId = 
         /* شمارش واریزی + پورسانت معرف (فقط واریزی اول و دوم) */
         try {
             $depositNo = deposit_count_up($tgId);
+            if (ref_mode() === 'cash' && ref_cash_when() === 'purchase') {
+                referral_welcome_cash($tgId);   // پاداش نقدی معلق، با اولین شارژ
+            }
             $commission = referral_deposit_payout($tgId, $amount);
             if ($commission > 0) {
                 log_payment('referral commission', ['user' => $tgId, 'deposit' => $depositNo,
@@ -11662,7 +11700,12 @@ function settle_payment(array $order, string $source = 'wallet', int $adminId = 
     if ($ok) {
         order_mark((int) $order['id'], 'delivered');
         try {
-            referral_payout($order);
+            /* پاداش نقدی‌ای که مدیر روی «اولین خرید» گذاشته، همین‌جا آزاد می‌شود */
+            if (ref_mode() === 'cash' && ref_cash_when() === 'purchase') {
+                referral_welcome_cash($tgId);
+            } else {
+                referral_payout($order);
+            }
         } catch (Throwable $ex) {
             log_line('warning', 'referral payout failed: ' . $ex->getMessage());
         }
@@ -12880,8 +12923,8 @@ function handle_callback_inner(array $cb): void
                 screen_trial($chatId, $messageId, $uid);
                 return;
             case 'ref':
-                $link = 'https://t.me/' . cfg('PANEL_BOT_USERNAME', '')
-                    . '?start=' . $uid;
+                /* لینک از یوزرنیم رسمی ربات ساخته می‌شود (تنظیمات → .env → getMe) */
+                $link = ref_link($uid);
                 $percent = set_int('ref_percent', 10);
                 $minBuy = set_int('ref_min', 0);
                 $invited = (int) DB::val('SELECT COUNT(*) FROM users WHERE referred_by=?',
@@ -12905,14 +12948,21 @@ function handle_callback_inner(array $cb): void
                             . '٪ به کیف پولتان اضافه می‌شود'
                             . ($minBuy > 0 ? ' (واریز بالای ' . money($minBuy) . ')' : ''))
                     . "\n\n"
-                    . 'لینک اختصاصی شما:' . "\n<code>" . e($link) . '</code>';
+                    . ($link !== ''
+                        ? 'لینک اختصاصی شما:' . "\n<code>" . e($link) . '</code>'
+                        : '⚠️ لینک دعوت ساخته نشد: یوزرنیم ربات تنظیم نشده است.');
                 if (!set_bool('ref_enabled', true)) {
                     $text .= "\n\n🔴 برنامهٔ دعوت فعلاً خاموش است.";
                 }
-                Tg::show($chatId, $messageId, $text, [
-                    [btn('📤 اشتراک لینک', 'ref:share', null, 'success')],
-                    [btn('« بازگشت', 'home', null, 'danger')],
-                ]);
+                $refRows = [];
+                if ($link !== '') {
+                    $refRows[] = [btn('📤 اشتراک‌گذاری لینک', null,
+                        ref_share_url($link, '🎁 با لینک من در ' . bot_name() . ' عضو شو'),
+                        'success')];
+                    $refRows[] = [btn('📋 فرستادن لینک به دوست', 'ref:share', null, 'primary')];
+                }
+                $refRows[] = [btn('« بازگشت', 'home', null, 'danger')];
+                Tg::show($chatId, $messageId, $text, $refRows);
                 return;
         }
     }
@@ -12925,13 +12975,27 @@ function handle_callback_inner(array $cb): void
         return;
     }
     if ($head === 'ref') {
-        $link = 'https://t.me/' . cfg('PANEL_BOT_USERNAME', '') . '?start=' . $uid;
-        $share = rawurlencode("🎁 با لینک من عضو شو:\n" . $link);
-        Tg::answer($cbId, 'لینک کپی شد', false);
-        Tg::send($chatId, '📤 لینک خودتان را برای دوستانت بفرستید:' . "\n\n"
-            . '<code>' . e($link) . '</code>',
-            [[btn('📲 اشتراک در تلگرام', null,
-                'https://t.me/share/url?url=' . $share . '&text=' . rawurlencode(bot_name()),
+        $link = ref_link($uid);
+        if ($link === '') {
+            Tg::answer($cbId, '⚠️ یوزرنیم ربات تنظیم نشده است.', true);
+            Tg::show($chatId, $messageId,
+                "⚠️ <b>لینک دعوت ساخته نشد</b>\n\n"
+                . 'یوزرنیم ربات روی سرور تنظیم نشده است. مدیر باید در '. "\n"
+                . '<code>.env</code> مقدار <code>PANEL_BOT_USERNAME</code> را بگذارد '
+                . '(بدون @) یا یک‌بار ربات را ری‌استارت کند تا خودکار خوانده شود.',
+                [[btn('« دعوت دوستان', 'menu:ref', null, 'danger')]]);
+            return;
+        }
+        Tg::answer($cbId, '📤 لینک آمادهٔ ارسال است', false);
+        Tg::send($chatId, '📤 <b>لینک اختصاصی شما</b>' . "\n" . SEP . "\n"
+            . '<code>' . e($link) . '</code>' . "\n\n"
+            . 'با یک ضربه روی لینک کپی می‌شود؛ با دکمهٔ زیر مستقیم در تلگرام '
+            . 'برای دوستتان بفرستید.' . "\n\n"
+            . '🎁 پاداش شما: ' . (ref_mode() === 'cash'
+                ? money(set_int('ref_cash', 10000)) . ' نقدی برای هر عضو جدید'
+                : fa_digits(set_int('ref_percent', 10)) . '٪ از واریزی اول و دوم'),
+            [[btn('📲 ارسال به مخاطب تلگرام', null,
+                ref_share_url($link, '🎁 با لینک من در ' . bot_name() . ' عضو شو'),
                 'success')],
              [btn('« دعوت دوستان', 'menu:ref', null, 'danger')]]);
         return;
@@ -13591,6 +13655,13 @@ function handle_callback_inner(array $cb): void
                 set_put('ref_mode', $mode === 'cash' ? 'cash' : 'percent');
                 Tg::answer($cbId, $mode === 'cash' ? 'پاداش نقدی ثابت فعال شد'
                     : 'پاداش درصدی فعال شد', false);
+                screen_referral_settings($chatId, $messageId);
+                return;
+            }
+            if ($op === 'when') {
+                set_put('ref_cash_when', ref_cash_when() === 'join' ? 'purchase' : 'join');
+                Tg::answer($cbId, ref_cash_when() === 'join'
+                    ? '💵 پاداش نقدی: لحظهٔ عضویت' : '🛒 پاداش نقدی: اولین خرید', false);
                 screen_referral_settings($chatId, $messageId);
                 return;
             }
@@ -14704,6 +14775,8 @@ function handle_message_inner(array $message): void
     }
     $name = trim((string) ($message['from']['first_name'] ?? '') . ' '
         . (string) ($message['from']['last_name'] ?? ''));
+    /* «کاربر تازه» یعنی هنوز هیچ رکوردی برایش نبود — ملاک ثبت دعوت و پاداش */
+    $isNewUser = user_get($uid) === null;
     $userRow = user_ensure($uid, $name, (string) ($message['from']['username'] ?? ''));
     $text = trim((string) ($message['text'] ?? ''));
     $state = State::get($uid);
@@ -14729,8 +14802,10 @@ function handle_message_inner(array $message): void
     /* ── /start و /help ─────────────────────────────────────────────── */
     if ($text !== '' && str_starts_with($text, '/start')) {
         $payload = trim(substr($text, 6));
-        if ($payload !== '' && ctype_digit($payload) && (int) $payload !== $uid) {
-            referral_credit((int) $payload, $uid);
+        $referrer = ref_parse_start($payload);
+        if ($referrer > 0) {
+            /* فقط کاربر تازه دعوت ثبت می‌کند؛ کاربر قدیمی پاداش دوباره نمی‌گیرد */
+            referral_credit($referrer, $uid, $isNewUser);
         }
         State::clear($uid);
         show_home($chatId, null, $uid);
@@ -15052,25 +15127,56 @@ function handle_message_inner(array $message): void
     /* غیر از این، ربات ساکت می‌ماند و به پیام‌های آزاد جواب نمی‌دهد */
 }
 
-function referral_credit(int $referrerId, int $newUserId): void
+/**
+ * ثبت دعوت و واریز قطعی پاداش.
+ *  · فقط کاربر تازه ثبت می‌شود (کاربر قدیمی معرف عوض نمی‌کند)
+ *  · کسی با لینک خودش عضو نمی‌شود
+ *  · حالت «نقدی ثابت» → همان لحظهٔ عضویت به کیف پول معرف
+ *  · حالت «درصدی» → با اولین/دومین واریزی زیرمجموعه (در settle_payment)
+ * خروجی: مبلغ پاداش نقدی پرداخت‌شده (۰ = پاداش نقدی نبود یا قبلاً پرداخت شده).
+ */
+function referral_credit(int $referrerId, int $newUserId, bool $isNewUser = true): int
 {
-    if ($referrerId === $newUserId) {
-        return;
+    if ($referrerId <= 0 || $newUserId <= 0 || $referrerId === $newUserId) {
+        return 0;   // دعوت خود
     }
-    $existing = DB::one('SELECT tg_id FROM users WHERE tg_id=?', [$referrerId]);
-    if ($existing === null) {
-        return;
+    if (!set_bool('ref_enabled', true)) {
+        return 0;
     }
-    DB::exec('INSERT OR IGNORE INTO settings(key, value) VALUES(?,?)', ['_ref_' . $newUserId, (string) $referrerId]);
+    if (!$isNewUser) {
+        return 0;   // فقط عضو جدید
+    }
+    if (user_get($referrerId) === null) {
+        return 0;   // معرف در ربات نیست
+    }
+    $user = user_get($newUserId);
+    if ($user === null) {
+        return 0;
+    }
+    $current = (int) ($user['referred_by'] ?? 0);
+    if ($current > 0 && $current !== $referrerId) {
+        return 0;   // قبلاً به کسی نسبت داده شده
+    }
+    DB::exec('INSERT OR IGNORE INTO settings(key, value) VALUES(?,?)',
+        ['_ref_' . $newUserId, (string) $referrerId]);
     $attached = DB::update('UPDATE users SET referred_by=? WHERE tg_id=? '
         . 'AND (referred_by IS NULL OR referred_by=0)', [$referrerId, $newUserId]);
-    if ($attached > 0) {
-        /* حالت «پاداش نقدی ثابت»: همان لحظهٔ استارت با لینک، پاداش واریز می‌شود */
-        try {
-            referral_welcome_cash($newUserId);
-        } catch (Throwable $ex) {
-            log_line('warning', 'referral welcome cash failed: ' . $ex->getMessage());
-        }
+    if ($attached === 0) {
+        return 0;   // پیش‌تر ثبت شده؛ پاداش دوباره پرداخت نمی‌شود
+    }
+    log_line('info', 'referral joined', ['referrer' => $referrerId, 'invited' => $newUserId]);
+    post_report('👥 <b>دعوت تازه</b>' . "\n"
+        . '👤 معرف: <code>' . $referrerId . "</code>\n"
+        . '🆕 دعوت‌شده: <code>' . $newUserId . '</code>', 'sales');
+    if (ref_mode() !== 'cash' || ref_cash_when() !== 'join') {
+        return 0;   // درصدی است، یا مدیر گفته با اولین خرید پرداخت شود
+    }
+    /* پاداش نقدی ثابت: همان لحظهٔ عضویت، با پیام اعلان برای معرف */
+    try {
+        return referral_welcome_cash($newUserId);
+    } catch (Throwable $ex) {
+        log_line('warning', 'referral welcome cash failed: ' . $ex->getMessage());
+        return 0;
     }
 }
 
@@ -20060,7 +20166,8 @@ function screen_referral_settings(int|string $chat, ?int $messageId): void
         . 'وضعیت: ' . ($enabled ? '🟢 فعال' : '🔴 خاموش') . "\n"
         . 'نوع پاداش: ' . ($mode === 'cash' ? '💵 نقدی ثابت' : '💯 درصدی از واریزها') . "\n";
     $text .= $mode === 'cash'
-        ? 'مبلغ پاداش هر دعوت: <b>' . money($cash) . "</b> (همان لحظهٔ استارت با لینک)\n"
+        ? 'مبلغ پاداش هر دعوت: <b>' . money($cash) . '</b> (' . (ref_cash_when() === 'join'
+            ? 'همان لحظهٔ استارت با لینک' : 'با اولین خرید یا شارژ زیرمجموعه') . ")\n"
         : 'درصد پورسانت: <b>' . fa_digits($percent) . "٪</b> — فقط واریزی اول و دوم\n";
     $text .= 'حداقل مبلغ واریز برای پورسانت: ' . money($min) . "\n"
         . 'دعوت‌شده‌ها: ' . fa_digits($invited) . ' · پاداش پرداخت‌شده: ' . money($paid) . "\n"
@@ -20082,12 +20189,25 @@ function screen_referral_settings(int|string $chat, ?int $messageId): void
              null, $mode === 'cash' ? 'success' : 'primary'),
          btn(($mode === 'percent' ? '✅ ' : '') . '💯 درصدی', 'ad:ref:mode:percent',
              null, $mode === 'percent' ? 'success' : 'primary')],
+        [btn('🎯 زمان پرداخت پاداش نقدی: ' . (ref_cash_when() === 'join'
+            ? 'لحظهٔ عضویت' : 'اولین خرید'), 'ad:ref:when', null, 'success')],
         [btn('💵 مبلغ پاداش نقدی', 'ad:ref:cash'), btn('💯 درصد پورسانت', 'ad:ref:percent')],
         [btn('💵 حداقل واریز', 'ad:ref:min'),
          btn('🔢 تعداد واریزی پورسانت', 'ad:ref:maxdep')],
         [btn('« تنظیمات', 'ad:setg:gift', null, 'danger')],
     ];
     Tg::show($chat, $messageId, $text, $buttons);
+}
+
+/**
+ * زمان پرداخت پاداش نقدی — انتخاب مدیر:
+ *  · 'join'     → همان لحظهٔ عضویت با لینک دعوت
+ *  · 'purchase' → با اولین خرید/شارژ زیرمجموعه
+ */
+function ref_cash_when(): string
+{
+    $when = (string) set_get('ref_cash_when', 'join');
+    return in_array($when, ['join', 'purchase'], true) ? $when : 'join';
 }
 
 /** حالت پاداش دعوت: percent (درصد واریزها) یا cash (نقدی ثابت) */
@@ -20111,6 +20231,50 @@ function deposit_count_up(int $tgId): int
         [$tgId]);
     return (int) DB::val('SELECT COALESCE(deposit_count,0) FROM users WHERE tg_id=?',
         [$tgId], 0);
+}
+
+/* ── لینک دعوت ──────────────────────────────────────────────────────────── */
+
+/** پیشوند استاندارد پارامتر استارت برای دعوت */
+const REF_PREFIX = 'ref_';
+
+/** لینک اختصاصی دعوت یک کاربر: https://t.me/<bot>?start=ref_<id> */
+function ref_link(int $tgId): string
+{
+    $handle = bot_username();
+    if ($handle === '' || $tgId <= 0) {
+        return '';
+    }
+    return 'https://t.me/' . $handle . '?start=' . REF_PREFIX . $tgId;
+}
+
+/** پارامتر استارت را به شناسهٔ معرف تبدیل می‌کند (ref_123 · ref-123 · 123) */
+function ref_parse_start(string $payload): int
+{
+    $payload = trim($payload);
+    if ($payload === '') {
+        return 0;
+    }
+    if (preg_match('~^ref[_-]?(\d{4,})$~i', $payload, $m)) {
+        return (int) $m[1];
+    }
+    if (ctype_digit($payload) && strlen($payload) >= 4) {
+        return (int) $payload;
+    }
+    return 0;
+}
+
+/** لینک اشتراک‌گذاری تلگرام برای فرستادن دعوت به دیگران */
+function ref_share_url(string $link, string $text = ''): string
+{
+    if ($link === '') {
+        return '';
+    }
+    $url = 'https://t.me/share/url?url=' . rawurlencode($link);
+    if ($text !== '') {
+        $url .= '&text=' . rawurlencode($text);
+    }
+    return $url;
 }
 
 /**
@@ -20147,8 +20311,9 @@ function referral_welcome_cash(int $newUserId): int
     add_balance($referrer, $cash, 'ref', (string) $newUserId, 'پاداش نقدی دعوت ' . $newUserId);
     log_line('info', 'referral cash reward', ['referrer' => $referrer, 'invited' => $newUserId,
         'amount' => $cash]);
-    Tg::send($referrer, '🎁 <b>' . money($cash) . "</b> پاداش دعوت به کیف پولتان اضافه شد.\n"
-        . 'یک کاربر تازه با لینک شما وارد ربات شد.');
+    Tg::send($referrer, '🎉 کاربری با لینک دعوت شما عضو شد و مبلغ <b>' . money($cash)
+        . "</b> به کیف پول شما اضافه گردید.\n\n"
+        . '💰 موجودی جدید: <b>' . money(balance_of($referrer)) . '</b>');
     post_report('🎁 <b>پاداش دعوت (نقدی)</b>' . "\n"
         . '👤 معرف: <code>' . $referrer . "</code>\n"
         . '🆕 دعوت‌شده: <code>' . $newUserId . "</code>\n"
@@ -20194,8 +20359,10 @@ function referral_deposit_payout(int $tgId, int $amount): int
         'پورسانت واریزی ' . $which . ' کاربر ' . $tgId);
     log_line('info', 'referral deposit commission', ['referrer' => $referrer,
         'invited' => $tgId, 'deposit' => $which, 'amount' => $reward]);
-    Tg::send($referrer, '🎁 <b>' . money($reward) . '</b> پورسانت به کیف پولتان اضافه شد.' . "\n"
-        . 'کاربری که دعوت کرده بودی واریزی شمارهٔ ' . fa_digits($which) . ' را انجام داد.');
+    Tg::send($referrer, '🎉 کاربری که با لینک دعوت شما عضو شده بود واریزی شمارهٔ '
+        . fa_digits($which) . ' را انجام داد و مبلغ <b>' . money($reward)
+        . "</b> به کیف پول شما اضافه گردید.\n\n"
+        . '💰 موجودی جدید: <b>' . money(balance_of($referrer)) . '</b>');
     post_report('🎁 <b>پورسانت دعوت</b>' . "\n"
         . '👤 معرف: <code>' . $referrer . "</code>\n"
         . '🆕 دعوت‌شده: <code>' . $tgId . "</code>\n"
