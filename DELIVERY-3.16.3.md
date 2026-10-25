@@ -18,7 +18,8 @@
 |---|---|---|
 | نسخهٔ دوردست در `sibil update` / `sibil check` | کش یک‌ساعته | **همیشه تازه** (`remote_version_now`) |
 | کش | منبع اصلی | فقط پشتیبان **آفلاین** (برچسب `offline-cache`) |
-| منبع نسخه | اول ریلیز، بعد VERSION | **بیشترین مقدار** بین ریلیز + تگ‌ها + `VERSION` |
+| منبع نسخه | اول ریلیز، بعد VERSION | **بیشترین مقدار** بین Contents API + ریلیز + تگ‌ها + `VERSION` |
+| کش CDN گیت‌هاب | `raw.githubusercontent` تا ۵ دقیقه نسخهٔ کهنه می‌داد (`x-cache: HIT`) | `Contents API` اضافه شد که **همان لحظهٔ پوش** به‌روز است |
 | درخواست‌ها | قابل کش شدن توسط CDN | `Cache-Control: no-cache` + `?t=<زمان>` |
 | دانلود بسته | ممکن بود نسخهٔ کش‌شدهٔ CDN بیاید | همان هدر no-cache روی دانلود آرشیو |
 | بعد از آپدیت | فقط «انجام شد» | نسخهٔ نصب‌شده چاپ و با گیت‌هاب مقایسه می‌شود |
@@ -75,7 +76,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/XuSibiL/SIBILPANEL/main/instal
 ## تست
 
 ```
-test_all 843/0 · test_panel_flow 225/0 · test_kyc 188/0
+test_all 846/0 · test_panel_flow 225/0 · test_kyc 188/0
 test_payments 166/0 · test_update 101/0 · audit_buttons OK · audit_owner OK
 ```
 
@@ -96,6 +97,6 @@ cache (planted): 3.16.1
 
 | فایل | حجم | md5 |
 |---|---|---|
-| `release/panel-service-3.16.3-src.tar.gz` | 1,050,720 | `618d9c68bf9270d36cd5f3f496205088` |
-| `release/panel-service-3.16.3-src.zip` | 1,083,449 | `6ddcb83463e92af50a909fbf10a6407b` |
-| `dist/sibil-installer.sh` | 1,783,231 | `14b63d370643287287407e5b5b68201b` |
+| `release/panel-service-3.16.3-src.tar.gz` | 1,051,907 | `9d8d58d2b1ea660d6ee3e2681641914f` |
+| `release/panel-service-3.16.3-src.zip` | 1,084,328 | `eb39dc82b7474cc39b4fdb90d1c101f2` |
+| `dist/sibil-installer.sh` | 1,786,215 | `1857fc7993df33de700bbb4c512d7dbe` |

@@ -2802,6 +2802,36 @@ function update_bust_url(string $url): string
     return $url . (str_contains($url, '?') ? '&' : '?') . 't=' . time() . mt_rand(100, 999);
 }
 
+/**
+ * نسخهٔ فایل VERSION از Contents API گیت‌هاب.
+ * `raw.githubusercontent.com` تا ۵ دقیقه پس از پوش، نسخهٔ کهنه را از کش
+ * (x-cache: HIT) برمی‌گرداند؛ این مسیر همان لحظه به‌روز است.
+ */
+function update_version_contents_api(string $repo, string $branch): string
+{
+    [$body, $status] = update_http_get(update_bust_url(
+        'https://api.github.com/repos/' . $repo . '/contents/VERSION?ref='
+        . rawurlencode($branch)), 10);
+    if ($status < 200 || $status >= 300 || $body === '') {
+        return '';
+    }
+    $json = json_decode($body, true);
+    if (!is_array($json) || ($json['encoding'] ?? '') !== 'base64'
+        || !isset($json['content'])) {
+        return '';
+    }
+    /* JSON رشتهٔ base64 را با «\\n» می‌فرستد؛ قبل از decode پاک می‌شود */
+    $b64 = (string) $json['content'];
+    $b64 = str_replace(chr(92) . 'n', '', $b64);
+    $b64 = str_replace(["\n", "\r", ' '], '', $b64);
+    $decoded = base64_decode($b64, true);
+    if ($decoded === false) {
+        return '';
+    }
+    $version = trim($decoded);
+    return preg_match('/^\d+(\.\d+)*$/', $version) ? $version : '';
+}
+
 /** بالاترین نسخهٔ معتبر از میان چند مقدار */
 function update_max_version(string ...$versions): string
 {
@@ -2839,8 +2869,15 @@ function update_remote_version(bool $force = true): array
 
     $release = '';
     $versionFile = '';
+    $contents = '';
     $tags = '';
     $sources = [];
+
+    /* ۰) Contents API — همان لحظهٔ پوش به‌روز است (بدون کش CDN) */
+    $contents = update_version_contents_api($repo, update_branch());
+    if ($contents !== '') {
+        $sources[] = 'contents-api';
+    }
 
     /* ۱) ریلیز رسمی */
     [$body, $status] = update_http_get(update_bust_url(
@@ -2880,11 +2917,12 @@ function update_remote_version(bool $force = true): array
         }
     }
 
-    $version = update_max_version($release, $versionFile, $tags);
+    $version = update_max_version($contents, $release, $versionFile, $tags);
 
     if ($version !== '') {
-        $source = $version === $release ? 'release'
-            : ($version === $versionFile ? 'version-file' : 'tags');
+        $source = $version === $contents ? 'contents-api'
+            : ($version === $release ? 'release'
+                : ($version === $versionFile ? 'version-file' : 'tags'));
         set_put('update_remote', json_encode(
             ['version' => $version, 'source' => $source, 'at' => time()]));
         return ['version' => $version, 'source' => $source, 'cached' => false];

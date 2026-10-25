@@ -177,27 +177,37 @@ _gh_get() {   # _gh_get URL  → بدنه (با هدر no-cache و پارامت�
         "$url$([[ "$url" == *\?* ]] && printf '&' || printf '?')t=$(date +%s)$RANDOM" 2>/dev/null
 }
 
-# نسخهٔ زندهٔ گیت‌هاب: بالاترین مقدار از ریلیز، فایل VERSION و تگ‌ها
+# نسخهٔ زندهٔ گیت‌هاب: بالاترین مقدار از Contents API، ریلیز، فایل VERSION و تگ‌ها
 remote_version_live() {
-    local repo branch tag raw tags taglist v
+    local repo branch tag raw contents tags taglist v
     repo="$(git_repo)"
     branch="$(git_branch)"
 
-    # ۱) ریلیز رسمی (اگر منتشر شده باشد)
+    # ۱) Contents API — همان لحظهٔ پوش به‌روز می‌شود
+    #    (raw.githubusercontent تا ۵ دقیقه `x-cache: HIT` می‌دهد و نسخهٔ کهنه
+    #     را برمی‌گرداند؛ این منبع آن مشکل را دور می‌زند)
+    contents="$(_gh_get "https://api.github.com/repos/$repo/contents/VERSION?ref=$branch" \
+        | sed -n 's/.*"content" *: *"\([^"]*\)".*/\1/p' | head -1 | sed 's/\\n//g')"
+    if [[ -n "$contents" ]]; then
+        contents="$(printf '%s' "$contents" | base64 -d 2>/dev/null | tr -d ' \r\n')"
+    fi
+    [[ "$contents" =~ ^[0-9]+(\.[0-9]+)*$ ]] || contents=""
+
+    # ۲) ریلیز رسمی (اگر منتشر شده باشد)
     tag="$(_gh_get "https://api.github.com/repos/$repo/releases/latest" \
         | sed -n 's/.*"tag_name" *: *"\([^"]*\)".*/\1/p' | head -1)"
 
-    # ۲) فایل VERSION روی همان برنچ — منبع اصلی و همیشه به‌روز
+    # ۳) فایل VERSION خام — سریع، ولی ممکن است چند دقیقه عقب باشد
     raw="$(_gh_get "https://raw.githubusercontent.com/$repo/$branch/VERSION" | head -1)"
 
     taglist=""
-    if [[ -z "$tag" && -z "$raw" ]]; then
-        # ۳) آخرین تگ‌ها (اگر ریلیز و فایل VERSION هر دو در دسترس نبودند)
+    if [[ -z "$contents" && -z "$tag" && -z "$raw" ]]; then
+        # ۴) آخرین تگ‌ها (اگر هیچ منبع دیگری جواب نداد)
         taglist="$(_gh_get "https://api.github.com/repos/$repo/tags?per_page=100" \
             | sed -n 's/.*"name" *: *"\([^"]*\)".*/\1/p' | tr '\n' ' ')"
     fi
 
-    v="$(version_max "$tag" "$raw" $taglist)"
+    v="$(version_max "$contents" "$tag" "$raw" $taglist)"
     printf '%s' "$v"
 }
 
