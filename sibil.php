@@ -21,7 +21,7 @@
 
 declare(strict_types=1);
 
-const PANEL_VERSION = '3.16.1';
+const PANEL_VERSION = '3.16.2';
 const IRAN_OFFSET   = 3.5 * 3600;
 const DAY           = 86400;
 
@@ -283,15 +283,35 @@ function bot_username(): string
     if ($handle === '') {
         $handle = trim(ltrim(cfg('PANEL_BOT_USERNAME', ''), '@'));
     }
-    if ($handle === '' && function_exists('Tg')) {
+    /* `Tg` یک کلاس است، نه تابع؛ با class_exists بررسی می‌شود (باگ 3.16.1) */
+    if ($handle === '' && class_exists('Tg')) {
+        $handle = bot_username_fetch();
+    }
+    $GLOBALS['__bot_username_cache'] = $handle;
+    return $handle;
+}
+
+/**
+ * خواندن یوزرنیم از خود تلگرام (getMe) و ذخیرهٔ آن.
+ * این تنها منبع «خودکار» است: هیچ‌جا لازم نیست مدیر یوزرنیم را دستی وارد کند.
+ * خروجی: یوزرنیم بدون @ یا رشتهٔ خالی.
+ */
+function bot_username_fetch(): string
+{
+    if (!class_exists('Tg')) {
+        return '';
+    }
+    if (Tg::$dry) {
+        /* در تست، پاسخ ساختگی از Tg::$meStub خوانده می‌شود */
+        $handle = trim(ltrim((string) (Tg::$meStub['username'] ?? ''), '@'));
+    } else {
         $res = Tg::call('getMe');
         $name = is_array($res) ? (string) ($res['result']['username'] ?? '') : '';
         $handle = trim(ltrim($name, '@'));
-        if ($handle !== '' && !Tg::$dry) {
-            set_put('bot_username', $handle);   // کش برای دفعهٔ بعد، بدون تماس اضافه
-        }
     }
-    $GLOBALS['__bot_username_cache'] = $handle;
+    if ($handle !== '') {
+        set_put('bot_username', $handle);   // کش دائمی برای دفعه‌های بعد
+    }
     return $handle;
 }
 
@@ -1253,6 +1273,8 @@ final class Tg
     public static ?array $chatStub = null;
     /** برای تست: پاسخ ساختگی getChatMember در حالت خشک (true/false/null) */
     public static ?bool $memberStub = null;
+    /** برای تست: پاسخ ساختگی getMe (username) در حالت خشک */
+    public static ?array $meStub = null;
     private static int $topicSeq = 100;
     private static int $updateOffset = 0;
 
@@ -12959,6 +12981,9 @@ function handle_callback_inner(array $cb): void
                     $refRows[] = [btn('📤 اشتراک‌گذاری لینک', null,
                         ref_share_url($link, '🎁 با لینک من در ' . bot_name() . ' عضو شو'),
                         'success')];
+                    $refRows[] = [btn('⚡️ ارسال سریع در تلگرام', null,
+                        ref_share_deeplink($link, '🎁 با لینک من در ' . bot_name() . ' عضو شو'),
+                        'primary')];
                     $refRows[] = [btn('📋 فرستادن لینک به دوست', 'ref:share', null, 'primary')];
                 }
                 $refRows[] = [btn('« بازگشت', 'home', null, 'danger')];
@@ -12978,13 +13003,19 @@ function handle_callback_inner(array $cb): void
         $link = ref_link($uid);
         if ($link === '') {
             Tg::answer($cbId, '⚠️ یوزرنیم ربات تنظیم نشده است.', true);
-            Tg::show($chatId, $messageId,
-                "⚠️ <b>لینک دعوت ساخته نشد</b>\n\n"
-                . 'یوزرنیم ربات روی سرور تنظیم نشده است. مدیر باید در '. "\n"
-                . '<code>.env</code> مقدار <code>PANEL_BOT_USERNAME</code> را بگذارد '
-                . '(بدون @) یا یک‌بار ربات را ری‌استارت کند تا خودکار خوانده شود.',
-                [[btn('« دعوت دوستان', 'menu:ref', null, 'danger')]]);
-            return;
+            $fetched = bot_username_fetch();      // یک‌بار دیگر از خود تلگرام
+            $link = $fetched !== '' ? ref_link($uid) : '';
+            if ($link === '') {
+                Tg::show($chatId, $messageId,
+                    "⚠️ <b>تلگرام یوزرنیم ربات را برنگرداند</b>\n\n"
+                    . 'ربات خودکار با <code>getMe</code> یوزرنیمش را می‌خواند؛ این بار '
+                    . 'پاسخ نداد (قطعی موقت شبکه یا توکن نامعتبر).' . "\n\n"
+                    . 'چند لحظه بعد دوباره بزنید. اگر تکرار شد:'
+                    . "\n" . '<code>sibil doctor</code>',
+                    [[btn('🔄 تلاش دوباره', 'ref:share', null, 'primary')],
+                     [btn('« دعوت دوستان', 'menu:ref', null, 'danger')]]);
+                return;
+            }
         }
         Tg::answer($cbId, '📤 لینک آمادهٔ ارسال است', false);
         Tg::send($chatId, '📤 <b>لینک اختصاصی شما</b>' . "\n" . SEP . "\n"
@@ -12997,6 +13028,9 @@ function handle_callback_inner(array $cb): void
             [[btn('📲 ارسال به مخاطب تلگرام', null,
                 ref_share_url($link, '🎁 با لینک من در ' . bot_name() . ' عضو شو'),
                 'success')],
+             [btn('⚡️ ارسال سریع (tg)', null,
+                ref_share_deeplink($link, '🎁 با لینک من در ' . bot_name() . ' عضو شو'),
+                'primary')],
              [btn('« دعوت دوستان', 'menu:ref', null, 'danger')]]);
         return;
     }
@@ -16189,6 +16223,19 @@ function cli_poll(int $seconds = 0): void
     } catch (Throwable $ex) {
         log_line('error', 'restore on startup failed: ' . $ex->getMessage());
     }
+    /* استارتاپ: یوزرنیم ربات یک‌بار خودکار از getMe خوانده و ذخیره می‌شود
+       (لینک دعوت هیچ‌وقت به تنظیم دستی وابسته نیست) */
+    try {
+        $handle = bot_username();
+        if ($handle === '') {
+            log_line('warning', 'bot username is still unknown; /start ref links fall back '
+                . 'to the id form until Telegram answers getMe');
+        } else {
+            log_line('info', 'bot username synced: @' . $handle);
+        }
+    } catch (Throwable $ex) {
+        log_line('warning', 'bot username sync failed: ' . $ex->getMessage());
+    }
     bot_commands_sync();
     /* استارتاپ: تاپیک‌های احراز هویت ساخته/نام‌گذاری شوند */
     try {
@@ -16322,6 +16369,16 @@ function cli_main(array $argv): int
             return cli_selftest();
         case '--serve':
             return cli_serve($argv);
+        case '--sync-bot':
+            /* یوزرنیم ربات خودکار از getMe خوانده و ذخیره می‌شود */
+            bot_username_forget();
+            $synced = bot_username();
+            if ($synced === '') {
+                echo "FAIL could not read the bot username from Telegram (token/network)\n";
+                return 1;
+            }
+            echo 'OK   @' . $synced . "\n";
+            return 0;
         case '--commands':
             $ok = bot_commands_sync(true);
             echo ($ok ? 'OK   ' : 'FAIL ') . 'bot commands synced (‎/start = راه‌اندازی مجدد بات)' . "\n";
@@ -16423,6 +16480,7 @@ function cli_main(array $argv): int
                 . "  --meter          run the usage/hourly billing pass once\n"
                 . "  --report [--post] daily report text (optionally to the report group)\n"
                 . "  --backup         send one backup to the backup group and delete it\n"
+                . "  --sync-bot       read and store the bot username (getMe)\n"
                 . "  --broadcast      run the background broadcast job until it ends\n"
                 . "  --topics         create the missing report topics in the group\n"
                 . "  --migrate        create/upgrade the database\n"
@@ -20271,6 +20329,19 @@ function ref_share_url(string $link, string $text = ''): string
         return '';
     }
     $url = 'https://t.me/share/url?url=' . rawurlencode($link);
+    if ($text !== '') {
+        $url .= '&text=' . rawurlencode($text);
+    }
+    return $url;
+}
+
+/** همان اشتراک‌گذاری با اسکیم داخلی تلگرام (tg://msg_url) — دکمهٔ سریع */
+function ref_share_deeplink(string $link, string $text = ''): string
+{
+    if ($link === '') {
+        return '';
+    }
+    $url = 'tg://msg_url?url=' . rawurlencode($link);
     if ($text !== '') {
         $url .= '&text=' . rawurlencode($text);
     }

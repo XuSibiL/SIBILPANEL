@@ -1273,6 +1273,19 @@ function ref_share_url(string $link, string $text = ''): string
     return $url;
 }
 
+/** همان اشتراک‌گذاری با اسکیم داخلی تلگرام (tg://msg_url) — دکمهٔ سریع */
+function ref_share_deeplink(string $link, string $text = ''): string
+{
+    if ($link === '') {
+        return '';
+    }
+    $url = 'tg://msg_url?url=' . rawurlencode($link);
+    if ($text !== '') {
+        $url .= '&text=' . rawurlencode($text);
+    }
+    return $url;
+}
+
 /**
  * پاداش نقدی ثابت — به‌محض اینکه کاربری با لینک دعوت وارد ربات می‌شود.
  * هر دعوت‌شده فقط یک‌بار (ref_cash_paid) و فقط در حالت cash.

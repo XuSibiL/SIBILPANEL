@@ -228,6 +228,9 @@ function handle_callback_inner(array $cb): void
                     $refRows[] = [btn('📤 اشتراک‌گذاری لینک', null,
                         ref_share_url($link, '🎁 با لینک من در ' . bot_name() . ' عضو شو'),
                         'success')];
+                    $refRows[] = [btn('⚡️ ارسال سریع در تلگرام', null,
+                        ref_share_deeplink($link, '🎁 با لینک من در ' . bot_name() . ' عضو شو'),
+                        'primary')];
                     $refRows[] = [btn('📋 فرستادن لینک به دوست', 'ref:share', null, 'primary')];
                 }
                 $refRows[] = [btn('« بازگشت', 'home', null, 'danger')];
@@ -247,13 +250,19 @@ function handle_callback_inner(array $cb): void
         $link = ref_link($uid);
         if ($link === '') {
             Tg::answer($cbId, '⚠️ یوزرنیم ربات تنظیم نشده است.', true);
-            Tg::show($chatId, $messageId,
-                "⚠️ <b>لینک دعوت ساخته نشد</b>\n\n"
-                . 'یوزرنیم ربات روی سرور تنظیم نشده است. مدیر باید در '. "\n"
-                . '<code>.env</code> مقدار <code>PANEL_BOT_USERNAME</code> را بگذارد '
-                . '(بدون @) یا یک‌بار ربات را ری‌استارت کند تا خودکار خوانده شود.',
-                [[btn('« دعوت دوستان', 'menu:ref', null, 'danger')]]);
-            return;
+            $fetched = bot_username_fetch();      // یک‌بار دیگر از خود تلگرام
+            $link = $fetched !== '' ? ref_link($uid) : '';
+            if ($link === '') {
+                Tg::show($chatId, $messageId,
+                    "⚠️ <b>تلگرام یوزرنیم ربات را برنگرداند</b>\n\n"
+                    . 'ربات خودکار با <code>getMe</code> یوزرنیمش را می‌خواند؛ این بار '
+                    . 'پاسخ نداد (قطعی موقت شبکه یا توکن نامعتبر).' . "\n\n"
+                    . 'چند لحظه بعد دوباره بزنید. اگر تکرار شد:'
+                    . "\n" . '<code>sibil doctor</code>',
+                    [[btn('🔄 تلاش دوباره', 'ref:share', null, 'primary')],
+                     [btn('« دعوت دوستان', 'menu:ref', null, 'danger')]]);
+                return;
+            }
         }
         Tg::answer($cbId, '📤 لینک آمادهٔ ارسال است', false);
         Tg::send($chatId, '📤 <b>لینک اختصاصی شما</b>' . "\n" . SEP . "\n"
@@ -266,6 +275,9 @@ function handle_callback_inner(array $cb): void
             [[btn('📲 ارسال به مخاطب تلگرام', null,
                 ref_share_url($link, '🎁 با لینک من در ' . bot_name() . ' عضو شو'),
                 'success')],
+             [btn('⚡️ ارسال سریع (tg)', null,
+                ref_share_deeplink($link, '🎁 با لینک من در ' . bot_name() . ' عضو شو'),
+                'primary')],
              [btn('« دعوت دوستان', 'menu:ref', null, 'danger')]]);
         return;
     }

@@ -7,7 +7,7 @@
 فروش پنل حجمی/ساعتی، کیف پول، درگاه‌های پرداخت ایرانی و کریپتو، احراز هویت دو سطحی،
 کد تخفیف، سیستم دعوت دوستان و پنل مدیریت کامل — بدون فریم‌ورک، بدون Composer.
 
-![version](https://img.shields.io/badge/version-3.16.1-2ea043)
+![version](https://img.shields.io/badge/version-3.16.2-2ea043)
 ![php](https://img.shields.io/badge/PHP-8.1%2B-777bb4)
 ![db](https://img.shields.io/badge/SQLite-PDO-003b57)
 ![license](https://img.shields.io/badge/license-MIT-blue)
@@ -280,6 +280,7 @@ sudo sibil ssl           # گواهی TLS
 sudo sibil config        # ویرایش .env
 sudo sibil migrate       # ساخت/ارتقای جداول
 sudo sibil version       # نسخه
+sudo sibil uninstall     # حذف کامل نصب (با تأیید؛ یک کپی از دیتابیس در /root می‌ماند)
 ```
 
 دستورهای مستقیم خود ربات:
@@ -290,6 +291,7 @@ php sibil.php --poll      # اجرای ربات
 php sibil.php --migrate   # جداول
 php sibil.php --version   # نسخه
 php sibil.php --broadcast # ادامهٔ کار پس‌زمینهٔ پیام همگانی
+php sibil.php --sync-bot  # خواندن و ذخیرهٔ یوزرنیم ربات از getMe
 ```
 
 ---

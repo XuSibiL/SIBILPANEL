@@ -140,6 +140,8 @@ final class Tg
     public static ?array $chatStub = null;
     /** برای تست: پاسخ ساختگی getChatMember در حالت خشک (true/false/null) */
     public static ?bool $memberStub = null;
+    /** برای تست: پاسخ ساختگی getMe (username) در حالت خشک */
+    public static ?array $meStub = null;
     private static int $topicSeq = 100;
     private static int $updateOffset = 0;
 

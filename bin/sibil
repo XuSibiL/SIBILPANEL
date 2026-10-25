@@ -6,7 +6,7 @@
 #  Run:             sibil
 #  Direct:          sibil status | update | restart | start | stop | logs
 #                   sibil backup | restore | domain | config | doctor | deps
-#                   sibil ssl | fix | install | remove | help | version
+#                   sibil ssl | fix | install | remove | uninstall | help | version
 # ═══════════════════════════════════════════════════════════════════════════════
 set -uo pipefail
 
@@ -860,7 +860,16 @@ cmd_doctor() {
         local api
         api="$(curl -fsS --max-time 8 "https://api.telegram.org/bot$token/getMe" 2>/dev/null)"
         if printf '%s' "$api" | grep -q '"ok":true'; then
-            ok "telegram: @$(printf '%s' "$api" | sed -n 's/.*"username":"\([^"]*\)".*/\1/p')"
+            local tguser
+            tguser="$(printf '%s' "$api" | sed -n 's/.*"username":"\([^"]*\)".*/\1/p')"
+            ok "telegram: @$tguser"
+            # یوزرنیم برای لینک دعوت خودکار گرفته می‌شود؛ اگر در .env نبود اضافه می‌شود
+            if [[ -n "$tguser" ]] && ! grep -q '^PANEL_BOT_USERNAME=' "$ENV_FILE" 2>/dev/null; then
+                printf 'PANEL_BOT_USERNAME="%s"\n' "$tguser" >>"$ENV_FILE" 2>/dev/null \
+                    && ok "bot username saved for referral links: @$tguser"
+            elif [[ -n "$tguser" ]]; then
+                ok "invite link ready: https://t.me/$tguser?start=ref_<id>"
+            fi
         else
             bad "telegram rejected the token (invalid or revoked)"
         fi
@@ -995,6 +1004,143 @@ cmd_remove() {
     say "  to delete everything:  sudo rm -rf $PANEL_HOME"
 }
 
+# ── حذف کامل (uninstall) ─────────────────────────────────────────────────────
+# کل نصب را پاک می‌کند: سرویس‌ها، فایل سرویس، پوشهٔ نصب، دستور ترمینال و
+# بلوک دامنه در کانفیگ وب‌سرور. قبل از هر کار یک بکاپ امن در /root گرفته می‌شود
+# تا حذف تصادفی دیتابیس جبران‌پذیر باشد.
+remove_caddy_block() {
+    local domain="$1"
+    [[ -z "$domain" ]] && return 0
+    local file="/etc/caddy/Caddyfile"
+    [[ -f "$file" ]] || return 0
+    grep -q "$domain" "$file" 2>/dev/null || return 0
+    local backup="$file.bak-$(date +%Y%m%d%H%M%S)"
+    cp -f "$file" "$backup" 2>/dev/null || return 0
+    # حذف فقط بلوک «domain { … }» و نگه‌داشتن بقیهٔ سایت‌ها
+    awk -v d="$domain" '
+        skip == 0 && index($0, d) > 0 && $0 ~ /\{[[:space:]]*$/ { skip = 1; depth = 1; next }
+        skip == 1 {
+            opens = gsub(/\{/, "{")
+            closes = gsub(/\}/, "}")
+            depth += opens - closes
+            if (depth <= 0) { skip = 0 }
+            next
+        }
+        { print }
+    ' "$backup" >"$file" 2>/dev/null || cp -f "$backup" "$file" 2>/dev/null || true
+    systemctl reload caddy 2>/dev/null || systemctl restart caddy 2>/dev/null || true
+    ok "web server entry removed for $domain (backup: ${backup##*/})"
+}
+
+remove_nginx_block() {
+    local domain="$1"
+    [[ -z "$domain" ]] && return 0
+    local removed=0 f
+    for f in /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf; do
+        [[ -f "$f" ]] || continue
+        if grep -q "$domain" "$f" 2>/dev/null; then
+            rm -f "$f" 2>/dev/null && removed=1
+        fi
+    done
+    if [[ $removed -eq 1 ]]; then
+        systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null || true
+        ok "web server entry removed for $domain"
+    fi
+}
+
+cmd_uninstall() {
+    local assume_yes="${1:-}"
+    local domain
+    domain="$(env_get PANEL_DOMAIN)"
+    [[ -z "$domain" ]] && domain="$(env_get PANEL_WEB_DOMAIN)"
+
+    banner
+    say ""
+    warn "this deletes the bot, its service, its files and its data"
+    say "  install dir : ${B}$PANEL_HOME${R}"
+    say "  database    : ${B}$DB_FILE${R}"
+    say "  command     : ${B}$CLI_PATH${R}"
+    [[ -n "$domain" ]] && say "  domain      : ${B}$domain${R}"
+    say ""
+
+    if [[ "$assume_yes" != "-y" && "$assume_yes" != "--yes" ]]; then
+        local answer=""
+        # اول ترمینال؛ اگر ترمینال نبود (اسکریپت/CI) تأیید از stdin خوانده می‌شود
+        if ! read -r -p "  Are you sure you want to completely uninstall SIBILPANEL? [y/N] " \
+            answer </dev/tty 2>/dev/null; then
+            read -r -p "  Are you sure you want to completely uninstall SIBILPANEL? [y/N] " \
+                answer 2>/dev/null || answer=""
+        fi
+        case "${answer,,}" in
+            y|yes) ;;
+            *) say ""; ok "cancelled — nothing was changed"; return 0 ;;
+        esac
+    fi
+
+    step "1/6 stopping and disabling the services"
+    if has_systemd; then
+        systemctl stop "$SERVICE" 2>/dev/null || true
+        systemctl disable "$SERVICE" 2>/dev/null || true
+        systemctl stop "$WEB_SERVICE" 2>/dev/null || true
+        systemctl disable "$WEB_SERVICE" 2>/dev/null || true
+        ok "systemd services stopped and disabled"
+    else
+        warn "no systemd — skipping the service step"
+    fi
+    pkill -f "$APP" 2>/dev/null || true
+    pkill -f "sibil.php --poll" 2>/dev/null || true
+    pkill -f "sibil.php --broadcast" 2>/dev/null || true
+
+    step "2/6 removing the service files"
+    rm -f "/etc/systemd/system/$SERVICE.service" \
+          "/etc/systemd/system/$WEB_SERVICE.service" 2>/dev/null || true
+    [[ -d /etc/systemd/system ]] && systemctl daemon-reload 2>/dev/null || true
+    systemctl reset-failed "$SERVICE" 2>/dev/null || true
+    ok "service files removed"
+
+    step "3/6 removing the installation directory"
+    # یک نسخهٔ ایمن از دیتابیس و .env بیرون از پوشه نگه داشته می‌شود
+    if [[ -f "$DB_FILE" ]]; then
+        local keep="/root/sibil-uninstall-$(date +%Y%m%d-%H%M%S)"
+        mkdir -p "$keep" 2>/dev/null && {
+            cp -f "$DB_FILE" "$keep/" 2>/dev/null || true
+            [[ -f "$ENV_FILE" ]] && cp -f "$ENV_FILE" "$keep/.env" 2>/dev/null || true
+            chmod 600 "$keep"/* 2>/dev/null || true
+            ok "a safety copy was kept in $keep"
+        }
+    fi
+    if [[ -d "$PANEL_HOME" && "$PANEL_HOME" != "/" && "$PANEL_HOME" != "/opt" ]]; then
+        rm -rf "$PANEL_HOME" 2>/dev/null || sudo -n rm -rf "$PANEL_HOME" 2>/dev/null || true
+        ok "installation directory removed: $PANEL_HOME"
+    else
+        warn "refusing to delete a suspicious install path: $PANEL_HOME"
+    fi
+
+    step "4/6 removing the terminal command"
+    rm -f "$CLI_PATH" 2>/dev/null || sudo -n rm -f "$CLI_PATH" 2>/dev/null || true
+    rm -f /usr/local/bin/sibil /usr/bin/sibil 2>/dev/null || true
+    ok "command removed: sibil"
+
+    step "5/6 cleaning the web server entries"
+    remove_caddy_block "$domain"
+    remove_nginx_block "$domain"
+    ok "web server entries cleaned"
+
+    step "6/6 final check"
+    local leftovers=0
+    [[ -f "/etc/systemd/system/$SERVICE.service" ]] && leftovers=$((leftovers+1))
+    [[ -d "$PANEL_HOME" ]] && leftovers=$((leftovers+1))
+    [[ -e "$CLI_PATH" ]] && leftovers=$((leftovers+1))
+    if [[ $leftovers -gt 0 ]]; then
+        warn "$leftovers item(s) are still on disk — remove them manually if needed"
+        return 1
+    fi
+    say ""
+    printf '  %s✓ SIBILPANEL was successfully uninstalled from your server.%s\n' \
+        "$GRN$B" "$R"
+    say ""
+}
+
 # ── قواعد امنیتی وب (دسترسی مستقیم به لاگ/بکاپ/کانفیگ بسته می‌شود) ──────────
 install_htaccess() {
     local target="$PANEL_HOME/.htaccess"
@@ -1034,6 +1180,7 @@ cmd_help() {
     say "    ${B}fix${R}        repair permissions/processes"
     say "    ${B}migrate${R}    upgrade the database schema (safe, repeatable)"
     say "    ${B}install${R}    fresh install        ${B}remove${R}  remove the service"
+    say "    ${B}uninstall${R}  delete everything (asks first, keeps a DB copy in /root)"
     say "    ${B}version${R}    print the version    ${B}check${R}   latest release check"
     say "    ${B}help${R}       this screen"
     say ""
@@ -1059,7 +1206,8 @@ cmd_menu() {
         say "  ${B}1${R}) status         ${B}2${R}) update$(update_label)"
         say "  ${B}3${R}) backup / import  ${B}4${R}) dependencies   ${B}5${R}) doctor"
         say "  ${B}6${R}) ssl / domain   ${B}7${R}) logs           ${B}8${R}) restart"
-        say "  ${B}9${R}) config         ${B}0${R}) exit"
+        say "  ${B}9${R}) config         ${B}10${R}) uninstall"
+        say "  ${B}0${R}) exit"
         say ""
         read -r -p "  choose: " choice </dev/tty || return 0
         say ""
@@ -1073,6 +1221,7 @@ cmd_menu() {
             7) cmd_logs "" ;;
             8) cmd_restart ;;
             9) cmd_config ;;
+            10|uninstall) cmd_uninstall ;;
             0|q|exit|"") exit 0 ;;
             *) warn "unknown choice: $choice" ;;
         esac
@@ -1100,6 +1249,7 @@ case "${1:-menu}" in
     fix)     cmd_fix ;;
     install) shift; cmd_install "${1:-}" ;;
     remove)  cmd_remove ;;
+    uninstall) shift; cmd_uninstall "${1:-}" ;;
     web)
         port="$(env_get PANEL_WEB_PORT)"; port="${port:-8080}"
         say "web endpoint : ${WEB_SERVICE} (php -S 0.0.0.0:$port)"

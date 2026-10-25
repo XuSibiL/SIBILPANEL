@@ -259,15 +259,35 @@ function bot_username(): string
     if ($handle === '') {
         $handle = trim(ltrim(cfg('PANEL_BOT_USERNAME', ''), '@'));
     }
-    if ($handle === '' && function_exists('Tg')) {
+    /* `Tg` یک کلاس است، نه تابع؛ با class_exists بررسی می‌شود (باگ 3.16.1) */
+    if ($handle === '' && class_exists('Tg')) {
+        $handle = bot_username_fetch();
+    }
+    $GLOBALS['__bot_username_cache'] = $handle;
+    return $handle;
+}
+
+/**
+ * خواندن یوزرنیم از خود تلگرام (getMe) و ذخیرهٔ آن.
+ * این تنها منبع «خودکار» است: هیچ‌جا لازم نیست مدیر یوزرنیم را دستی وارد کند.
+ * خروجی: یوزرنیم بدون @ یا رشتهٔ خالی.
+ */
+function bot_username_fetch(): string
+{
+    if (!class_exists('Tg')) {
+        return '';
+    }
+    if (Tg::$dry) {
+        /* در تست، پاسخ ساختگی از Tg::$meStub خوانده می‌شود */
+        $handle = trim(ltrim((string) (Tg::$meStub['username'] ?? ''), '@'));
+    } else {
         $res = Tg::call('getMe');
         $name = is_array($res) ? (string) ($res['result']['username'] ?? '') : '';
         $handle = trim(ltrim($name, '@'));
-        if ($handle !== '' && !Tg::$dry) {
-            set_put('bot_username', $handle);   // کش برای دفعهٔ بعد، بدون تماس اضافه
-        }
     }
-    $GLOBALS['__bot_username_cache'] = $handle;
+    if ($handle !== '') {
+        set_put('bot_username', $handle);   // کش دائمی برای دفعه‌های بعد
+    }
     return $handle;
 }
 

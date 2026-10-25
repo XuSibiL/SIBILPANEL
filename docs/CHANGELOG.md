@@ -1,5 +1,27 @@
 # تغییرها
 
+## 3.16.2
+- **یوزرنیم ربات کاملاً خودکار (ریشهٔ باگ لینک دعوت)**: بررسی نوع با
+  `function_exists('Tg')` انجام می‌شد که برای یک **کلاس** همیشه `false` است،
+  پس شاخهٔ `getMe` هرگز اجرا نمی‌شد و کاربر پیام «یوزرنیم ربات تنظیم نشده است»
+  می‌گرفت. حالا `bot_username_fetch()` با `class_exists('Tg')` یک‌بار `getMe`
+  صدا می‌زند، `result.username` را در تنظیمات کش می‌کند و لینک
+  `https://t.me/<bot>?start=ref_<id>` بدون هیچ تنظیم دستی ساخته می‌شود.
+  مسیرهای خودکارسازی: شروع `--poll`، دستور `sibil doctor` و
+  `php sibil.php --sync-bot`؛ `sibil doctor` اگر کلید در `.env` نبود خودش
+  `PANEL_BOT_USERNAME` را اضافه می‌کند.
+- **دکمهٔ اشتراک‌گذاری سریع `tg://msg_url`** کنار دکمهٔ وب
+  (`t.me/share/url`) در صفحهٔ دعوت و پیام ارسال لینک.
+- **`sibil uninstall`** (گزینهٔ **۱۰** در منوی CLI): با پرسش قطعی
+  «Are you sure you want to completely uninstall SIBILPANEL? [y/N]»، سپس
+  توقف/غیرفعال‌سازی سرویس‌ها، حذف فایل‌های systemd و `daemon-reload`، حذف پوشهٔ
+  نصب، حذف `/usr/local/bin/sibil`، پاک‌کردن بلوک دامنه در
+  `/etc/caddy/Caddyfile` و `nginx`، و پیام پایانی
+  «✓ SIBILPANEL was successfully uninstalled from your server.»
+  پیش از حذف، یک نسخهٔ ایمن از دیتابیس و `.env` در
+  `/root/sibil-uninstall-<تاریخ>` نگه داشته می‌شود. بدون ترمینال (اسکریپت/CI)
+  تأیید از stdin خوانده می‌شود و پاسخ غیر `y` هیچ چیزی را تغییر نمی‌دهد.
+
 ## 3.16.1
 - **لینک دعوت دیگر خالی نیست**: لینک از یوزرنیم رسمی ربات ساخته می‌شود — نخست
   از تنظیمات، بعد از `PANEL_BOT_USERNAME` در `.env` و اگر نبود یک‌بار از

@@ -137,6 +137,19 @@ function cli_poll(int $seconds = 0): void
     } catch (Throwable $ex) {
         log_line('error', 'restore on startup failed: ' . $ex->getMessage());
     }
+    /* استارتاپ: یوزرنیم ربات یک‌بار خودکار از getMe خوانده و ذخیره می‌شود
+       (لینک دعوت هیچ‌وقت به تنظیم دستی وابسته نیست) */
+    try {
+        $handle = bot_username();
+        if ($handle === '') {
+            log_line('warning', 'bot username is still unknown; /start ref links fall back '
+                . 'to the id form until Telegram answers getMe');
+        } else {
+            log_line('info', 'bot username synced: @' . $handle);
+        }
+    } catch (Throwable $ex) {
+        log_line('warning', 'bot username sync failed: ' . $ex->getMessage());
+    }
     bot_commands_sync();
     /* استارتاپ: تاپیک‌های احراز هویت ساخته/نام‌گذاری شوند */
     try {
@@ -270,6 +283,16 @@ function cli_main(array $argv): int
             return cli_selftest();
         case '--serve':
             return cli_serve($argv);
+        case '--sync-bot':
+            /* یوزرنیم ربات خودکار از getMe خوانده و ذخیره می‌شود */
+            bot_username_forget();
+            $synced = bot_username();
+            if ($synced === '') {
+                echo "FAIL could not read the bot username from Telegram (token/network)\n";
+                return 1;
+            }
+            echo 'OK   @' . $synced . "\n";
+            return 0;
         case '--commands':
             $ok = bot_commands_sync(true);
             echo ($ok ? 'OK   ' : 'FAIL ') . 'bot commands synced (‎/start = راه‌اندازی مجدد بات)' . "\n";
@@ -371,6 +394,7 @@ function cli_main(array $argv): int
                 . "  --meter          run the usage/hourly billing pass once\n"
                 . "  --report [--post] daily report text (optionally to the report group)\n"
                 . "  --backup         send one backup to the backup group and delete it\n"
+                . "  --sync-bot       read and store the bot username (getMe)\n"
                 . "  --broadcast      run the background broadcast job until it ends\n"
                 . "  --topics         create the missing report topics in the group\n"
                 . "  --migrate        create/upgrade the database\n"
