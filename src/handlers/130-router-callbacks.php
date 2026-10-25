@@ -93,6 +93,25 @@ function handle_callback_inner(array $cb): void
     $GLOBALS['panel_nav_scope'] = str_starts_with($data, 'ad:') ? 'ad' : 'user';
 
     /* ── ماژول احراز هویت (KYC) ─────────────────────────────────────── */
+    /* ── قفل عضویت اجباری کانال ─────────────────────────────────────── */
+    if ($data === 'fj:check') {
+        /* دکمهٔ تایید عضویت: فقط همین یک دکمه همیشه باز است */
+        if (force_join_blocked($uid)) {
+            Tg::answer($cbId, '⚠️ عضویت شما تایید نشد. اول در کانال عضو شوید.', true);
+            force_join_show($chatId, $messageId);
+            return;
+        }
+        Tg::answer($cbId, '✅ عضویت تایید شد.');
+        State::clear($uid);
+        show_home($chatId, $messageId, $uid);
+        return;
+    }
+    if (force_join_blocked($uid)) {
+        Tg::answer($cbId, '⚠️ اول در کانال عضو شوید', true);
+        force_join_show($chatId, $messageId);
+        return;
+    }
+
     if ($head === 'kyc') {
         Tg::answer($cbId);
         kyc_callback($uid, $chatId, $messageId, $parts);
@@ -253,7 +272,7 @@ function handle_callback_inner(array $cb): void
                 return;
             }
             Tg::show($chatId, $messageId,
-                '<b>' . e($pool[$key]['title']) . "</b>\n\n" . $pool[$key]['body'],
+                '<b>' . e($pool[$key]['title']) . "</b>\n\n" . help_body($key, $pool[$key]),
                 [[btn('« راهنما', 'help:home', null, 'danger')]]);
             return;
         }
@@ -308,8 +327,12 @@ function handle_callback_inner(array $cb): void
             foreach ([1, 5, 10, 50, 100] as $gb) {
                 $text .= '· ' . fa_digits($gb) . ' گیگ → ' . money($gb * $perGb) . "\n";
             }
-            $text .= "\n" . 'اجارهٔ روزانه (۲۴ ساعت): ' . money($hourly * 24) . "\n\n"
-                . '🧮 فرمول: (گیگ مصرف‌شده × قیمت هر گیگ) + (ساعت فعال × اجارهٔ ساعتی)';
+            $hours = prepaid_hours();
+            $text .= "\n" . 'اجارهٔ روزانه (۲۴ ساعت): ' . money($hourly * 24) . "\n"
+                . 'پیش‌پرداخت ' . fa_digits($hours) . ' ساعت اول: <b>'
+                . money(panel_prepaid_amount($product)) . '</b>' . "\n\n"
+                . '🧮 فرمول: پیش‌پرداخت ساعت‌های اول + (گیگ مصرف‌شده × قیمت هر گیگ) + '
+                . '(ساعت فعال × اجارهٔ ساعتی)';
             Tg::show($chatId, $messageId, $text,
                 [[btn('« بازگشت', 'buy:p:' . $product['id'], null, 'danger')]]);
             return;
@@ -555,11 +578,20 @@ function handle_callback_inner(array $cb): void
             }
             $blockPrice = (int) ($product['extra_block_price'] ?? 0);
             unset($blockPrice);
+            /* هشدار: پیش‌پرداخت ساعت‌های اول غیرقابل استرداد است */
+            $prepaid = (int) ($panel['prepaid_amount'] ?? 0);
+            $warn = '';
+            if ($prepaid > 0 && panel_prepaid_remaining($panel) > 0) {
+                $warn = "\n" . '⚠️ <b>توجه:</b> پیش‌پرداخت ' . fa_digits(prepaid_hours())
+                    . ' ساعت اول این پنل (<b>' . money($prepaid) . '</b>) '
+                    . 'در صورت حذف <b>بازگردانده نمی‌شود</b>.';
+            }
             Tg::show($chatId, $messageId,
                 "🗑 <b>حذف پنل</b>\n\n"
                 . 'پنل <code>' . e((string) $panel['panel_username']) . "</code> از روی پنل و از "
                 . "ربات حذف می‌شود.\n"
-                . '<i>این کار برگشت‌پذیر نیست.</i>',
+                . '<i>این کار برگشت‌پذیر نیست.</i>'
+                . $warn,
                 [[btn('✅ بله، حذف کنید', 'pn:' . $panelId . ':delok', null, 'danger')],
                  [btn('« انصراف', 'pn:' . $panelId, null, 'primary')]]);
             return;
@@ -717,6 +749,45 @@ function handle_callback_inner(array $cb): void
     }
 
     /* ── مدیریت ───────────────────────────────────────────────────────── */
+    /* ── 📢 قفل کانال اجباری (مسیر مستقیم پنل مدیریت) ─────────────────── */
+    if ($head === 'fj') {
+        if (!is_owner($uid)) {
+            Tg::answer($cbId, '⛔️ این بخش فقط برای مالک ربات است.', true);
+            return;
+        }
+        $op = (string) ($parts[1] ?? '');
+        if ($op === 'on') {
+            if (force_channel_raw() === '') {
+                Tg::answer($cbId, '🔗 اول آیدی کانال را تنظیم کنید.', true);
+                Tg::show($chatId, $messageId,
+                    "⚠️ هنوز کانالی تنظیم نشده است.\n\n" . force_channel_admin_text(),
+                    force_channel_admin_kb());
+                return;
+            }
+            $new = !set_bool('force_channel_on', false);
+            set_put('force_channel_on', $new ? '1' : '0');
+            Tg::answer($cbId, $new ? '🟢 قفل روشن شد.' : '🔴 قفل خاموش شد.');
+        } elseif ($op === 'set') {
+            State::set($uid, 'fj_channel');
+            Tg::show($chatId, $messageId,
+                "🔗 <b>تنظیم کانال اجباری</b>\n" . SEP . "\n"
+                . 'آیدی یا لینک کانال را بفرستید:' . "\n"
+                . '· <code>@my_channel</code>' . "\n"
+                . '· <code>https://t.me/my_channel</code>' . "\n"
+                . '· یا شناسهٔ عددی <code>-1001234567890</code>' . "\n\n"
+                . '<i>ربات باید در آن کانال «مدیر» باشد؛ وگرنه ذخیره نمی‌شود.</i>',
+                [[btn('🔙 انصراف / بازگشت', 'ad:fj', null, 'danger')]]);
+            return;
+        } elseif ($op === 'del') {
+            set_put('force_channel_id', '');
+            set_put('force_channel_on', '0');
+            Tg::answer($cbId, '🗑 کانال اجباری حذف شد.');
+        }
+        State::clear($uid);
+        Tg::show($chatId, $messageId, force_channel_admin_text(), force_channel_admin_kb());
+        return;
+    }
+
     if ($head !== 'ad') {
         Tg::send($chatId, 'این دکمه دیگر معتبر نیست.', home_kb($uid));
         return;
@@ -736,6 +807,10 @@ function handle_callback_inner(array $cb): void
     }
     $action = $parts[1] ?? '';
     switch ($action) {
+        case 'fj':
+            Tg::show($chatId, $messageId, force_channel_admin_text(),
+                force_channel_admin_kb());
+            return;
         case 'home':
             screen_console($chatId, $messageId);
             return;

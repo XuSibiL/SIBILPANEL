@@ -63,6 +63,7 @@ function console_kb(): array
          btn('⚙️ تنظیمات ربات', 'ad:settings', null, 'primary')],
         [btn('🔍 جستجوی سفارشات', 'ad:find', null, 'primary'),
          btn('📢 پیام همگانی', 'ad:broadcast', null, 'success')],
+        [btn('📢 قفل کانال اجباری', 'ad:fj', null, 'success')],
         [btn('🔙 بازگشت به منوی کاربری', 'home', null, 'danger')],
     ]);
 }

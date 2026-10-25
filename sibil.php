@@ -21,7 +21,7 @@
 
 declare(strict_types=1);
 
-const PANEL_VERSION = '3.15.0';
+const PANEL_VERSION = '3.16.0';
 const IRAN_OFFSET   = 3.5 * 3600;
 const DAY           = 86400;
 
@@ -669,7 +669,9 @@ CREATE TABLE IF NOT EXISTS panels (
     last_devices    INTEGER NOT NULL DEFAULT 0,
     last_hwid_limit INTEGER NOT NULL DEFAULT 0,
     last_users      INTEGER NOT NULL DEFAULT 0,
-    last_synced_at  INTEGER NOT NULL DEFAULT 0
+    last_synced_at  INTEGER NOT NULL DEFAULT 0,
+    billing_start_at INTEGER NOT NULL DEFAULT 0,
+    prepaid_amount  INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS pg_panels (
@@ -879,6 +881,8 @@ function db_bootstrap(): void
                         'ref_cash_paid' => 'INTEGER DEFAULT 0',
                         'ref_reward_total' => 'INTEGER DEFAULT 0'],
         'panels'    => ['pg_panel_id' => 'INTEGER', 'user_cap' => 'INTEGER DEFAULT 0',
+                        'billing_start_at' => 'INTEGER DEFAULT 0',
+                        'prepaid_amount' => 'INTEGER DEFAULT 0',
                         'is_trial' => 'INTEGER DEFAULT 0',
                         'hourly_paused' => 'INTEGER DEFAULT 0',
                         'violation_until' => 'INTEGER', 'violation_count' => 'INTEGER DEFAULT 0',
@@ -985,6 +989,7 @@ const SETTING_DEFAULTS = [
     'trial_gb'             => '1',
     'trial_hours'          => '24',
     'trial_per_user'       => '1',
+    'trial_user_limit'     => '10',   // سقف ساخت کاربر داخلِ پنل تست روی پاسارگاد
     'trial_price'          => '0',
     'panel_test_timeout'   => '20',
     'panel_test_amount'    => '0',
@@ -1000,6 +1005,9 @@ const SETTING_DEFAULTS = [
     'backup_env'           => '1',     // فایل تنظیمات هم کنار بکاپ ارسال شود
     'last_backup_at'       => '0',
     'panel_pass_len'       => '12',
+    'prepaid_hours'        => '24',   // ساعت‌های پیش‌پرداخت‌شدهٔ اول پنل (غیرقابل استرداد)
+    'force_channel_on'     => '0',
+    'force_channel_id'     => '',
     'trial_in_panels'      => '0',
     'admin_trial_unlimited' => '1',
     'kyc_on'               => '1',
@@ -1208,6 +1216,8 @@ final class Tg
     public static bool $plainRetry = false;
     /** برای تست: پاسخ ساختگی getChat در حالت خشک */
     public static ?array $chatStub = null;
+    /** برای تست: پاسخ ساختگی getChatMember در حالت خشک (true/false/null) */
+    public static ?bool $memberStub = null;
     private static int $topicSeq = 100;
     private static int $updateOffset = 0;
 
@@ -3141,7 +3151,10 @@ function product_detail_text(array $product): string
 {
     $cap = (float) $product['data_cap_gb'] > 0
         ? fa_digits((float) $product['data_cap_gb']) . ' گیگ' : 'نامحدود';
+    $hours = prepaid_hours();
     $daily = ((int) $product['hourly_price']) * 24;
+    $prepaid = panel_prepaid_amount($product);
+    $setup = max(0, set_int('panel_setup_fee', 0));
     return $product['emoji'] . ' <b>' . e($product['name']) . "</b>\n\n"
         . '👤 تعداد کاربر: ' . fa_digits((int) $product['max_users']) . "\n"
         . '📦 سقف حجم پنل: ' . $cap . "\n"
@@ -3152,8 +3165,14 @@ function product_detail_text(array $product): string
         . '🧩 اسلات لازم: ' . fa_digits((int) $product['slots_needed']) . "\n"
         . '💰 حداقل موجودی لازم: ' . money((int) $product['min_balance']) . "\n\n"
         . '📊 حدود هزینه: روزانه ≈ ' . money($daily) . "\n\n"
-        . '💳 <b>پرداخت مصرفی:</b> پیش‌پرداخت لازم نیست؛ بر اساس گیگ مصرف و ساعت اجاره، '
-        . 'از کیف پول کم می‌شود.';
+        . '🧾 <b>پرداخت هنگام خرید:</b>' . "\n"
+        . ($setup > 0 ? '• هزینهٔ ساخت پنل: ' . money($setup) . "\n" : '')
+        . ($prepaid > 0
+            ? '• پیش‌پرداخت ' . fa_digits($hours) . ' ساعت اول: <b>' . money($prepaid) . '</b>'
+                . "\n" . '  (غیرقابل استرداد — کسر ساعتی از ساعت ' . fa_digits($hours)
+                . ' به بعد شروع می‌شود)' . "\n"
+            : '• پیش‌پرداخت اولیه ندارد.' . "\n")
+        . "\n" . '💳 <b>پس از آن:</b> بر اساس گیگ مصرف و ساعت اجاره، خودکار از کیف پول کم می‌شود.';
 }
 
 function screen_product(int|string $chat, ?int $messageId, int $productId): void
@@ -3165,7 +3184,7 @@ function screen_product(int|string $chat, ?int $messageId, int $productId): void
         return;
     }
     Tg::show($chat, $messageId, product_detail_text($product), [
-        [btn('🛒 خرید این پنل', 'buy:confirm:' . $productId, null, 'success')],
+        [btn('🟧 خرید این پنل', 'buy:confirm:' . $productId, null, 'success')],
         [btn('🔢 قیمت دقیق', 'buy:exact:' . $productId)],
         [btn('« بازگشت', 'buy:cat:' . (int) ($product['category_id'] ?? 0), null, 'danger')],
     ]);
@@ -3195,6 +3214,65 @@ function order_expiry_line(array $order): string
         return '⌛️ <b>مهلت این فاکتور تمام شده است.</b>' . "\n";
     }
     return '⏳ مهلت پرداخت: <b>' . $remaining . ' دقیقه</b>' . "\n";
+}
+
+/**
+ * ساعت‌های پیش‌پرداخت اولیهٔ هر پنل (غیرقابل استرداد). پیش‌فرض ۲۴ ساعت.
+ */
+function prepaid_hours(): int
+{
+    return max(0, min(168, set_int('prepaid_hours', 24)));
+}
+
+/** مبلغ پیش‌پرداخت = قیمت ساعتی × ساعت‌های پیش‌پرداخت */
+function panel_prepaid_amount(array $product): int
+{
+    $hourly = max(0, (int) ($product['hourly_price'] ?? 0));
+    if ($hourly === 0 || !set_bool('billing_hourly', true)) {
+        return 0;
+    }
+    return $hourly * prepaid_hours();
+}
+
+/** ثانیه‌های باقی‌مانده از پیش‌پرداخت (۰ = تمام شده و کسر ساعتی فعال است) */
+function panel_prepaid_remaining(array $panel): int
+{
+    $start = (int) ($panel['billing_start_at'] ?? 0);
+    return $start > 0 ? max(0, $start - now_ts()) : 0;
+}
+
+/**
+ * مبلغ فاکتور خرید پنل = هزینهٔ ساخت + پیش‌پرداخت ساعت‌های اول.
+ * فاکتور یک پلن غیررایگان هرگز صفر نمی‌شود (باگ «مبلغ: ۰ تومان»).
+ * خروجی: [کل, هزینهٔ ساخت, پیش‌پرداخت]
+ */
+function panel_order_price(array $product): array
+{
+    $setup = max(0, set_int('panel_setup_fee', 0));
+    $prepaid = panel_prepaid_amount($product);
+    return [$setup + $prepaid, $setup, $prepaid];
+}
+
+/**
+ * ریز فاکتور خرید پنل: هزینهٔ ساخت + پیش‌پرداخت ساعت‌های اول.
+ * غیرقابل استرداد بودن پیش‌پرداخت همین‌جا به کاربر گفته می‌شود.
+ */
+function panel_order_breakdown(array $product, int $setupFee, int $prepaid): string
+{
+    $lines = '';
+    if ($setupFee > 0) {
+        $lines .= '🧾 هزینهٔ ساخت پنل: <b>' . money($setupFee) . "</b>\n";
+    }
+    if ($prepaid > 0) {
+        $hours = prepaid_hours();
+        $lines .= '💰 پیش‌پرداخت ' . fa_digits($hours) . ' ساعت اول: <b>'
+            . money($prepaid) . '</b>' . "\n"
+            . '   (ساعتی ' . money((int) $product['hourly_price']) . ' × '
+            . fa_digits($hours) . " ساعت)\n"
+            . '<i>این مبلغ بابت ' . fa_digits($hours) . ' ساعت اول پنل است و با حذف پنل '
+            . 'پیش از پایان این مدت بازگردانده نمی‌شود.</i>' . "\n";
+    }
+    return $lines !== '' ? $lines . "\n" : '';
 }
 
 function invoice_text(array $order, string $title, string $detail = ''): string
@@ -3342,13 +3420,16 @@ function start_panel_order(int $uid, int|string $chat, ?int $messageId, int $pro
              [btn('« بازگشت', 'menu:buy', null, 'danger')]]);
         return;
     }
-    $price = set_int('panel_setup_fee', 0);
+    [$price, $setupFee, $prepaid] = panel_order_price($product);
     /* تخفیف اختصاصی کاربر (اگر مدیر برایش فعال کرده باشد) */
     $personal = user_discount_amount($uid, $price);
     $order = create_order($uid, 'panel', $price, $productId,
-        ['product' => $productId, 'panel_username' => $username], $personal);
+        ['product' => $productId, 'panel_username' => $username,
+         'setup_fee' => $setupFee, 'prepaid' => $prepaid,
+         'prepaid_hours' => prepaid_hours()], $personal);
     Tg::show($chat, $messageId,
-        invoice_text($order, 'خرید پنل', '📦 ' . e((string) $product['name'])
+        invoice_text($order, 'خرید پنل', panel_order_breakdown($product, $setupFee, $prepaid)
+            . '📦 ' . e((string) $product['name'])
             . "\n" . '👤 نام کاربری پنل: <code>' . e($username) . '</code>'),
         invoice_kb($order, $uid));
 }
@@ -3481,9 +3562,13 @@ function wallet_account_text(int $uid): string
  * پشتیبانی: هیچ پیامی داخل ربات گرفته نمی‌شود؛ دکمه مستقیم چت خصوصی مالک را
  * باز می‌کند. آدرس فقط از تنظیمات ربات یا PANEL_SUPPORT_USERNAME خوانده می‌شود.
  */
+/**
+ * آیدی پشتیبانی — هیچ‌وقت داخل سورس نیست.
+ * مقدار تنظیمات می‌تواند `@username`، `username` یا لینک کامل
+ * `https://t.me/username` باشد؛ هر سه یکسان خوانده می‌شوند.
+ */
 function support_username(): string
 {
-    /* هندل پشتیبانی هیچ‌وقت داخل کد نیست: از تنظیمات ربات یا .env خوانده می‌شود */
     $link = trim(set_get('support_link', ''));
     if ($link !== '') {
         if (preg_match('~t\.me/([A-Za-z0-9_]{3,})~i', $link, $m)) {
@@ -3494,6 +3579,13 @@ function support_username(): string
         }
     }
     return trim(ltrim(cfg('PANEL_SUPPORT_USERNAME', ''), '@'));
+}
+
+/** لینک کامل پشتیبانی برای دکمهٔ شیشه‌ای (خالی = تنظیم نشده) */
+function support_url(): string
+{
+    $handle = support_username();
+    return $handle !== '' ? 'https://t.me/' . $handle : '';
 }
 
 /**
@@ -3528,6 +3620,7 @@ function show_support(int|string $chat, ?int $messageId, int $uid): void
     }
     $user = '@' . $handle;
     $channel = channel_url();
+    /* دکمه با لینک کامل ساخته می‌شود؛ @ و لینک t.me هر دو پشتیبانی می‌شوند */
     $rows = [[btn('💬 پیام به ' . $user, null, 'https://t.me/' . $handle, 'success')]];
     if ($channel !== '') {
         $rows[] = [btn('📢 کانال رسمی', null, $channel, 'primary')];
@@ -4184,6 +4277,17 @@ function screen_panel_detail(int|string $chat, ?int $messageId, int $panelId): v
         $text .= '📈 روزانه ' . money((int) $panel['hourly_price'] * 24)
             . ' · ماهانه ' . money((int) $panel['hourly_price'] * 24 * 30) . "\n";
     }
+    if (!$isTrial) {
+        $leftPrepaid = panel_prepaid_remaining($panel);
+        if ($leftPrepaid > 0) {
+            $text .= '🎁 <b>' . fa_digits((int) ceil($leftPrepaid / 3600))
+                . ' ساعت پیش‌پرداخت‌شده</b> باقی مانده — تا آن زمان کسر ساعتی شروع نمی‌شود' . "\n"
+                . '   شروع کسر ساعتی: ' . fa_ts((int) $panel['billing_start_at']) . "\n";
+        } elseif ((int) ($panel['prepaid_amount'] ?? 0) > 0) {
+            $text .= '⏱ کسر ساعتی از ' . fa_ts((int) $panel['billing_start_at'])
+                . ' فعال شده است' . "\n";
+        }
+    }
     if ((int) $panel['last_devices'] > 0) {
         $text .= '📱 دستگاه متصل: ' . fa_digits((int) $panel['last_devices']) . "\n";
     }
@@ -4231,22 +4335,33 @@ function screen_panel_detail(int|string $chat, ?int $messageId, int $panelId): v
  * اجارهٔ ۲۴ ساعت اول پنل، همان لحظهٔ ساخت، از کیف پول کم می‌شود.
  * خروجی: مبلغی که واقعاً کم شد.
  */
-function panel_charge_first_day(int $panelId, int $tgId, int $hourlyPrice): int
+/**
+ * ثبت پیش‌پرداخت ساعت‌های اول در دفتر مصرف پنل.
+ *
+ * پول هنگام پرداخت فاکتور از کیف پول رفته است؛ اینجا فقط ثبت دفتری می‌شود تا
+ * «مصرف» و «هزینهٔ پنل» در گزارش‌ها درست دیده شود.
+ * ⚠️ این مبلغ غیرقابل استرداد است و با حذف پنل هم برنمی‌گردد.
+ */
+function panel_record_prepaid(int $panelId, int $tgId, int $amount, ?int $hours = null): int
 {
-    $daily = max(0, $hourlyPrice) * 24;
-    if ($daily <= 0) {
+    if ($amount <= 0) {
         return 0;
     }
-    $chargeable = min($daily, max(0, balance_of($tgId)));
-    if ($chargeable <= 0) {
+    $hours = $hours ?? prepaid_hours();
+    $panel = DB::one('SELECT * FROM panels WHERE id=?', [$panelId]);
+    if ($panel === null) {
         return 0;
     }
-    add_balance($tgId, -$chargeable, 'usage', (string) $panelId, 'اجارهٔ ۲۴ ساعت اول پنل');
+    $billingStart = (int) ($panel['billing_start_at'] ?? 0);
+    if ($billingStart <= 0) {
+        $billingStart = now_ts() + $hours * 3600;
+    }
     DB::exec('INSERT INTO usage_charges(panel_id, tg_id, bytes, hours, amount, kind, created_at) '
-        . 'VALUES(?,?,?,?,?,?,?)', [$panelId, $tgId, 0, 24, $chargeable, 'first-day', now_ts()]);
-    DB::exec('UPDATE panels SET spent_total = spent_total + ?, last_meter_at=? WHERE id=?',
-        [$chargeable, now_ts(), $panelId]);
-    return $chargeable;
+        . 'VALUES(?,?,?,?,?,?,?)', [$panelId, $tgId, 0, $hours, $amount, 'prepaid', now_ts()]);
+    DB::exec('UPDATE panels SET prepaid_amount=?, billing_start_at=?, last_meter_at=?, '
+        . 'spent_total = spent_total + ? WHERE id=?',
+        [$amount, $billingStart, $billingStart, $amount, $panelId]);
+    return $amount;
 }
 
 /**
@@ -4471,12 +4586,9 @@ const HELP_SECTIONS = [
             . "۳) محصول را باز کن؛ قیمت هر گیگ و اجارهٔ ساعتی‌اش را می‌بینید.\n"
             . "۴) «خرید این پنل» را بزنید و پرداخت را کامل کنید.\n\n"
             . 'بعد از پرداخت، نام کاربری و رمز پنل همین‌جا برایت می‌آید.'],
-    'pay' => ['title' => '💳 پرداخت و کیف پول', 'tags' => 'پرداخت کارت به کارت رسید کیف پول شارژ موجودی',
-        'body' => "دو راه پرداخت دارید:\n\n"
-            . "· <b>کارت به کارت</b>: شمارهٔ کارت را می‌بینی، مبلغ را واریز می‌کنی، عکس رسید را "
-            . "می‌فرستی؛ ادمین تأیید می‌کند.\n"
-            . "· <b>کیف پول</b>: قبلاً شارژ می‌کنید و با موجودی سریع خرید می‌زنید.\n\n"
-            . 'شارژ: «💰 کیف پول» → یکی از مبالغ آماده یا «✍️ مبلغ دلخواه».'],
+    'pay' => ['title' => '💳 پرداخت و کیف پول',
+        'tags' => 'پرداخت کارت به کارت رسید کیف پول شارژ موجودی درگاه فیش پیگیری',
+        'body' => ''],   // متن کامل و پویا از help_body() می‌آید
     'panels' => ['title' => '📦 پنل‌های من', 'tags' => 'پنل من مصرف تمدید رمز تعلیق کاربر',
         'body' => "«📦 پنل‌های من» فهرست پنل‌های توست.\n\n"
             . "هزینهٔ مصرف خودکار از کیف پول کم می‌شود؛ پنل هیچ‌وقت حذف نمی‌شود."],
@@ -4524,6 +4636,37 @@ const ADMIN_HELP = [
             . "· 🏷 کد تخفیف · 💳 کارت و پرداخت · ↩️ بازگشت وجه · 📅 گزارش امروز"],
 ];
 
+/**
+ * متن نهایی یک بخش راهنما.
+ * بخش پرداخت متن کامل و پویا دارد (نام ربات و مهلت فاکتور از تنظیمات خوانده
+ * می‌شود)؛ بقیهٔ بخش‌ها همان متن ثابت خودشان را برمی‌گردانند.
+ */
+function help_body(string $key, array $item): string
+{
+    if ($key !== 'pay') {
+        return (string) ($item['body'] ?? '');
+    }
+    $minutes = max(1, set_int('pay_expire_minutes', 30));
+    return "در " . e(bot_name()) . ' جهت رفاه حال شما، روش‌های متنوع و آنی برای پرداخت '
+        . 'و خرید سرویس‌ها فراهم شده است:' . "\n\n"
+        . "💎 <b>روش اول: شارژ کیف پول (پیشنهادی و آنی)</b>\n"
+        . 'با شارژ حساب کاربری خود، تمامی فاکتورها، تمدیدها و هزینه‌های ساعتی پنل‌ها '
+        . "به صورت خودکار و بدون نیاز به تایید دستی کسر می‌شوند.\n\n"
+        . "▸ <b>نحوه شارژ:</b> ورود به بخش «💰 کیف پول» ➔ انتخاب مبالغ آماده یا لمس "
+        . "«✍️ مبلغ دلخواه» ➔ انتخاب درگاه پرداخت آنی یا کارت‌به‌کارت.\n\n"
+        . "💳 <b>روش دوم: کارت به کارت (تایید سریع)</b>\n"
+        . "۱. در هنگام خرید یا شارژ، گزینه «کارت به کارت» را انتخاب نمایید.\n"
+        . "۲. شماره کارت و مبلغ دقیق فاکتور نمایش داده می‌شود.\n"
+        . '۳. پس از واریز از طریق همراه بانک یا اپلیکیشن‌های بانکی، تصویر فیش واریزی '
+        . "خود را ارسال فرمایید.\n"
+        . '۴. تراکنش شما پس از بررسی خودکار/تایید مدیریت، در سریع‌ترین زمان تایید و '
+        . "اعمال خواهد شد.\n\n"
+        . "⚠️ <b>نکات مهم:</b>\n"
+        . "• در پرداخت کارت به کارت، حتماً فیش واضح و حاوی شماره پیگیری معتبر ارسال شود.\n"
+        . '• پیش از سررسید مهلت پرداخت (' . fa_digits($minutes)
+        . ' دقیقه)، واریز را تکمیل فرمایید تا فاکتور منقضی نگردد.';
+}
+
 function help_pool(bool $admin): array
 {
     return $admin ? (HELP_SECTIONS + ADMIN_HELP) : HELP_SECTIONS;
@@ -4570,6 +4713,7 @@ function help_home_kb(bool $admin): array
                    btn('💳 مالی', 'help:s:adfin', null, 'danger')];
     }
     if (channel_url() !== '') {
+        /* فقط یک دکمهٔ کانال، متصل به آدرس تنظیم‌شده (پیش‌فرض sibilpanel) */
         $rows[] = [btn('📢 کانال رسمی', null, channel_url(), 'primary')];
     }
     $rows[] = [btn('« منو', 'home', null, 'danger')];
@@ -4638,6 +4782,7 @@ function console_kb(): array
          btn('⚙️ تنظیمات ربات', 'ad:settings', null, 'primary')],
         [btn('🔍 جستجوی سفارشات', 'ad:find', null, 'primary'),
          btn('📢 پیام همگانی', 'ad:broadcast', null, 'success')],
+        [btn('📢 قفل کانال اجباری', 'ad:fj', null, 'success')],
         [btn('🔙 بازگشت به منوی کاربری', 'home', null, 'danger')],
     ]);
 }
@@ -11278,7 +11423,10 @@ function deliver_panel_order(array $order): array
         : ($isTrial
             ? time() + max(1, (int) ($payloadOrder['trial_hours'] ?? set_int('trial_hours', 24))) * 3600
             : time() + (int) $product['days'] * DAY);
-    $userCap = $unlimitedTrial ? 0 : ($isTrial ? 1 : (int) $product['max_users']);
+    /* سقف کاربرانِ داخلِ پنل: برای تست از تنظیم مستقل trial_user_limit خوانده می‌شود
+       (قبلاً اشتباهاً ۱ بود و ظرفیت پنل پاسارگاد را قفل می‌کرد) */
+    $userCap = $unlimitedTrial ? 0
+        : ($isTrial ? max(1, set_int('trial_user_limit', 10)) : (int) $product['max_users']);
     $roleId = (int) $product['role_id'];
     if ($roleId <= 0) {
         $roleId = auto_role_id($panelRow);
@@ -11337,17 +11485,27 @@ function deliver_panel_order(array $order): array
         }
         return [false, 'ساخت پنل روی سرور انجام نشد: ' . $note];
     }
+    /* ⏱ ساعت‌های اول پیش‌پرداخت شده‌اند: کسر ساعتی فقط بعد از آن‌ها شروع می‌شود */
+    $prepaidHours = $isTrial ? 0 : prepaid_hours();
+    $billingStartAt = $prepaidHours > 0 ? now_ts() + $prepaidHours * 3600 : 0;
+    /* اگر سفارش از مسیر عادی ساخته نشده باشد (پرداخت مستقیم/ادمین)، پیش‌پرداخت
+       از خود محصول محاسبه می‌شود تا هیچ پنلی بدون پیش‌پرداخت ساخته نشود */
+    $prepaidAmount = $isTrial ? 0
+        : max(0, (int) ($payloadOrder['prepaid'] ?? panel_prepaid_amount($product)));
     $panelId = DB::exec('INSERT INTO panels(tg_id, product_id, panel_admin_id, panel_username, '
         . 'panel_password, label, max_users, device_limit, data_cap, expires_at, per_gb_price, '
-        . 'hourly_price, min_balance, status, created_at, pg_panel_id, order_id, user_cap, is_trial) '
-        . 'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+        . 'hourly_price, min_balance, status, created_at, pg_panel_id, order_id, user_cap, is_trial, '
+        . 'billing_start_at, prepaid_amount, last_meter_at) '
+        . 'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
         [$order['tg_id'], $product['id'], (int) ($created['id'] ?? 0), $username, $password,
          $product['name'] . ($isTrial ? ' (تست)' : ''), $userCap, (int) $product['device_limit'],
          (int) round($dataCapGb * 1024 ** 3),
          $expireAt, $isTrial ? 0 : (int) $product['per_gb_price'],
          $isTrial ? 0 : (int) $product['hourly_price'],
          (int) $product['min_balance'], 'active',
-         now_ts(), (int) $panelRow['id'], (int) $order['id'], $userCap, $isTrial ? 1 : 0]);
+         now_ts(), (int) $panelRow['id'], (int) $order['id'], $userCap, $isTrial ? 1 : 0,
+         $billingStartAt, $prepaidAmount,
+         $billingStartAt > 0 ? $billingStartAt : now_ts()]);
     if (!$isTrial) {
         /* این‌ها نباید تحویل پنل را خراب کنند؛ پنل ساخته شده و باید به کاربر برسد */
         try {
@@ -11355,10 +11513,15 @@ function deliver_panel_order(array $order): array
         } catch (Throwable $ex) {
             log_line('warning', 'grant_order_discount failed: ' . $ex->getMessage());
         }
-        try {
-            panel_charge_first_day($panelId, (int) $order['tg_id'], (int) $product['hourly_price']);
-        } catch (Throwable $ex) {
-            log_line('warning', 'first day charge failed: ' . $ex->getMessage());
+        /* ⚠️ اینجا دیگر پولی کسر نمی‌شود: پیش‌پرداخت هنگام پرداخت فاکتور
+           از کیف پول رفته است؛ فقط ثبت دفتری می‌شود */
+        if ($prepaidAmount > 0) {
+            try {
+                panel_record_prepaid($panelId, (int) $order['tg_id'], $prepaidAmount,
+                    $prepaidHours);
+            } catch (Throwable $ex) {
+                log_line('warning', 'prepaid ledger failed: ' . $ex->getMessage());
+            }
         }
     }
     $user = user_get((int) $order['tg_id']);
@@ -12148,6 +12311,32 @@ function wiz_finish(int $uid, array $data): void
                      [btn('« مالی', 'ad:finance', null, 'danger')]]);
                 return;
             }
+            /* آیدی پشتیبانی: @name و لینک t.me هر دو پذیرفته و یکسان ذخیره می‌شوند */
+            if ($key === 'support_link') {
+                $rawSupport = trim((string) $values['value']);
+                $supportHandle = '';
+                if (preg_match('~t\.me/([A-Za-z0-9_]{3,32})~i', $rawSupport, $sm)) {
+                    $supportHandle = $sm[1];
+                } elseif (preg_match('~^@?([A-Za-z0-9_]{3,32})$~', $rawSupport, $sm)) {
+                    $supportHandle = $sm[1];
+                }
+                if ($supportHandle === '' && $rawSupport !== '') {
+                    Tg::send($uid, "❌ این آیدی معتبر نیست.\n\n"
+                        . 'یکی از این دو شکل را بفرستید:' . "\n"
+                        . '· <code>@my_support</code>' . "\n"
+                        . '· <code>https://t.me/my_support</code>',
+                        [[btn('📞 دوباره', 'ad:set:support_link', null, 'primary')],
+                         [btn('« تنظیمات', 'ad:setg:report', null, 'danger')]]);
+                    return;
+                }
+                set_put('support_link', $supportHandle !== '' ? '@' . $supportHandle : '');
+                Tg::send($uid, "✅ «آیدی پشتیبانی» ذخیره شد: <b>"
+                    . e($supportHandle !== '' ? '@' . $supportHandle : '—') . "</b>\n\n"
+                    . '<i>دکمهٔ شیشه‌ای «☎️ پشتیبانی» همین حالا به '
+                    . '<code>https://t.me/' . e($supportHandle) . '</code> وصل شد.</i>',
+                    [[btn('« تنظیمات', 'ad:setg:report', null, 'danger')]]);
+                return;
+            }
             set_put($key, (string) $values['value']);
             $label = SETTING_LABELS[$key] ?? 'مقدار';
             $backTo = match (setting_group_of($key)) {
@@ -12468,15 +12657,17 @@ function wiz_finish(int $uid, array $data): void
                     [[btn('🎯 تغییر مخاطب', 'ad:bc:seg', null, 'success')]]);
                 return;
             }
-            $stats = bc_run($targets, 'text', $text, 0, 0, set_bool('bc_pin', false));
-            Tg::send($uid, '📣 <b>ارسال همگانی تمام شد</b>' . "\n"
-                . '🎯 ' . BC_SEGMENTS[bc_segment()] . "\n"
-                . '✅ موفق: ' . fa_digits($stats['sent']) . "\n"
-                . '❌ ناموفق: ' . fa_digits($stats['failed']),
+            /* ارسال همگانی در پس‌زمینه: ربات هیچ‌وقت قفل نمی‌کند و تایم‌اوت نمی‌دهد */
+            bc_job_start($targets, 'text', $text, 0, 0, set_bool('bc_pin', false),
+                $uid, '📣 ارسال همگانی تمام شد', BC_SEGMENTS[bc_segment()]);
+            Tg::send($uid, '🚀 <b>ارسال همگانی در پس‌زمینه آغاز شد</b>' . "\n" . SEP . "\n"
+                . '🎯 مخاطب: ' . BC_SEGMENTS[bc_segment()] . "\n"
+                . '👥 تعداد کل: ' . fa_digits(count($targets)) . "\n\n"
+                . '<i>پیام‌ها یکی‌یکی و با فاصله ارسال می‌شوند؛ گزارش کامل '
+                . '(تعداد کل / موفق / مسدود شده توسط کاربر) همین‌جا برایت می‌آید. '
+                . 'می‌توانی ربات را عادی استفاده کنی.</i>',
                 [[btn('« پیام همگانی', 'ad:bc', null, 'success')]]);
-            post_report('📣 <b>پیام همگانی</b>' . "\n" . 'مخاطب: '
-                . BC_SEGMENTS[bc_segment()] . "\n" . 'موفق ' . $stats['sent']
-                . ' · ناموفق ' . $stats['failed'], 'general');
+            bc_job_dispatch();
             return;
     }
     Tg::send($uid, 'ویزارد نامعتبر.', console_kb());
@@ -12590,6 +12781,25 @@ function handle_callback_inner(array $cb): void
     $GLOBALS['panel_nav_scope'] = str_starts_with($data, 'ad:') ? 'ad' : 'user';
 
     /* ── ماژول احراز هویت (KYC) ─────────────────────────────────────── */
+    /* ── قفل عضویت اجباری کانال ─────────────────────────────────────── */
+    if ($data === 'fj:check') {
+        /* دکمهٔ تایید عضویت: فقط همین یک دکمه همیشه باز است */
+        if (force_join_blocked($uid)) {
+            Tg::answer($cbId, '⚠️ عضویت شما تایید نشد. اول در کانال عضو شوید.', true);
+            force_join_show($chatId, $messageId);
+            return;
+        }
+        Tg::answer($cbId, '✅ عضویت تایید شد.');
+        State::clear($uid);
+        show_home($chatId, $messageId, $uid);
+        return;
+    }
+    if (force_join_blocked($uid)) {
+        Tg::answer($cbId, '⚠️ اول در کانال عضو شوید', true);
+        force_join_show($chatId, $messageId);
+        return;
+    }
+
     if ($head === 'kyc') {
         Tg::answer($cbId);
         kyc_callback($uid, $chatId, $messageId, $parts);
@@ -12750,7 +12960,7 @@ function handle_callback_inner(array $cb): void
                 return;
             }
             Tg::show($chatId, $messageId,
-                '<b>' . e($pool[$key]['title']) . "</b>\n\n" . $pool[$key]['body'],
+                '<b>' . e($pool[$key]['title']) . "</b>\n\n" . help_body($key, $pool[$key]),
                 [[btn('« راهنما', 'help:home', null, 'danger')]]);
             return;
         }
@@ -12805,8 +13015,12 @@ function handle_callback_inner(array $cb): void
             foreach ([1, 5, 10, 50, 100] as $gb) {
                 $text .= '· ' . fa_digits($gb) . ' گیگ → ' . money($gb * $perGb) . "\n";
             }
-            $text .= "\n" . 'اجارهٔ روزانه (۲۴ ساعت): ' . money($hourly * 24) . "\n\n"
-                . '🧮 فرمول: (گیگ مصرف‌شده × قیمت هر گیگ) + (ساعت فعال × اجارهٔ ساعتی)';
+            $hours = prepaid_hours();
+            $text .= "\n" . 'اجارهٔ روزانه (۲۴ ساعت): ' . money($hourly * 24) . "\n"
+                . 'پیش‌پرداخت ' . fa_digits($hours) . ' ساعت اول: <b>'
+                . money(panel_prepaid_amount($product)) . '</b>' . "\n\n"
+                . '🧮 فرمول: پیش‌پرداخت ساعت‌های اول + (گیگ مصرف‌شده × قیمت هر گیگ) + '
+                . '(ساعت فعال × اجارهٔ ساعتی)';
             Tg::show($chatId, $messageId, $text,
                 [[btn('« بازگشت', 'buy:p:' . $product['id'], null, 'danger')]]);
             return;
@@ -13052,11 +13266,20 @@ function handle_callback_inner(array $cb): void
             }
             $blockPrice = (int) ($product['extra_block_price'] ?? 0);
             unset($blockPrice);
+            /* هشدار: پیش‌پرداخت ساعت‌های اول غیرقابل استرداد است */
+            $prepaid = (int) ($panel['prepaid_amount'] ?? 0);
+            $warn = '';
+            if ($prepaid > 0 && panel_prepaid_remaining($panel) > 0) {
+                $warn = "\n" . '⚠️ <b>توجه:</b> پیش‌پرداخت ' . fa_digits(prepaid_hours())
+                    . ' ساعت اول این پنل (<b>' . money($prepaid) . '</b>) '
+                    . 'در صورت حذف <b>بازگردانده نمی‌شود</b>.';
+            }
             Tg::show($chatId, $messageId,
                 "🗑 <b>حذف پنل</b>\n\n"
                 . 'پنل <code>' . e((string) $panel['panel_username']) . "</code> از روی پنل و از "
                 . "ربات حذف می‌شود.\n"
-                . '<i>این کار برگشت‌پذیر نیست.</i>',
+                . '<i>این کار برگشت‌پذیر نیست.</i>'
+                . $warn,
                 [[btn('✅ بله، حذف کنید', 'pn:' . $panelId . ':delok', null, 'danger')],
                  [btn('« انصراف', 'pn:' . $panelId, null, 'primary')]]);
             return;
@@ -13214,6 +13437,45 @@ function handle_callback_inner(array $cb): void
     }
 
     /* ── مدیریت ───────────────────────────────────────────────────────── */
+    /* ── 📢 قفل کانال اجباری (مسیر مستقیم پنل مدیریت) ─────────────────── */
+    if ($head === 'fj') {
+        if (!is_owner($uid)) {
+            Tg::answer($cbId, '⛔️ این بخش فقط برای مالک ربات است.', true);
+            return;
+        }
+        $op = (string) ($parts[1] ?? '');
+        if ($op === 'on') {
+            if (force_channel_raw() === '') {
+                Tg::answer($cbId, '🔗 اول آیدی کانال را تنظیم کنید.', true);
+                Tg::show($chatId, $messageId,
+                    "⚠️ هنوز کانالی تنظیم نشده است.\n\n" . force_channel_admin_text(),
+                    force_channel_admin_kb());
+                return;
+            }
+            $new = !set_bool('force_channel_on', false);
+            set_put('force_channel_on', $new ? '1' : '0');
+            Tg::answer($cbId, $new ? '🟢 قفل روشن شد.' : '🔴 قفل خاموش شد.');
+        } elseif ($op === 'set') {
+            State::set($uid, 'fj_channel');
+            Tg::show($chatId, $messageId,
+                "🔗 <b>تنظیم کانال اجباری</b>\n" . SEP . "\n"
+                . 'آیدی یا لینک کانال را بفرستید:' . "\n"
+                . '· <code>@my_channel</code>' . "\n"
+                . '· <code>https://t.me/my_channel</code>' . "\n"
+                . '· یا شناسهٔ عددی <code>-1001234567890</code>' . "\n\n"
+                . '<i>ربات باید در آن کانال «مدیر» باشد؛ وگرنه ذخیره نمی‌شود.</i>',
+                [[btn('🔙 انصراف / بازگشت', 'ad:fj', null, 'danger')]]);
+            return;
+        } elseif ($op === 'del') {
+            set_put('force_channel_id', '');
+            set_put('force_channel_on', '0');
+            Tg::answer($cbId, '🗑 کانال اجباری حذف شد.');
+        }
+        State::clear($uid);
+        Tg::show($chatId, $messageId, force_channel_admin_text(), force_channel_admin_kb());
+        return;
+    }
+
     if ($head !== 'ad') {
         Tg::send($chatId, 'این دکمه دیگر معتبر نیست.', home_kb($uid));
         return;
@@ -13233,6 +13495,10 @@ function handle_callback_inner(array $cb): void
     }
     $action = $parts[1] ?? '';
     switch ($action) {
+        case 'fj':
+            Tg::show($chatId, $messageId, force_channel_admin_text(),
+                force_channel_admin_kb());
+            return;
         case 'home':
             screen_console($chatId, $messageId);
             return;
@@ -14447,6 +14713,13 @@ function handle_message_inner(array $message): void
         return;
     }
 
+    /* ── قفل عضویت اجباری کانال: تا عضویت تایید نشود هیچ بخشی باز نیست ── */
+    if (force_join_blocked($uid)) {
+        State::clear($uid);
+        force_join_show($chatId, null);
+        return;
+    }
+
     /* ── پرداخت موفق استارز ─────────────────────────────────────────── */
     if (isset($message['successful_payment'])) {
         pay_stars_success($message);
@@ -14543,12 +14816,15 @@ function handle_message_inner(array $message): void
                     [[btn('🎯 تغییر مخاطب', 'ad:bc:seg', null, 'success')]]);
                 return;
             }
-            $stats = bc_run($targets, 'copy', '', $chatId, $msgId, set_bool('bc_pin', false));
-            Tg::send($chatId, '🔁 <b>فروارد همگانی تمام شد</b>' . "\n"
-                . '🎯 ' . BC_SEGMENTS[bc_segment()] . "\n"
-                . '✅ موفق: ' . fa_digits($stats['sent']) . "\n"
-                . '❌ ناموفق: ' . fa_digits($stats['failed']),
+            bc_job_start($targets, 'copy', '', $chatId, $msgId, set_bool('bc_pin', false),
+                $uid, '🔁 فروارد همگانی تمام شد', BC_SEGMENTS[bc_segment()]);
+            Tg::send($chatId, '🚀 <b>فروارد همگانی در پس‌زمینه آغاز شد</b>' . "\n" . SEP . "\n"
+                . '🎯 مخاطب: ' . BC_SEGMENTS[bc_segment()] . "\n"
+                . '👥 تعداد کل: ' . fa_digits(count($targets)) . "\n\n"
+                . '<i>گزارش کامل (تعداد کل / موفق / مسدود شده توسط کاربر) '
+                . 'همین‌جا برایت می‌آید.</i>',
                 [[btn('« پیام همگانی', 'ad:bc', null, 'success')]]);
+            bc_job_dispatch();
             return;
 
         case 'wiz':
@@ -14640,6 +14916,44 @@ function handle_message_inner(array $message): void
             $order = order_get($orderId) ?? $order;
             Tg::send($chatId, '✅ کد اعمال شد.' . "\n" . invoice_text($order, 'پرداخت سفارش',
                 'تخفیف: ' . money($discount)), invoice_kb($order, $uid));
+            return;
+
+        case 'fj_channel':
+            /* ثبت کانال اجباری: تجزیه → بررسی مدیر بودن ربات → ذخیره */
+            if (!is_owner($uid)) {
+                State::clear($uid);
+                return;
+            }
+            if (in_array(trim($text), ['لغو', 'انصراف', 'cancel', '/cancel'], true)) {
+                State::clear($uid);
+                Tg::send($chatId, 'انصراف داده شد.', force_channel_admin_kb());
+                return;
+            }
+            [$chOk, $chChat, $chUsername, $chWhy] = force_channel_parse($text);
+            if (!$chOk) {
+                Tg::send($chatId, '❌ ' . $chWhy . "\n\n" . 'دوباره بفرستید.',
+                    [[btn('🔙 انصراف / بازگشت', 'ad:fj', null, 'danger')]]);
+                return;
+            }
+            [$chAdmin, $chAdminWhy] = force_channel_bot_admin($chChat);
+            if (!$chAdmin) {
+                Tg::send($chatId, '⚠️ ' . $chAdminWhy . "\n\n" . 'دوباره بفرستید '
+                    . 'یا «🔙 انصراف / بازگشت» را بزنید.',
+                    [[btn('🔙 انصراف / بازگشت', 'ad:fj', null, 'danger')]]);
+                return;
+            }
+            State::clear($uid);
+            set_put('force_channel_id', $chUsername !== '' ? '@' . $chUsername : $chChat);
+            set_put('force_channel_on', '1');
+            $chLink = force_channel_link();
+            Tg::send($chatId, "✅ <b>کانال اجباری ذخیره و فعال شد</b>\n" . SEP . "\n"
+                . 'کانال: <code>' . e($chUsername !== '' ? '@' . $chUsername : $chChat)
+                . '</code>' . "\n"
+                . 'لینک عضویت: ' . ($chLink !== '' ? '<code>' . e($chLink) . '</code>'
+                    : '—') . "\n\n"
+                . '<i>ربات مدیر این کانال است و قفل برای همهٔ کاربران فعال شد. '
+                . 'مالک و ادمین‌ها قفل نمی‌شوند.</i>',
+                force_channel_admin_kb());
             return;
 
         case 'report_group_id':
@@ -14865,6 +15179,12 @@ function panel_meter_amounts(array $panel, int $usedBytes, bool $hourlyEnabled,
         }
     }
     $meterAt = (int) $panel['last_meter_at'] ?: (int) $panel['created_at'];
+    /* ⏱ ساعت‌های پیش‌پرداخت‌شده (پیش‌فرض ۲۴ ساعت اول) حساب نمی‌شوند:
+       مبنای کسر ساعتی فقط بعد از پایان آن‌ها جلو می‌رود */
+    $billingStart = (int) ($panel['billing_start_at'] ?? 0);
+    if ($billingStart > 0 && $billingStart > $meterAt) {
+        $meterAt = $billingStart;
+    }
     $hours = 0;
     $meterUntil = now_ts();
     if ($hourlyEnabled && (int) $panel['hourly_price'] > 0
@@ -15909,6 +16229,19 @@ function cli_main(array $argv): int
             $stats = panels_meter(true);
             echo json_encode($stats, JSON_UNESCAPED_UNICODE) . "\n";
             return 0;
+        case '--broadcast':
+            /* کارگر پس‌زمینهٔ پیام همگانی: تا تمام شدن کار ادامه می‌دهد */
+            if (!function_exists('bc_job_tick')) {
+                echo "FAIL broadcast module is not loaded\n";
+                return 1;
+            }
+            $guard = 0;
+            while (!bc_job_tick(45) && $guard++ < 2000) {
+                /* هر تیک ۴۵ ثانیه کار می‌کند؛ بین تیک‌ها نفس می‌کشد */
+                usleep(200000);
+            }
+            echo "OK   broadcast job finished\n";
+            return 0;
         case '--backup':
             [$backupOk, $backupNote] = backup_send('بکاپ دستی از خط فرمان', true);
             echo ($backupOk ? 'OK   ' : 'FAIL ') . $backupNote . "\n";
@@ -15984,6 +16317,7 @@ function cli_main(array $argv): int
                 . "  --meter          run the usage/hourly billing pass once\n"
                 . "  --report [--post] daily report text (optionally to the report group)\n"
                 . "  --backup         send one backup to the backup group and delete it\n"
+                . "  --broadcast      run the background broadcast job until it ends\n"
                 . "  --topics         create the missing report topics in the group\n"
                 . "  --migrate        create/upgrade the database\n"
                 . "  --test-update    dry-run one update (no telegram calls)\n"
@@ -15996,6 +16330,226 @@ function cli_main(array $argv): int
 }
 
 
+/* 26) قفل عضویت اجباری کانال
+   ─────────────────────────────────────────────────────────────────────────
+   مدیر از مسیر «⚙️ پنل مدیریت ➔ 📢 قفل کانال اجباری» کانال را وصل می‌کند.
+   پیش از ذخیره، ربات با getChatMember بررسی می‌کند که خودش در آن کانال
+   «مدیر» باشد؛ وگرنه قفل هرگز کار نمی‌کند و کاربر بی‌گناه بسته می‌شود.
+   مالک و ادمین‌ها هیچ‌وقت قفل نمی‌شوند.
+*/
+
+/** شناسهٔ عددی خود ربات — از پیش‌شمارهٔ توکن خوانده می‌شود */
+function bot_numeric_id(): int
+{
+    static $id = null;
+    if ($id === null) {
+        $id = 0;
+        $token = bot_token();
+        if ($token !== '' && str_contains($token, ':')) {
+            $id = (int) substr($token, 0, (int) strpos($token, ':'));
+        }
+        $override = (int) cfg('PANEL_BOT_ID', '0');
+        if ($override > 0) {
+            $id = $override;
+        }
+    }
+    return $id;
+}
+
+/** مقدار خام ذخیره‌شده (@name یا لینک t.me یا شناسهٔ عددی) */
+function force_channel_raw(): string
+{
+    return trim((string) set_get('force_channel_id', ''));
+}
+
+/** آیا قفل روشن است و کانالی هم تنظیم شده است؟ */
+function force_channel_ready(): bool
+{
+    return set_bool('force_channel_on', false) && force_channel_raw() !== '';
+}
+
+/**
+ * تجزیهٔ ورودی مدیر → [ok, chat, username, why]
+ * ورودی مجاز: `@name` · `name` · `https://t.me/name` · `-100…`
+ */
+function force_channel_parse(string $raw): array
+{
+    $raw = trim($raw);
+    $raw = trim($raw, "\"'<> \t\n\r");
+    if ($raw === '') {
+        return [false, '', '', 'آیدی یا لینک کانال را بفرستید.'];
+    }
+    if (preg_match('~^-100\d{6,}$~', $raw)) {
+        return [true, $raw, '', ''];
+    }
+    if (preg_match('~^(?:https?://)?(?:www\.)?t\.me/(?:s/)?([A-Za-z][A-Za-z0-9_]{3,31})/?$~i', $raw, $m)) {
+        return [true, '@' . $m[1], $m[1], ''];
+    }
+    if (preg_match('~^@?([A-Za-z][A-Za-z0-9_]{3,31})$~', $raw, $m)) {
+        return [true, '@' . $m[1], $m[1], ''];
+    }
+    return [false, '', '', 'این آیدی معتبر نیست. نمونهٔ درست: @my_channel یا https://t.me/my_channel'];
+}
+
+/** لینک عمومی کانال برای دکمهٔ «📢 عضویت در کانال» */
+function force_channel_link(string $raw = ''): string
+{
+    $raw = $raw !== '' ? $raw : force_channel_raw();
+    if ($raw === '') {
+        return '';
+    }
+    [$ok, $chat, $username] = force_channel_parse($raw);
+    if (!$ok) {
+        return '';
+    }
+    if ($username !== '') {
+        return 'https://t.me/' . $username;
+    }
+    /* شناسهٔ عددی: نام کاربری عمومی را از خود تلگرام می‌پرسیم */
+    $info = Tg::getChat($chat);
+    if (is_array($info) && !empty($info['username'])) {
+        return 'https://t.me/' . (string) $info['username'];
+    }
+    if (is_array($info) && !empty($info['invite_link'])) {
+        return (string) $info['invite_link'];
+    }
+    return '';
+}
+
+/**
+ * آیا ربات در این کانال مدیر است؟ → [ok, why]
+ * بدون این بررسی، قفل برای همهٔ کاربران بی‌اثر می‌شد.
+ */
+function force_channel_bot_admin(string $chat): array
+{
+    $botId = bot_numeric_id();
+    if ($botId === 0) {
+        return [false, 'شناسهٔ ربات خوانده نشد؛ توکن ربات را بررسی کنید.'];
+    }
+    $res = Tg::call('getChatMember', ['chat_id' => $chat, 'user_id' => $botId]);
+    if (Tg::$dry) {
+        return [true, ''];
+    }
+    $member = is_array($res) ? ($res['result'] ?? null) : null;
+    if (!is_array($member)) {
+        return [false, 'ربات به این کانال دسترسی ندارد. اول ربات را در کانال «مدیر» کنید، '
+            . 'بعد آیدی را بفرستید.'];
+    }
+    $status = (string) ($member['status'] ?? '');
+    if (!in_array($status, ['administrator', 'creator'], true)) {
+        return [false, 'ربات در این کانال مدیر نیست. در «مدیریت کانال ➔ مدیران» ربات را '
+            . 'با دسترسی دیدن پیام‌ها اضافه کنید و دوباره بفرستید.'];
+    }
+    return [true, ''];
+}
+
+/**
+ * عضویت یک کاربر → true عضو است، false عضو نیست، null نامعلوم (تلگرام جواب نداد)
+ * در حالت نامعلوم قفل باز می‌ماند تا کسی بی‌دلیل بیرون نماند.
+ */
+function force_channel_member(int $uid): ?bool
+{
+    $raw = force_channel_raw();
+    if ($raw === '' || $uid <= 0) {
+        return null;
+    }
+    [, $chat] = force_channel_parse($raw);
+    if ($chat === '') {
+        return null;
+    }
+    if (Tg::$dry) {
+        /* در تست، پاسخ ساختگی getChatMember از Tg::$memberStub خوانده می‌شود */
+        if (Tg::$memberStub !== null) {
+            return Tg::$memberStub;
+        }
+        return null;
+    }
+    $res = Tg::call('getChatMember', ['chat_id' => $chat, 'user_id' => $uid]);
+    $member = is_array($res) ? ($res['result'] ?? null) : null;
+    if (!is_array($member)) {
+        return null;
+    }
+    $status = (string) ($member['status'] ?? '');
+    if (in_array($status, ['creator', 'administrator', 'member'], true)) {
+        return true;
+    }
+    if ($status === 'restricted') {
+        return !empty($member['is_member']);
+    }
+    return false;   // left · kicked
+}
+
+/** آیا این کاربر باید پشت قفل بماند؟ مالک و ادمین‌ها هرگز */
+function force_join_blocked(int $uid): bool
+{
+    if (!force_channel_ready()) {
+        return false;
+    }
+    if (is_owner($uid) || is_admin($uid)) {
+        return false;
+    }
+    return force_channel_member($uid) === false;
+}
+
+/** متن قفل — همان متنی که در همهٔ بخش‌ها نشان داده می‌شود */
+function force_join_text(): string
+{
+    return "⚠️ <b>کاربر گرامی!</b>\n\n"
+        . 'برای استفاده از ربات، ابتدا باید در کانال رسمی ما عضو شوید.' . "\n"
+        . 'پس از عضویت، دکمهٔ «تایید عضویت 🔄» را بزنید تا دسترسی شما باز شود.' . "\n\n"
+        . '<i>اگر عضو هستید و باز هم این پیام را می‌بینید، یک‌بار روی «تایید عضویت 🔄» بزنید.</i>';
+}
+
+/** دکمه‌های قفل: عضویت (شیشه‌ای) + تایید */
+function force_join_kb(): array
+{
+    $rows = [];
+    $link = force_channel_link();
+    if ($link !== '') {
+        $rows[] = [btn('📢 عضویت در کانال', null, $link, 'success')];
+    }
+    $rows[] = [btn('تایید عضویت 🔄', 'fj:check', null, 'primary')];
+    return $rows;
+}
+
+/** نمایش صفحهٔ قفل (برای روترها) */
+function force_join_show(int|string $chat, ?int $messageId = null): void
+{
+    Tg::show($chat, $messageId, force_join_text(), force_join_kb());
+}
+
+/** صفحهٔ مدیریت قفل — وضعیت + سه دکمه */
+function force_channel_admin_kb(): array
+{
+    $on = force_channel_ready();
+    return kb_clean([
+        [btn($on ? '🔘 وضعیت قفل: روشن 🟢' : '🔘 وضعیت قفل: خاموش 🔴', 'fj:on', null,
+            $on ? 'danger' : 'success')],
+        [btn('🔗 تنظیم آیدی / لینک کانال', 'fj:set', null, 'primary')],
+        [btn('🗑 حذف کانال اجباری', 'fj:del', null, 'danger')],
+        [btn('« بازگشت به مدیریت', 'ad:home', null, 'danger')],
+    ]);
+}
+
+function force_channel_admin_text(): string
+{
+    $raw = force_channel_raw();
+    $linked = $raw !== '' ? '<code>' . e($raw) . '</code>' : '🔴 تنظیم نشده';
+    $state = force_channel_ready() ? '🟢 روشن' : '🔴 خاموش';
+    return "📢 <b>قفل کانال اجباری</b>\n" . SEP . "\n"
+        . 'وضعیت: ' . $state . "\n"
+        . 'کانال: ' . $linked . "\n"
+        . 'لینک عضویت: ' . (force_channel_link() !== ''
+            ? '<code>' . e(force_channel_link()) . '</code>' : '—') . "\n"
+        . SEP . "\n"
+        . "📋 <b>راهنمای مدیر</b>\n"
+        . '۱) ربات را در کانال خود <b>مدیر</b> کنید (دسترسی دیدن پیام‌ها).' . "\n"
+        . '۲) دکمهٔ «🔗 تنظیم آیدی / لینک کانال» را بزنید و آیدی را بفرستید:' . "\n"
+        . '   · <code>@channel</code> یا <code>https://t.me/channel</code>' . "\n"
+        . '   · یا شناسهٔ عددی کانال، مثل <code>-1001234567890</code>' . "\n"
+        . '۳) ربات خودش بررسی می‌کند که مدیر کانال باشد؛ اگر نبود ذخیره نمی‌کند.' . "\n\n"
+        . '<i>مالک و ادمین‌های ربات هیچ‌وقت قفل نمی‌شوند.</i>';
+}
 /*
    21) PAYMENTS — درگاه‌های پرداخت: کارت‌به‌کارت · کیف پول · زرین‌پال ·
        آقای‌پرداخت · ایران‌پی ۱/۲/۴ · نواپی‌منت · پلیسیو · واریزا · ترون ·
@@ -18767,34 +19321,241 @@ function bc_targets(string $segment, bool $onlyAllowed = true): array
     return $ids;
 }
 
-/** یک اجرای همگانی: متن یا کپی پیام، با پین اختیاری */
+/**
+ * یک ارسال تک‌نفره با تحمل خطا:
+ *  · اگر تلگرام «مسدود کرده» بگوید → blocked
+ *  · اگر 429 بدهد → به اندازهٔ retry_after صبر می‌کند و دوباره می‌فرستد
+ *  خروجی: [موفق؟، مسدود؟، message_id]
+ */
+function bc_send_one(int $tgId, string $mode, string $text, int $fromChat, int $messageId,
+                     int $tries = 3): array
+{
+    for ($attempt = 1; $attempt <= $tries; $attempt++) {
+        $params = $mode === 'copy'
+            ? ['chat_id' => $tgId, 'from_chat_id' => $fromChat, 'message_id' => $messageId]
+            : ['chat_id' => $tgId, 'text' => $text, 'parse_mode' => 'HTML',
+               'disable_web_page_preview' => true];
+        $method = $mode === 'copy' ? 'copyMessage' : 'sendMessage';
+        $res = Tg::call($method, $params);
+        if (Tg::$dry) {
+            return [true, false, count(Tg::$outbox)];
+        }
+        $okSend = is_array($res) && ($res['ok'] ?? false) === true;
+        if ($okSend) {
+            $sentId = (int) ($res['result']['message_id'] ?? 0);
+            return [true, false, $sentId];
+        }
+        $description = is_array($res) ? (string) ($res['description'] ?? '') : '';
+        if (bc_blocked_error($description)) {
+            return [false, true, 0];
+        }
+        $retryAfter = (int) ($res['parameters']['retry_after'] ?? 0);
+        if ($retryAfter > 0 || stripos($description, 'too many requests') !== false) {
+            /* 429: صبر می‌کنیم و همان کاربر را دوباره می‌زنیم — هیچ‌وقت رها نمی‌شود */
+            sleep(max(1, min(60, $retryAfter > 0 ? $retryAfter : 2)));
+            usleep(50000);
+            continue;
+        }
+        return [false, false, 0];
+    }
+    return [false, false, 0];
+}
+
+/** آیا خطای تلگرام یعنی «کاربر ربات را مسدود کرده»؟ */
+function bc_blocked_error(string $description): bool
+{
+    $needle = mb_strtolower($description);
+    foreach (['blocked by the user', 'user is deactivated', 'bot was blocked',
+              'chat not found', 'user not found', 'peer_id_invalid', 'bot cannot initiate'] as $hint) {
+        if (str_contains($needle, $hint)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * ارسال همگانی — غیرهمزمان و بی‌خطر.
+ *  · بین هر پیام ۵۰ میلی‌ثانیه فاصله می‌گذارد (محدودیت تلگرام)
+ *  · کاربرانی که ربات را مسدود کرده‌اند رد می‌شوند و شمرده می‌شوند
+ *  · متن نهایی: «تعداد کل: X | موفق: Y | مسدود شده توسط کاربر: Z»
+ */
 function bc_run(array $targets, string $mode, string $text = '', int $fromChat = 0,
                 int $messageId = 0, bool $pin = false): array
 {
     $sent = 0;
     $failed = 0;
-    foreach ($targets as $tgId) {
-        if ($mode === 'copy') {
-            $okSend = Tg::copyMessage($tgId, $fromChat, $messageId);
-            $lastId = 0;
-        } else {
-            $lastId = (int) Tg::send($tgId, $text);
-            $okSend = $lastId > 0;
-        }
+    $blocked = 0;
+    $jobId = (string) set_get('bc_job_id', '');
+    foreach ($targets as $index => $tgId) {
+        [$okSend, $isBlocked, $lastId] = bc_send_one((int) $tgId, $mode, $text, $fromChat,
+            $messageId);
         if ($okSend) {
             $sent++;
             if ($pin && $lastId > 0) {
-                Tg::pin($tgId, $lastId);
+                Tg::pin((int) $tgId, $lastId);
             }
+        } elseif ($isBlocked) {
+            $blocked++;
         } else {
             $failed++;
         }
+        /* پیشرفت کار برای صفحهٔ «پیام همگانی» و جلوگیری از تایم‌اوت */
+        if ($jobId !== '') {
+            bc_job_update($index + 1, $sent, $failed, $blocked);
+        }
+        usleep(50000);   // ۵۰ میلی‌ثانیه بین هر ارسال
     }
-    $stats = ['at' => now_ts(), 'sent' => $sent, 'failed' => $failed,
+    $stats = ['at' => now_ts(), 'sent' => $sent, 'failed' => $failed, 'blocked' => $blocked,
               'segment' => bc_segment(), 'mode' => $mode, 'total' => count($targets)];
     set_put('bc_last', json_encode($stats, JSON_UNESCAPED_UNICODE));
     set_put('bc_last_at', (string) now_ts());
     return $stats;
+}
+
+/** یک خط گزارش همگانی — دقیقاً همان قالبی که مدیر می‌خواهد */
+function bc_report_line(array $stats): string
+{
+    return 'تعداد کل: ' . fa_digits((int) ($stats['total'] ?? 0))
+        . ' | موفق: ' . fa_digits((int) ($stats['sent'] ?? 0))
+        . ' | مسدود شده توسط کاربر: ' . fa_digits((int) ($stats['blocked'] ?? 0));
+}
+
+/** متن گزارش نهایی همگانی برای مدیر و گروه گزارشات */
+function bc_report_text(array $stats, string $title, string $segment = ''): string
+{
+    return $title . "\n"
+        . ($segment !== '' ? '🎯 ' . $segment . "\n" : '')
+        . '✅ ' . bc_report_line($stats)
+        . ((int) ($stats['failed'] ?? 0) > 0
+            ? "\n" . '⚠️ ناموفق (غیر از مسدود): ' . fa_digits((int) $stats['failed']) : '');
+}
+
+/* ── کار پس‌زمینهٔ ارسال همگانی ─────────────────────────────────────────── */
+
+/** ثبت یک کار همگانی در تنظیمات (تا صفحه همیشه بداند چه چیزی در جریان است) */
+function bc_job_start(array $targets, string $mode, string $text, int $fromChat,
+                      int $messageId, bool $pin, int $adminId, string $title,
+                      string $segment): string
+{
+    $jobId = 'bc' . now_ts() . mt_rand(100, 999);
+    $job = ['id' => $jobId, 'mode' => $mode, 'text' => $text, 'from_chat' => $fromChat,
+            'message_id' => $messageId, 'pin' => $pin ? 1 : 0, 'admin' => $adminId,
+            'title' => $title, 'segment' => $segment, 'targets' => array_values($targets),
+            'cursor' => 0, 'sent' => 0, 'failed' => 0, 'blocked' => 0,
+            'total' => count($targets), 'started_at' => now_ts(), 'done' => 0];
+    set_put('bc_job', json_encode($job, JSON_UNESCAPED_UNICODE));
+    set_put('bc_job_id', $jobId);
+    return $jobId;
+}
+
+function bc_job_get(): ?array
+{
+    $raw = (string) set_get('bc_job', '');
+    if ($raw === '') {
+        return null;
+    }
+    $job = json_decode($raw, true);
+    return is_array($job) ? $job : null;
+}
+
+/** به‌روزرسانی پیشرفت کار (برای صفحهٔ مدیریت) */
+function bc_job_update(int $cursor, int $sent, int $failed, int $blocked, bool $done = false): void
+{
+    $job = bc_job_get();
+    if ($job === null) {
+        return;
+    }
+    $job['cursor'] = $cursor;
+    $job['sent'] = $sent;
+    $job['failed'] = $failed;
+    $job['blocked'] = $blocked;
+    $job['done'] = $done ? 1 : 0;
+    if ($done) {
+        $job['finished_at'] = now_ts();
+    }
+    set_put('bc_job', json_encode($job, JSON_UNESCAPED_UNICODE));
+}
+
+/**
+ * یک تیک از کار پس‌زمینه: تا سقف زمانی مشخص ارسال می‌کند و برمی‌گردد.
+ * وقتی کار تمام شد، گزارش برای مدیر و گروه گزارشات می‌رود.
+ * خروجی: true اگر کار تمام شده باشد.
+ */
+function bc_job_tick(int $budgetSeconds = 45): bool
+{
+    $job = bc_job_get();
+    if ($job === null || (int) ($job['done'] ?? 0) === 1) {
+        return true;
+    }
+    $targets = array_map('intval', (array) ($job['targets'] ?? []));
+    $cursor = (int) ($job['cursor'] ?? 0);
+    $sent = (int) ($job['sent'] ?? 0);
+    $failed = (int) ($job['failed'] ?? 0);
+    $blocked = (int) ($job['blocked'] ?? 0);
+    $started = microtime(true);
+    $mode = (string) ($job['mode'] ?? 'text');
+    $count = count($targets);
+    while ($cursor < $count && (microtime(true) - $started) < $budgetSeconds) {
+        [$okSend, $isBlocked, $lastId] = bc_send_one($targets[$cursor], $mode,
+            (string) ($job['text'] ?? ''), (int) ($job['from_chat'] ?? 0),
+            (int) ($job['message_id'] ?? 0));
+        if ($okSend) {
+            $sent++;
+            if (!empty($job['pin']) && $lastId > 0) {
+                Tg::pin($targets[$cursor], $lastId);
+            }
+        } elseif ($isBlocked) {
+            $blocked++;
+        } else {
+            $failed++;
+        }
+        $cursor++;
+        bc_job_update($cursor, $sent, $failed, $blocked);
+        usleep(50000);
+    }
+    if ($cursor < $count) {
+        return false;   // بقیه در تیک بعدی / فرایند بعدی
+    }
+    bc_job_update($cursor, $sent, $failed, $blocked, true);
+    $stats = ['total' => $count, 'sent' => $sent, 'failed' => $failed, 'blocked' => $blocked,
+              'at' => now_ts()];
+    set_put('bc_last', json_encode($stats, JSON_UNESCAPED_UNICODE));
+    set_put('bc_last_at', (string) now_ts());
+    $title = (string) ($job['title'] ?? '📣 ارسال همگانی تمام شد');
+    $body = bc_report_text($stats, $title, (string) ($job['segment'] ?? ''));
+    $adminId = (int) ($job['admin'] ?? 0);
+    if ($adminId > 0) {
+        Tg::send($adminId, $body, [[btn('« پیام همگانی', 'ad:bc', null, 'success')]]);
+    }
+    post_report($body, 'general');
+    set_put('bc_job_id', '');
+    return true;
+}
+
+/**
+ * اجرای کار همگانی در پس‌زمینه (فرایند جدا).
+ * اگر اجرای پس‌زمینه ممکن نبود، همان‌جا (همگام) ادامه می‌دهد تا کار گم نشود.
+ */
+function bc_job_dispatch(): bool
+{
+    $job = bc_job_get();
+    if ($job === null || (int) ($job['done'] ?? 0) === 1) {
+        return false;
+    }
+    if (Tg::$dry) {
+        /* در تست، بدون فرایند جدا: همان‌جا تا آخر می‌رود */
+        while (!bc_job_tick(3600)) {
+        }
+        return true;
+    }
+    $script = panel_root() . '/sibil.php';
+    $log = panel_root() . '/sibil.log';
+    $inner = 'cd ' . escapeshellarg(panel_root())
+        . ' && nohup ' . escapeshellarg(PHP_BINARY) . ' ' . escapeshellarg($script)
+        . ' --broadcast >> ' . escapeshellarg($log) . ' 2>&1 &';
+    @shell_exec('nohup bash -c ' . escapeshellarg($inner) . ' >/dev/null 2>&1 &');
+    return true;
 }
 
 function screen_broadcast(int|string $chat, ?int $messageId, string $notice = ''): void
@@ -18813,8 +19574,16 @@ function screen_broadcast(int|string $chat, ?int $messageId, string $notice = ''
         $text .= "\n<b>آخرین ارسال</b>\n"
             . '🕒 ' . fa_ts($lastAt) . "\n"
             . '🎯 ' . (BC_SEGMENTS[(string) ($last['segment'] ?? 'all')] ?? '—') . "\n"
-            . '✅ ' . fa_digits((int) ($last['sent'] ?? 0))
-            . ' · ❌ ' . fa_digits((int) ($last['failed'] ?? 0)) . "\n";
+            . '✅ ' . bc_report_line($last) . "\n";
+    }
+    $job = bc_job_get();
+    if ($job !== null && (int) ($job['done'] ?? 0) === 0) {
+        $text .= "\n🚀 <b>ارسال در جریان است</b>\n"
+            . '📤 ' . fa_digits((int) ($job['cursor'] ?? 0)) . ' از '
+            . fa_digits((int) ($job['total'] ?? 0)) . "\n"
+            . '✅ ' . fa_digits((int) ($job['sent'] ?? 0))
+            . ' · ⛔️ ' . fa_digits((int) ($job['blocked'] ?? 0))
+            . ' · ❌ ' . fa_digits((int) ($job['failed'] ?? 0)) . "\n";
     }
     if ($notice !== '') {
         $text .= "\n" . e($notice);
@@ -18880,7 +19649,8 @@ const SETTING_GROUPS = [
             'trial_on'        => ['وضعیت تست', 'bool', 0],
             'trial_gb'        => ['مقدار تست (گیگ)', 'int', 0],
             'trial_hours'     => ['زمان تست (ساعت)', 'int', 0],
-            'trial_per_user'  => ['تعداد تست مجاز هر کاربر', 'int', 0],
+            'trial_per_user'  => ['دفعات تست مجاز هر کاربر تلگرام', 'int', 0],
+            'trial_user_limit' => ['👥 سقف ساخت کاربر در پنل تست', 'int', 0],
             'trial_price'     => ['هزینهٔ تست (تومان) — 0 = رایگان', 'int', 0],
             'trial_in_panels' => ['نمایش پنل تست در «پنل‌های من»', 'bool', 0],
             'admin_trial_unlimited' => ['تست نامحدود برای مالک و ادمین‌ها', 'bool', 0],
@@ -18953,7 +19723,7 @@ const SETTING_GROUPS = [
         'title' => '📢 گزارش و پشتیبانی',
         'items' => [
             'bot_name'     => ['نام ربات (در پیام‌ها و گزارش‌ها)', 'text', 0],
-            'support_link' => ['لینک پشتیبانی', 'text', 0],
+            'support_link' => ['📞 تنظیم آیدی پشتیبانی (@name یا لینک t.me)', 'text', 0],
             'channel_link' => ['لینک کانال رسمی (خبر و بروزرسانی)', 'text', 0],
             'owner_id'     => ['مالک ربات (تنها کسی که پنل مدیریت را می‌بیند)', 'int', 0],
         ],
@@ -19010,8 +19780,13 @@ const SETTING_LABELS = [
     'bot_name' => 'نام ربات', 'support_link' => 'لینک پشتیبانی',
     'channel_link' => 'لینک کانال', 'web_url' => 'آدرس وب',
     'trial_on' => 'وضعیت تست پنل', 'trial_gb' => 'مقدار تست (گیگ)',
-    'trial_hours' => 'زمان تست (ساعت)', 'trial_per_user' => 'تعداد تست هر کاربر',
+    'trial_hours' => 'زمان تست (ساعت)',
+    'trial_per_user' => 'دفعات تست مجاز هر کاربر تلگرام',
+    'trial_user_limit' => 'سقف ساخت کاربر در پنل تست',
     'trial_price' => 'هزینهٔ تست', 'billing_hourly' => 'محاسبهٔ ساعتی',
+    'prepaid_hours' => 'ساعت‌های پیش‌پرداخت اول پنل',
+    'force_channel_on' => 'قفل عضویت اجباری کانال',
+    'force_channel_id' => 'کانال اجباری',
     'billing_per_gb' => 'محاسبهٔ حجمی', 'suspend_on_zero' => 'توقف پنل با موجودی صفر',
     'meter_grace' => 'مهلت قبل از توقف', 'panel_test_timeout' => 'مهلت پاسخ پنل (ثانیه)',
     'panel_test_amount' => 'مبلغ تست اتصال', 'slots_free' => 'اسلات رایگان',

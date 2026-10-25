@@ -151,7 +151,10 @@ function product_detail_text(array $product): string
 {
     $cap = (float) $product['data_cap_gb'] > 0
         ? fa_digits((float) $product['data_cap_gb']) . ' گیگ' : 'نامحدود';
+    $hours = prepaid_hours();
     $daily = ((int) $product['hourly_price']) * 24;
+    $prepaid = panel_prepaid_amount($product);
+    $setup = max(0, set_int('panel_setup_fee', 0));
     return $product['emoji'] . ' <b>' . e($product['name']) . "</b>\n\n"
         . '👤 تعداد کاربر: ' . fa_digits((int) $product['max_users']) . "\n"
         . '📦 سقف حجم پنل: ' . $cap . "\n"
@@ -162,8 +165,14 @@ function product_detail_text(array $product): string
         . '🧩 اسلات لازم: ' . fa_digits((int) $product['slots_needed']) . "\n"
         . '💰 حداقل موجودی لازم: ' . money((int) $product['min_balance']) . "\n\n"
         . '📊 حدود هزینه: روزانه ≈ ' . money($daily) . "\n\n"
-        . '💳 <b>پرداخت مصرفی:</b> پیش‌پرداخت لازم نیست؛ بر اساس گیگ مصرف و ساعت اجاره، '
-        . 'از کیف پول کم می‌شود.';
+        . '🧾 <b>پرداخت هنگام خرید:</b>' . "\n"
+        . ($setup > 0 ? '• هزینهٔ ساخت پنل: ' . money($setup) . "\n" : '')
+        . ($prepaid > 0
+            ? '• پیش‌پرداخت ' . fa_digits($hours) . ' ساعت اول: <b>' . money($prepaid) . '</b>'
+                . "\n" . '  (غیرقابل استرداد — کسر ساعتی از ساعت ' . fa_digits($hours)
+                . ' به بعد شروع می‌شود)' . "\n"
+            : '• پیش‌پرداخت اولیه ندارد.' . "\n")
+        . "\n" . '💳 <b>پس از آن:</b> بر اساس گیگ مصرف و ساعت اجاره، خودکار از کیف پول کم می‌شود.';
 }
 
 function screen_product(int|string $chat, ?int $messageId, int $productId): void
@@ -175,7 +184,7 @@ function screen_product(int|string $chat, ?int $messageId, int $productId): void
         return;
     }
     Tg::show($chat, $messageId, product_detail_text($product), [
-        [btn('🛒 خرید این پنل', 'buy:confirm:' . $productId, null, 'success')],
+        [btn('🟧 خرید این پنل', 'buy:confirm:' . $productId, null, 'success')],
         [btn('🔢 قیمت دقیق', 'buy:exact:' . $productId)],
         [btn('« بازگشت', 'buy:cat:' . (int) ($product['category_id'] ?? 0), null, 'danger')],
     ]);
@@ -205,6 +214,65 @@ function order_expiry_line(array $order): string
         return '⌛️ <b>مهلت این فاکتور تمام شده است.</b>' . "\n";
     }
     return '⏳ مهلت پرداخت: <b>' . $remaining . ' دقیقه</b>' . "\n";
+}
+
+/**
+ * ساعت‌های پیش‌پرداخت اولیهٔ هر پنل (غیرقابل استرداد). پیش‌فرض ۲۴ ساعت.
+ */
+function prepaid_hours(): int
+{
+    return max(0, min(168, set_int('prepaid_hours', 24)));
+}
+
+/** مبلغ پیش‌پرداخت = قیمت ساعتی × ساعت‌های پیش‌پرداخت */
+function panel_prepaid_amount(array $product): int
+{
+    $hourly = max(0, (int) ($product['hourly_price'] ?? 0));
+    if ($hourly === 0 || !set_bool('billing_hourly', true)) {
+        return 0;
+    }
+    return $hourly * prepaid_hours();
+}
+
+/** ثانیه‌های باقی‌مانده از پیش‌پرداخت (۰ = تمام شده و کسر ساعتی فعال است) */
+function panel_prepaid_remaining(array $panel): int
+{
+    $start = (int) ($panel['billing_start_at'] ?? 0);
+    return $start > 0 ? max(0, $start - now_ts()) : 0;
+}
+
+/**
+ * مبلغ فاکتور خرید پنل = هزینهٔ ساخت + پیش‌پرداخت ساعت‌های اول.
+ * فاکتور یک پلن غیررایگان هرگز صفر نمی‌شود (باگ «مبلغ: ۰ تومان»).
+ * خروجی: [کل, هزینهٔ ساخت, پیش‌پرداخت]
+ */
+function panel_order_price(array $product): array
+{
+    $setup = max(0, set_int('panel_setup_fee', 0));
+    $prepaid = panel_prepaid_amount($product);
+    return [$setup + $prepaid, $setup, $prepaid];
+}
+
+/**
+ * ریز فاکتور خرید پنل: هزینهٔ ساخت + پیش‌پرداخت ساعت‌های اول.
+ * غیرقابل استرداد بودن پیش‌پرداخت همین‌جا به کاربر گفته می‌شود.
+ */
+function panel_order_breakdown(array $product, int $setupFee, int $prepaid): string
+{
+    $lines = '';
+    if ($setupFee > 0) {
+        $lines .= '🧾 هزینهٔ ساخت پنل: <b>' . money($setupFee) . "</b>\n";
+    }
+    if ($prepaid > 0) {
+        $hours = prepaid_hours();
+        $lines .= '💰 پیش‌پرداخت ' . fa_digits($hours) . ' ساعت اول: <b>'
+            . money($prepaid) . '</b>' . "\n"
+            . '   (ساعتی ' . money((int) $product['hourly_price']) . ' × '
+            . fa_digits($hours) . " ساعت)\n"
+            . '<i>این مبلغ بابت ' . fa_digits($hours) . ' ساعت اول پنل است و با حذف پنل '
+            . 'پیش از پایان این مدت بازگردانده نمی‌شود.</i>' . "\n";
+    }
+    return $lines !== '' ? $lines . "\n" : '';
 }
 
 function invoice_text(array $order, string $title, string $detail = ''): string
@@ -352,13 +420,16 @@ function start_panel_order(int $uid, int|string $chat, ?int $messageId, int $pro
              [btn('« بازگشت', 'menu:buy', null, 'danger')]]);
         return;
     }
-    $price = set_int('panel_setup_fee', 0);
+    [$price, $setupFee, $prepaid] = panel_order_price($product);
     /* تخفیف اختصاصی کاربر (اگر مدیر برایش فعال کرده باشد) */
     $personal = user_discount_amount($uid, $price);
     $order = create_order($uid, 'panel', $price, $productId,
-        ['product' => $productId, 'panel_username' => $username], $personal);
+        ['product' => $productId, 'panel_username' => $username,
+         'setup_fee' => $setupFee, 'prepaid' => $prepaid,
+         'prepaid_hours' => prepaid_hours()], $personal);
     Tg::show($chat, $messageId,
-        invoice_text($order, 'خرید پنل', '📦 ' . e((string) $product['name'])
+        invoice_text($order, 'خرید پنل', panel_order_breakdown($product, $setupFee, $prepaid)
+            . '📦 ' . e((string) $product['name'])
             . "\n" . '👤 نام کاربری پنل: <code>' . e($username) . '</code>'),
         invoice_kb($order, $uid));
 }
@@ -491,9 +562,13 @@ function wallet_account_text(int $uid): string
  * پشتیبانی: هیچ پیامی داخل ربات گرفته نمی‌شود؛ دکمه مستقیم چت خصوصی مالک را
  * باز می‌کند. آدرس فقط از تنظیمات ربات یا PANEL_SUPPORT_USERNAME خوانده می‌شود.
  */
+/**
+ * آیدی پشتیبانی — هیچ‌وقت داخل سورس نیست.
+ * مقدار تنظیمات می‌تواند `@username`، `username` یا لینک کامل
+ * `https://t.me/username` باشد؛ هر سه یکسان خوانده می‌شوند.
+ */
 function support_username(): string
 {
-    /* هندل پشتیبانی هیچ‌وقت داخل کد نیست: از تنظیمات ربات یا .env خوانده می‌شود */
     $link = trim(set_get('support_link', ''));
     if ($link !== '') {
         if (preg_match('~t\.me/([A-Za-z0-9_]{3,})~i', $link, $m)) {
@@ -504,6 +579,13 @@ function support_username(): string
         }
     }
     return trim(ltrim(cfg('PANEL_SUPPORT_USERNAME', ''), '@'));
+}
+
+/** لینک کامل پشتیبانی برای دکمهٔ شیشه‌ای (خالی = تنظیم نشده) */
+function support_url(): string
+{
+    $handle = support_username();
+    return $handle !== '' ? 'https://t.me/' . $handle : '';
 }
 
 /**
@@ -538,6 +620,7 @@ function show_support(int|string $chat, ?int $messageId, int $uid): void
     }
     $user = '@' . $handle;
     $channel = channel_url();
+    /* دکمه با لینک کامل ساخته می‌شود؛ @ و لینک t.me هر دو پشتیبانی می‌شوند */
     $rows = [[btn('💬 پیام به ' . $user, null, 'https://t.me/' . $handle, 'success')]];
     if ($channel !== '') {
         $rows[] = [btn('📢 کانال رسمی', null, $channel, 'primary')];
@@ -1194,6 +1277,17 @@ function screen_panel_detail(int|string $chat, ?int $messageId, int $panelId): v
         $text .= '📈 روزانه ' . money((int) $panel['hourly_price'] * 24)
             . ' · ماهانه ' . money((int) $panel['hourly_price'] * 24 * 30) . "\n";
     }
+    if (!$isTrial) {
+        $leftPrepaid = panel_prepaid_remaining($panel);
+        if ($leftPrepaid > 0) {
+            $text .= '🎁 <b>' . fa_digits((int) ceil($leftPrepaid / 3600))
+                . ' ساعت پیش‌پرداخت‌شده</b> باقی مانده — تا آن زمان کسر ساعتی شروع نمی‌شود' . "\n"
+                . '   شروع کسر ساعتی: ' . fa_ts((int) $panel['billing_start_at']) . "\n";
+        } elseif ((int) ($panel['prepaid_amount'] ?? 0) > 0) {
+            $text .= '⏱ کسر ساعتی از ' . fa_ts((int) $panel['billing_start_at'])
+                . ' فعال شده است' . "\n";
+        }
+    }
     if ((int) $panel['last_devices'] > 0) {
         $text .= '📱 دستگاه متصل: ' . fa_digits((int) $panel['last_devices']) . "\n";
     }
@@ -1241,22 +1335,33 @@ function screen_panel_detail(int|string $chat, ?int $messageId, int $panelId): v
  * اجارهٔ ۲۴ ساعت اول پنل، همان لحظهٔ ساخت، از کیف پول کم می‌شود.
  * خروجی: مبلغی که واقعاً کم شد.
  */
-function panel_charge_first_day(int $panelId, int $tgId, int $hourlyPrice): int
+/**
+ * ثبت پیش‌پرداخت ساعت‌های اول در دفتر مصرف پنل.
+ *
+ * پول هنگام پرداخت فاکتور از کیف پول رفته است؛ اینجا فقط ثبت دفتری می‌شود تا
+ * «مصرف» و «هزینهٔ پنل» در گزارش‌ها درست دیده شود.
+ * ⚠️ این مبلغ غیرقابل استرداد است و با حذف پنل هم برنمی‌گردد.
+ */
+function panel_record_prepaid(int $panelId, int $tgId, int $amount, ?int $hours = null): int
 {
-    $daily = max(0, $hourlyPrice) * 24;
-    if ($daily <= 0) {
+    if ($amount <= 0) {
         return 0;
     }
-    $chargeable = min($daily, max(0, balance_of($tgId)));
-    if ($chargeable <= 0) {
+    $hours = $hours ?? prepaid_hours();
+    $panel = DB::one('SELECT * FROM panels WHERE id=?', [$panelId]);
+    if ($panel === null) {
         return 0;
     }
-    add_balance($tgId, -$chargeable, 'usage', (string) $panelId, 'اجارهٔ ۲۴ ساعت اول پنل');
+    $billingStart = (int) ($panel['billing_start_at'] ?? 0);
+    if ($billingStart <= 0) {
+        $billingStart = now_ts() + $hours * 3600;
+    }
     DB::exec('INSERT INTO usage_charges(panel_id, tg_id, bytes, hours, amount, kind, created_at) '
-        . 'VALUES(?,?,?,?,?,?,?)', [$panelId, $tgId, 0, 24, $chargeable, 'first-day', now_ts()]);
-    DB::exec('UPDATE panels SET spent_total = spent_total + ?, last_meter_at=? WHERE id=?',
-        [$chargeable, now_ts(), $panelId]);
-    return $chargeable;
+        . 'VALUES(?,?,?,?,?,?,?)', [$panelId, $tgId, 0, $hours, $amount, 'prepaid', now_ts()]);
+    DB::exec('UPDATE panels SET prepaid_amount=?, billing_start_at=?, last_meter_at=?, '
+        . 'spent_total = spent_total + ? WHERE id=?',
+        [$amount, $billingStart, $billingStart, $amount, $panelId]);
+    return $amount;
 }
 
 /**

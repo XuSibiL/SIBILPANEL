@@ -134,7 +134,10 @@ function deliver_panel_order(array $order): array
         : ($isTrial
             ? time() + max(1, (int) ($payloadOrder['trial_hours'] ?? set_int('trial_hours', 24))) * 3600
             : time() + (int) $product['days'] * DAY);
-    $userCap = $unlimitedTrial ? 0 : ($isTrial ? 1 : (int) $product['max_users']);
+    /* سقف کاربرانِ داخلِ پنل: برای تست از تنظیم مستقل trial_user_limit خوانده می‌شود
+       (قبلاً اشتباهاً ۱ بود و ظرفیت پنل پاسارگاد را قفل می‌کرد) */
+    $userCap = $unlimitedTrial ? 0
+        : ($isTrial ? max(1, set_int('trial_user_limit', 10)) : (int) $product['max_users']);
     $roleId = (int) $product['role_id'];
     if ($roleId <= 0) {
         $roleId = auto_role_id($panelRow);
@@ -193,17 +196,27 @@ function deliver_panel_order(array $order): array
         }
         return [false, 'ساخت پنل روی سرور انجام نشد: ' . $note];
     }
+    /* ⏱ ساعت‌های اول پیش‌پرداخت شده‌اند: کسر ساعتی فقط بعد از آن‌ها شروع می‌شود */
+    $prepaidHours = $isTrial ? 0 : prepaid_hours();
+    $billingStartAt = $prepaidHours > 0 ? now_ts() + $prepaidHours * 3600 : 0;
+    /* اگر سفارش از مسیر عادی ساخته نشده باشد (پرداخت مستقیم/ادمین)، پیش‌پرداخت
+       از خود محصول محاسبه می‌شود تا هیچ پنلی بدون پیش‌پرداخت ساخته نشود */
+    $prepaidAmount = $isTrial ? 0
+        : max(0, (int) ($payloadOrder['prepaid'] ?? panel_prepaid_amount($product)));
     $panelId = DB::exec('INSERT INTO panels(tg_id, product_id, panel_admin_id, panel_username, '
         . 'panel_password, label, max_users, device_limit, data_cap, expires_at, per_gb_price, '
-        . 'hourly_price, min_balance, status, created_at, pg_panel_id, order_id, user_cap, is_trial) '
-        . 'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+        . 'hourly_price, min_balance, status, created_at, pg_panel_id, order_id, user_cap, is_trial, '
+        . 'billing_start_at, prepaid_amount, last_meter_at) '
+        . 'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
         [$order['tg_id'], $product['id'], (int) ($created['id'] ?? 0), $username, $password,
          $product['name'] . ($isTrial ? ' (تست)' : ''), $userCap, (int) $product['device_limit'],
          (int) round($dataCapGb * 1024 ** 3),
          $expireAt, $isTrial ? 0 : (int) $product['per_gb_price'],
          $isTrial ? 0 : (int) $product['hourly_price'],
          (int) $product['min_balance'], 'active',
-         now_ts(), (int) $panelRow['id'], (int) $order['id'], $userCap, $isTrial ? 1 : 0]);
+         now_ts(), (int) $panelRow['id'], (int) $order['id'], $userCap, $isTrial ? 1 : 0,
+         $billingStartAt, $prepaidAmount,
+         $billingStartAt > 0 ? $billingStartAt : now_ts()]);
     if (!$isTrial) {
         /* این‌ها نباید تحویل پنل را خراب کنند؛ پنل ساخته شده و باید به کاربر برسد */
         try {
@@ -211,10 +224,15 @@ function deliver_panel_order(array $order): array
         } catch (Throwable $ex) {
             log_line('warning', 'grant_order_discount failed: ' . $ex->getMessage());
         }
-        try {
-            panel_charge_first_day($panelId, (int) $order['tg_id'], (int) $product['hourly_price']);
-        } catch (Throwable $ex) {
-            log_line('warning', 'first day charge failed: ' . $ex->getMessage());
+        /* ⚠️ اینجا دیگر پولی کسر نمی‌شود: پیش‌پرداخت هنگام پرداخت فاکتور
+           از کیف پول رفته است؛ فقط ثبت دفتری می‌شود */
+        if ($prepaidAmount > 0) {
+            try {
+                panel_record_prepaid($panelId, (int) $order['tg_id'], $prepaidAmount,
+                    $prepaidHours);
+            } catch (Throwable $ex) {
+                log_line('warning', 'prepaid ledger failed: ' . $ex->getMessage());
+            }
         }
     }
     $user = user_get((int) $order['tg_id']);

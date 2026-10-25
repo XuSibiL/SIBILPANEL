@@ -423,34 +423,241 @@ function bc_targets(string $segment, bool $onlyAllowed = true): array
     return $ids;
 }
 
-/** یک اجرای همگانی: متن یا کپی پیام، با پین اختیاری */
+/**
+ * یک ارسال تک‌نفره با تحمل خطا:
+ *  · اگر تلگرام «مسدود کرده» بگوید → blocked
+ *  · اگر 429 بدهد → به اندازهٔ retry_after صبر می‌کند و دوباره می‌فرستد
+ *  خروجی: [موفق؟، مسدود؟، message_id]
+ */
+function bc_send_one(int $tgId, string $mode, string $text, int $fromChat, int $messageId,
+                     int $tries = 3): array
+{
+    for ($attempt = 1; $attempt <= $tries; $attempt++) {
+        $params = $mode === 'copy'
+            ? ['chat_id' => $tgId, 'from_chat_id' => $fromChat, 'message_id' => $messageId]
+            : ['chat_id' => $tgId, 'text' => $text, 'parse_mode' => 'HTML',
+               'disable_web_page_preview' => true];
+        $method = $mode === 'copy' ? 'copyMessage' : 'sendMessage';
+        $res = Tg::call($method, $params);
+        if (Tg::$dry) {
+            return [true, false, count(Tg::$outbox)];
+        }
+        $okSend = is_array($res) && ($res['ok'] ?? false) === true;
+        if ($okSend) {
+            $sentId = (int) ($res['result']['message_id'] ?? 0);
+            return [true, false, $sentId];
+        }
+        $description = is_array($res) ? (string) ($res['description'] ?? '') : '';
+        if (bc_blocked_error($description)) {
+            return [false, true, 0];
+        }
+        $retryAfter = (int) ($res['parameters']['retry_after'] ?? 0);
+        if ($retryAfter > 0 || stripos($description, 'too many requests') !== false) {
+            /* 429: صبر می‌کنیم و همان کاربر را دوباره می‌زنیم — هیچ‌وقت رها نمی‌شود */
+            sleep(max(1, min(60, $retryAfter > 0 ? $retryAfter : 2)));
+            usleep(50000);
+            continue;
+        }
+        return [false, false, 0];
+    }
+    return [false, false, 0];
+}
+
+/** آیا خطای تلگرام یعنی «کاربر ربات را مسدود کرده»؟ */
+function bc_blocked_error(string $description): bool
+{
+    $needle = mb_strtolower($description);
+    foreach (['blocked by the user', 'user is deactivated', 'bot was blocked',
+              'chat not found', 'user not found', 'peer_id_invalid', 'bot cannot initiate'] as $hint) {
+        if (str_contains($needle, $hint)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * ارسال همگانی — غیرهمزمان و بی‌خطر.
+ *  · بین هر پیام ۵۰ میلی‌ثانیه فاصله می‌گذارد (محدودیت تلگرام)
+ *  · کاربرانی که ربات را مسدود کرده‌اند رد می‌شوند و شمرده می‌شوند
+ *  · متن نهایی: «تعداد کل: X | موفق: Y | مسدود شده توسط کاربر: Z»
+ */
 function bc_run(array $targets, string $mode, string $text = '', int $fromChat = 0,
                 int $messageId = 0, bool $pin = false): array
 {
     $sent = 0;
     $failed = 0;
-    foreach ($targets as $tgId) {
-        if ($mode === 'copy') {
-            $okSend = Tg::copyMessage($tgId, $fromChat, $messageId);
-            $lastId = 0;
-        } else {
-            $lastId = (int) Tg::send($tgId, $text);
-            $okSend = $lastId > 0;
-        }
+    $blocked = 0;
+    $jobId = (string) set_get('bc_job_id', '');
+    foreach ($targets as $index => $tgId) {
+        [$okSend, $isBlocked, $lastId] = bc_send_one((int) $tgId, $mode, $text, $fromChat,
+            $messageId);
         if ($okSend) {
             $sent++;
             if ($pin && $lastId > 0) {
-                Tg::pin($tgId, $lastId);
+                Tg::pin((int) $tgId, $lastId);
             }
+        } elseif ($isBlocked) {
+            $blocked++;
         } else {
             $failed++;
         }
+        /* پیشرفت کار برای صفحهٔ «پیام همگانی» و جلوگیری از تایم‌اوت */
+        if ($jobId !== '') {
+            bc_job_update($index + 1, $sent, $failed, $blocked);
+        }
+        usleep(50000);   // ۵۰ میلی‌ثانیه بین هر ارسال
     }
-    $stats = ['at' => now_ts(), 'sent' => $sent, 'failed' => $failed,
+    $stats = ['at' => now_ts(), 'sent' => $sent, 'failed' => $failed, 'blocked' => $blocked,
               'segment' => bc_segment(), 'mode' => $mode, 'total' => count($targets)];
     set_put('bc_last', json_encode($stats, JSON_UNESCAPED_UNICODE));
     set_put('bc_last_at', (string) now_ts());
     return $stats;
+}
+
+/** یک خط گزارش همگانی — دقیقاً همان قالبی که مدیر می‌خواهد */
+function bc_report_line(array $stats): string
+{
+    return 'تعداد کل: ' . fa_digits((int) ($stats['total'] ?? 0))
+        . ' | موفق: ' . fa_digits((int) ($stats['sent'] ?? 0))
+        . ' | مسدود شده توسط کاربر: ' . fa_digits((int) ($stats['blocked'] ?? 0));
+}
+
+/** متن گزارش نهایی همگانی برای مدیر و گروه گزارشات */
+function bc_report_text(array $stats, string $title, string $segment = ''): string
+{
+    return $title . "\n"
+        . ($segment !== '' ? '🎯 ' . $segment . "\n" : '')
+        . '✅ ' . bc_report_line($stats)
+        . ((int) ($stats['failed'] ?? 0) > 0
+            ? "\n" . '⚠️ ناموفق (غیر از مسدود): ' . fa_digits((int) $stats['failed']) : '');
+}
+
+/* ── کار پس‌زمینهٔ ارسال همگانی ─────────────────────────────────────────── */
+
+/** ثبت یک کار همگانی در تنظیمات (تا صفحه همیشه بداند چه چیزی در جریان است) */
+function bc_job_start(array $targets, string $mode, string $text, int $fromChat,
+                      int $messageId, bool $pin, int $adminId, string $title,
+                      string $segment): string
+{
+    $jobId = 'bc' . now_ts() . mt_rand(100, 999);
+    $job = ['id' => $jobId, 'mode' => $mode, 'text' => $text, 'from_chat' => $fromChat,
+            'message_id' => $messageId, 'pin' => $pin ? 1 : 0, 'admin' => $adminId,
+            'title' => $title, 'segment' => $segment, 'targets' => array_values($targets),
+            'cursor' => 0, 'sent' => 0, 'failed' => 0, 'blocked' => 0,
+            'total' => count($targets), 'started_at' => now_ts(), 'done' => 0];
+    set_put('bc_job', json_encode($job, JSON_UNESCAPED_UNICODE));
+    set_put('bc_job_id', $jobId);
+    return $jobId;
+}
+
+function bc_job_get(): ?array
+{
+    $raw = (string) set_get('bc_job', '');
+    if ($raw === '') {
+        return null;
+    }
+    $job = json_decode($raw, true);
+    return is_array($job) ? $job : null;
+}
+
+/** به‌روزرسانی پیشرفت کار (برای صفحهٔ مدیریت) */
+function bc_job_update(int $cursor, int $sent, int $failed, int $blocked, bool $done = false): void
+{
+    $job = bc_job_get();
+    if ($job === null) {
+        return;
+    }
+    $job['cursor'] = $cursor;
+    $job['sent'] = $sent;
+    $job['failed'] = $failed;
+    $job['blocked'] = $blocked;
+    $job['done'] = $done ? 1 : 0;
+    if ($done) {
+        $job['finished_at'] = now_ts();
+    }
+    set_put('bc_job', json_encode($job, JSON_UNESCAPED_UNICODE));
+}
+
+/**
+ * یک تیک از کار پس‌زمینه: تا سقف زمانی مشخص ارسال می‌کند و برمی‌گردد.
+ * وقتی کار تمام شد، گزارش برای مدیر و گروه گزارشات می‌رود.
+ * خروجی: true اگر کار تمام شده باشد.
+ */
+function bc_job_tick(int $budgetSeconds = 45): bool
+{
+    $job = bc_job_get();
+    if ($job === null || (int) ($job['done'] ?? 0) === 1) {
+        return true;
+    }
+    $targets = array_map('intval', (array) ($job['targets'] ?? []));
+    $cursor = (int) ($job['cursor'] ?? 0);
+    $sent = (int) ($job['sent'] ?? 0);
+    $failed = (int) ($job['failed'] ?? 0);
+    $blocked = (int) ($job['blocked'] ?? 0);
+    $started = microtime(true);
+    $mode = (string) ($job['mode'] ?? 'text');
+    $count = count($targets);
+    while ($cursor < $count && (microtime(true) - $started) < $budgetSeconds) {
+        [$okSend, $isBlocked, $lastId] = bc_send_one($targets[$cursor], $mode,
+            (string) ($job['text'] ?? ''), (int) ($job['from_chat'] ?? 0),
+            (int) ($job['message_id'] ?? 0));
+        if ($okSend) {
+            $sent++;
+            if (!empty($job['pin']) && $lastId > 0) {
+                Tg::pin($targets[$cursor], $lastId);
+            }
+        } elseif ($isBlocked) {
+            $blocked++;
+        } else {
+            $failed++;
+        }
+        $cursor++;
+        bc_job_update($cursor, $sent, $failed, $blocked);
+        usleep(50000);
+    }
+    if ($cursor < $count) {
+        return false;   // بقیه در تیک بعدی / فرایند بعدی
+    }
+    bc_job_update($cursor, $sent, $failed, $blocked, true);
+    $stats = ['total' => $count, 'sent' => $sent, 'failed' => $failed, 'blocked' => $blocked,
+              'at' => now_ts()];
+    set_put('bc_last', json_encode($stats, JSON_UNESCAPED_UNICODE));
+    set_put('bc_last_at', (string) now_ts());
+    $title = (string) ($job['title'] ?? '📣 ارسال همگانی تمام شد');
+    $body = bc_report_text($stats, $title, (string) ($job['segment'] ?? ''));
+    $adminId = (int) ($job['admin'] ?? 0);
+    if ($adminId > 0) {
+        Tg::send($adminId, $body, [[btn('« پیام همگانی', 'ad:bc', null, 'success')]]);
+    }
+    post_report($body, 'general');
+    set_put('bc_job_id', '');
+    return true;
+}
+
+/**
+ * اجرای کار همگانی در پس‌زمینه (فرایند جدا).
+ * اگر اجرای پس‌زمینه ممکن نبود، همان‌جا (همگام) ادامه می‌دهد تا کار گم نشود.
+ */
+function bc_job_dispatch(): bool
+{
+    $job = bc_job_get();
+    if ($job === null || (int) ($job['done'] ?? 0) === 1) {
+        return false;
+    }
+    if (Tg::$dry) {
+        /* در تست، بدون فرایند جدا: همان‌جا تا آخر می‌رود */
+        while (!bc_job_tick(3600)) {
+        }
+        return true;
+    }
+    $script = panel_root() . '/sibil.php';
+    $log = panel_root() . '/sibil.log';
+    $inner = 'cd ' . escapeshellarg(panel_root())
+        . ' && nohup ' . escapeshellarg(PHP_BINARY) . ' ' . escapeshellarg($script)
+        . ' --broadcast >> ' . escapeshellarg($log) . ' 2>&1 &';
+    @shell_exec('nohup bash -c ' . escapeshellarg($inner) . ' >/dev/null 2>&1 &');
+    return true;
 }
 
 function screen_broadcast(int|string $chat, ?int $messageId, string $notice = ''): void
@@ -469,8 +676,16 @@ function screen_broadcast(int|string $chat, ?int $messageId, string $notice = ''
         $text .= "\n<b>آخرین ارسال</b>\n"
             . '🕒 ' . fa_ts($lastAt) . "\n"
             . '🎯 ' . (BC_SEGMENTS[(string) ($last['segment'] ?? 'all')] ?? '—') . "\n"
-            . '✅ ' . fa_digits((int) ($last['sent'] ?? 0))
-            . ' · ❌ ' . fa_digits((int) ($last['failed'] ?? 0)) . "\n";
+            . '✅ ' . bc_report_line($last) . "\n";
+    }
+    $job = bc_job_get();
+    if ($job !== null && (int) ($job['done'] ?? 0) === 0) {
+        $text .= "\n🚀 <b>ارسال در جریان است</b>\n"
+            . '📤 ' . fa_digits((int) ($job['cursor'] ?? 0)) . ' از '
+            . fa_digits((int) ($job['total'] ?? 0)) . "\n"
+            . '✅ ' . fa_digits((int) ($job['sent'] ?? 0))
+            . ' · ⛔️ ' . fa_digits((int) ($job['blocked'] ?? 0))
+            . ' · ❌ ' . fa_digits((int) ($job['failed'] ?? 0)) . "\n";
     }
     if ($notice !== '') {
         $text .= "\n" . e($notice);
@@ -536,7 +751,8 @@ const SETTING_GROUPS = [
             'trial_on'        => ['وضعیت تست', 'bool', 0],
             'trial_gb'        => ['مقدار تست (گیگ)', 'int', 0],
             'trial_hours'     => ['زمان تست (ساعت)', 'int', 0],
-            'trial_per_user'  => ['تعداد تست مجاز هر کاربر', 'int', 0],
+            'trial_per_user'  => ['دفعات تست مجاز هر کاربر تلگرام', 'int', 0],
+            'trial_user_limit' => ['👥 سقف ساخت کاربر در پنل تست', 'int', 0],
             'trial_price'     => ['هزینهٔ تست (تومان) — 0 = رایگان', 'int', 0],
             'trial_in_panels' => ['نمایش پنل تست در «پنل‌های من»', 'bool', 0],
             'admin_trial_unlimited' => ['تست نامحدود برای مالک و ادمین‌ها', 'bool', 0],
@@ -609,7 +825,7 @@ const SETTING_GROUPS = [
         'title' => '📢 گزارش و پشتیبانی',
         'items' => [
             'bot_name'     => ['نام ربات (در پیام‌ها و گزارش‌ها)', 'text', 0],
-            'support_link' => ['لینک پشتیبانی', 'text', 0],
+            'support_link' => ['📞 تنظیم آیدی پشتیبانی (@name یا لینک t.me)', 'text', 0],
             'channel_link' => ['لینک کانال رسمی (خبر و بروزرسانی)', 'text', 0],
             'owner_id'     => ['مالک ربات (تنها کسی که پنل مدیریت را می‌بیند)', 'int', 0],
         ],
@@ -666,8 +882,13 @@ const SETTING_LABELS = [
     'bot_name' => 'نام ربات', 'support_link' => 'لینک پشتیبانی',
     'channel_link' => 'لینک کانال', 'web_url' => 'آدرس وب',
     'trial_on' => 'وضعیت تست پنل', 'trial_gb' => 'مقدار تست (گیگ)',
-    'trial_hours' => 'زمان تست (ساعت)', 'trial_per_user' => 'تعداد تست هر کاربر',
+    'trial_hours' => 'زمان تست (ساعت)',
+    'trial_per_user' => 'دفعات تست مجاز هر کاربر تلگرام',
+    'trial_user_limit' => 'سقف ساخت کاربر در پنل تست',
     'trial_price' => 'هزینهٔ تست', 'billing_hourly' => 'محاسبهٔ ساعتی',
+    'prepaid_hours' => 'ساعت‌های پیش‌پرداخت اول پنل',
+    'force_channel_on' => 'قفل عضویت اجباری کانال',
+    'force_channel_id' => 'کانال اجباری',
     'billing_per_gb' => 'محاسبهٔ حجمی', 'suspend_on_zero' => 'توقف پنل با موجودی صفر',
     'meter_grace' => 'مهلت قبل از توقف', 'panel_test_timeout' => 'مهلت پاسخ پنل (ثانیه)',
     'panel_test_amount' => 'مبلغ تست اتصال', 'slots_free' => 'اسلات رایگان',

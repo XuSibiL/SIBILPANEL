@@ -61,6 +61,13 @@ function handle_message_inner(array $message): void
         return;
     }
 
+    /* ── قفل عضویت اجباری کانال: تا عضویت تایید نشود هیچ بخشی باز نیست ── */
+    if (force_join_blocked($uid)) {
+        State::clear($uid);
+        force_join_show($chatId, null);
+        return;
+    }
+
     /* ── پرداخت موفق استارز ─────────────────────────────────────────── */
     if (isset($message['successful_payment'])) {
         pay_stars_success($message);
@@ -157,12 +164,15 @@ function handle_message_inner(array $message): void
                     [[btn('🎯 تغییر مخاطب', 'ad:bc:seg', null, 'success')]]);
                 return;
             }
-            $stats = bc_run($targets, 'copy', '', $chatId, $msgId, set_bool('bc_pin', false));
-            Tg::send($chatId, '🔁 <b>فروارد همگانی تمام شد</b>' . "\n"
-                . '🎯 ' . BC_SEGMENTS[bc_segment()] . "\n"
-                . '✅ موفق: ' . fa_digits($stats['sent']) . "\n"
-                . '❌ ناموفق: ' . fa_digits($stats['failed']),
+            bc_job_start($targets, 'copy', '', $chatId, $msgId, set_bool('bc_pin', false),
+                $uid, '🔁 فروارد همگانی تمام شد', BC_SEGMENTS[bc_segment()]);
+            Tg::send($chatId, '🚀 <b>فروارد همگانی در پس‌زمینه آغاز شد</b>' . "\n" . SEP . "\n"
+                . '🎯 مخاطب: ' . BC_SEGMENTS[bc_segment()] . "\n"
+                . '👥 تعداد کل: ' . fa_digits(count($targets)) . "\n\n"
+                . '<i>گزارش کامل (تعداد کل / موفق / مسدود شده توسط کاربر) '
+                . 'همین‌جا برایت می‌آید.</i>',
                 [[btn('« پیام همگانی', 'ad:bc', null, 'success')]]);
+            bc_job_dispatch();
             return;
 
         case 'wiz':
@@ -254,6 +264,44 @@ function handle_message_inner(array $message): void
             $order = order_get($orderId) ?? $order;
             Tg::send($chatId, '✅ کد اعمال شد.' . "\n" . invoice_text($order, 'پرداخت سفارش',
                 'تخفیف: ' . money($discount)), invoice_kb($order, $uid));
+            return;
+
+        case 'fj_channel':
+            /* ثبت کانال اجباری: تجزیه → بررسی مدیر بودن ربات → ذخیره */
+            if (!is_owner($uid)) {
+                State::clear($uid);
+                return;
+            }
+            if (in_array(trim($text), ['لغو', 'انصراف', 'cancel', '/cancel'], true)) {
+                State::clear($uid);
+                Tg::send($chatId, 'انصراف داده شد.', force_channel_admin_kb());
+                return;
+            }
+            [$chOk, $chChat, $chUsername, $chWhy] = force_channel_parse($text);
+            if (!$chOk) {
+                Tg::send($chatId, '❌ ' . $chWhy . "\n\n" . 'دوباره بفرستید.',
+                    [[btn('🔙 انصراف / بازگشت', 'ad:fj', null, 'danger')]]);
+                return;
+            }
+            [$chAdmin, $chAdminWhy] = force_channel_bot_admin($chChat);
+            if (!$chAdmin) {
+                Tg::send($chatId, '⚠️ ' . $chAdminWhy . "\n\n" . 'دوباره بفرستید '
+                    . 'یا «🔙 انصراف / بازگشت» را بزنید.',
+                    [[btn('🔙 انصراف / بازگشت', 'ad:fj', null, 'danger')]]);
+                return;
+            }
+            State::clear($uid);
+            set_put('force_channel_id', $chUsername !== '' ? '@' . $chUsername : $chChat);
+            set_put('force_channel_on', '1');
+            $chLink = force_channel_link();
+            Tg::send($chatId, "✅ <b>کانال اجباری ذخیره و فعال شد</b>\n" . SEP . "\n"
+                . 'کانال: <code>' . e($chUsername !== '' ? '@' . $chUsername : $chChat)
+                . '</code>' . "\n"
+                . 'لینک عضویت: ' . ($chLink !== '' ? '<code>' . e($chLink) . '</code>'
+                    : '—') . "\n\n"
+                . '<i>ربات مدیر این کانال است و قفل برای همهٔ کاربران فعال شد. '
+                . 'مالک و ادمین‌ها قفل نمی‌شوند.</i>',
+                force_channel_admin_kb());
             return;
 
         case 'report_group_id':

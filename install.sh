@@ -59,7 +59,7 @@ silence_needrestart() {
 
 APP_NAME="${PANEL_BOT_NAME:-Panel Service}"
 CHANNEL_DEFAULT="https://t.me/sibilpanel"
-VERSION="3.15.0"
+VERSION="3.16.0"
 # سازگاری با کلیدهای قدیمی
 export PANEL_HOME="${PANEL_HOME:-${SIBIL_HOME:-}}"
 export PANEL_BOT_TOKEN="${PANEL_BOT_TOKEN:-${SIBIL_BOT_TOKEN:-}}"

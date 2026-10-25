@@ -283,6 +283,19 @@ function cli_main(array $argv): int
             $stats = panels_meter(true);
             echo json_encode($stats, JSON_UNESCAPED_UNICODE) . "\n";
             return 0;
+        case '--broadcast':
+            /* کارگر پس‌زمینهٔ پیام همگانی: تا تمام شدن کار ادامه می‌دهد */
+            if (!function_exists('bc_job_tick')) {
+                echo "FAIL broadcast module is not loaded\n";
+                return 1;
+            }
+            $guard = 0;
+            while (!bc_job_tick(45) && $guard++ < 2000) {
+                /* هر تیک ۴۵ ثانیه کار می‌کند؛ بین تیک‌ها نفس می‌کشد */
+                usleep(200000);
+            }
+            echo "OK   broadcast job finished\n";
+            return 0;
         case '--backup':
             [$backupOk, $backupNote] = backup_send('بکاپ دستی از خط فرمان', true);
             echo ($backupOk ? 'OK   ' : 'FAIL ') . $backupNote . "\n";
@@ -358,6 +371,7 @@ function cli_main(array $argv): int
                 . "  --meter          run the usage/hourly billing pass once\n"
                 . "  --report [--post] daily report text (optionally to the report group)\n"
                 . "  --backup         send one backup to the backup group and delete it\n"
+                . "  --broadcast      run the background broadcast job until it ends\n"
                 . "  --topics         create the missing report topics in the group\n"
                 . "  --migrate        create/upgrade the database\n"
                 . "  --test-update    dry-run one update (no telegram calls)\n"

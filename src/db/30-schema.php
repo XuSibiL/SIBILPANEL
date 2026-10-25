@@ -191,7 +191,9 @@ CREATE TABLE IF NOT EXISTS panels (
     last_devices    INTEGER NOT NULL DEFAULT 0,
     last_hwid_limit INTEGER NOT NULL DEFAULT 0,
     last_users      INTEGER NOT NULL DEFAULT 0,
-    last_synced_at  INTEGER NOT NULL DEFAULT 0
+    last_synced_at  INTEGER NOT NULL DEFAULT 0,
+    billing_start_at INTEGER NOT NULL DEFAULT 0,
+    prepaid_amount  INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS pg_panels (
@@ -401,6 +403,8 @@ function db_bootstrap(): void
                         'ref_cash_paid' => 'INTEGER DEFAULT 0',
                         'ref_reward_total' => 'INTEGER DEFAULT 0'],
         'panels'    => ['pg_panel_id' => 'INTEGER', 'user_cap' => 'INTEGER DEFAULT 0',
+                        'billing_start_at' => 'INTEGER DEFAULT 0',
+                        'prepaid_amount' => 'INTEGER DEFAULT 0',
                         'is_trial' => 'INTEGER DEFAULT 0',
                         'hourly_paused' => 'INTEGER DEFAULT 0',
                         'violation_until' => 'INTEGER', 'violation_count' => 'INTEGER DEFAULT 0',

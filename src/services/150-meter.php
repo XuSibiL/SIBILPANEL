@@ -81,6 +81,12 @@ function panel_meter_amounts(array $panel, int $usedBytes, bool $hourlyEnabled,
         }
     }
     $meterAt = (int) $panel['last_meter_at'] ?: (int) $panel['created_at'];
+    /* ⏱ ساعت‌های پیش‌پرداخت‌شده (پیش‌فرض ۲۴ ساعت اول) حساب نمی‌شوند:
+       مبنای کسر ساعتی فقط بعد از پایان آن‌ها جلو می‌رود */
+    $billingStart = (int) ($panel['billing_start_at'] ?? 0);
+    if ($billingStart > 0 && $billingStart > $meterAt) {
+        $meterAt = $billingStart;
+    }
     $hours = 0;
     $meterUntil = now_ts();
     if ($hourlyEnabled && (int) $panel['hourly_price'] > 0

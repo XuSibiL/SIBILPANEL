@@ -352,6 +352,32 @@ function wiz_finish(int $uid, array $data): void
                      [btn('« مالی', 'ad:finance', null, 'danger')]]);
                 return;
             }
+            /* آیدی پشتیبانی: @name و لینک t.me هر دو پذیرفته و یکسان ذخیره می‌شوند */
+            if ($key === 'support_link') {
+                $rawSupport = trim((string) $values['value']);
+                $supportHandle = '';
+                if (preg_match('~t\.me/([A-Za-z0-9_]{3,32})~i', $rawSupport, $sm)) {
+                    $supportHandle = $sm[1];
+                } elseif (preg_match('~^@?([A-Za-z0-9_]{3,32})$~', $rawSupport, $sm)) {
+                    $supportHandle = $sm[1];
+                }
+                if ($supportHandle === '' && $rawSupport !== '') {
+                    Tg::send($uid, "❌ این آیدی معتبر نیست.\n\n"
+                        . 'یکی از این دو شکل را بفرستید:' . "\n"
+                        . '· <code>@my_support</code>' . "\n"
+                        . '· <code>https://t.me/my_support</code>',
+                        [[btn('📞 دوباره', 'ad:set:support_link', null, 'primary')],
+                         [btn('« تنظیمات', 'ad:setg:report', null, 'danger')]]);
+                    return;
+                }
+                set_put('support_link', $supportHandle !== '' ? '@' . $supportHandle : '');
+                Tg::send($uid, "✅ «آیدی پشتیبانی» ذخیره شد: <b>"
+                    . e($supportHandle !== '' ? '@' . $supportHandle : '—') . "</b>\n\n"
+                    . '<i>دکمهٔ شیشه‌ای «☎️ پشتیبانی» همین حالا به '
+                    . '<code>https://t.me/' . e($supportHandle) . '</code> وصل شد.</i>',
+                    [[btn('« تنظیمات', 'ad:setg:report', null, 'danger')]]);
+                return;
+            }
             set_put($key, (string) $values['value']);
             $label = SETTING_LABELS[$key] ?? 'مقدار';
             $backTo = match (setting_group_of($key)) {
@@ -672,15 +698,17 @@ function wiz_finish(int $uid, array $data): void
                     [[btn('🎯 تغییر مخاطب', 'ad:bc:seg', null, 'success')]]);
                 return;
             }
-            $stats = bc_run($targets, 'text', $text, 0, 0, set_bool('bc_pin', false));
-            Tg::send($uid, '📣 <b>ارسال همگانی تمام شد</b>' . "\n"
-                . '🎯 ' . BC_SEGMENTS[bc_segment()] . "\n"
-                . '✅ موفق: ' . fa_digits($stats['sent']) . "\n"
-                . '❌ ناموفق: ' . fa_digits($stats['failed']),
+            /* ارسال همگانی در پس‌زمینه: ربات هیچ‌وقت قفل نمی‌کند و تایم‌اوت نمی‌دهد */
+            bc_job_start($targets, 'text', $text, 0, 0, set_bool('bc_pin', false),
+                $uid, '📣 ارسال همگانی تمام شد', BC_SEGMENTS[bc_segment()]);
+            Tg::send($uid, '🚀 <b>ارسال همگانی در پس‌زمینه آغاز شد</b>' . "\n" . SEP . "\n"
+                . '🎯 مخاطب: ' . BC_SEGMENTS[bc_segment()] . "\n"
+                . '👥 تعداد کل: ' . fa_digits(count($targets)) . "\n\n"
+                . '<i>پیام‌ها یکی‌یکی و با فاصله ارسال می‌شوند؛ گزارش کامل '
+                . '(تعداد کل / موفق / مسدود شده توسط کاربر) همین‌جا برایت می‌آید. '
+                . 'می‌توانی ربات را عادی استفاده کنی.</i>',
                 [[btn('« پیام همگانی', 'ad:bc', null, 'success')]]);
-            post_report('📣 <b>پیام همگانی</b>' . "\n" . 'مخاطب: '
-                . BC_SEGMENTS[bc_segment()] . "\n" . 'موفق ' . $stats['sent']
-                . ' · ناموفق ' . $stats['failed'], 'general');
+            bc_job_dispatch();
             return;
     }
     Tg::send($uid, 'ویزارد نامعتبر.', console_kb());

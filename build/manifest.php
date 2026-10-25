@@ -29,6 +29,7 @@ return [
     'handlers/140-router-messages.php',
     'services/150-meter.php',
     'cli/160-cli.php',
+    'services/160-force-join.php',
     'services/170-gateways.php',
     'web/180-web.php',
     'screens/190-pay-admin.php',
