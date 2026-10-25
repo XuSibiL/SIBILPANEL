@@ -132,10 +132,15 @@ banner() {
     printf '%s\n' "  ╚══════════════════════════════════════╝$R"
 }
 
-# ── بررسی نسخهٔ منتشرشده (کش یک‌ساعته، بدون فشار به API) ────────────────────
+# ── بررسی نسخهٔ منتشرشده ────────────────────────────────────────────────────
+# قاعده: هر بار که «آپدیت» یا «بررسی» زده می‌شود، نسخهٔ دوردست **تازه** خوانده
+# می‌شود؛ هیچ کشی نسخهٔ تازه‌تر را پنهان نمی‌کند. فایل کش فقط زمانی استفاده
+# می‌شود که شبکه/گیت‌هاب جواب ندهد (حالت آفلاین).
 REMOTE_CACHE="$PANEL_HOME/.update-cache"
-REMOTE_TTL=3600
 DEFAULT_GITHUB_REPO="XuSibiL/SIBILPANEL"
+REMOTE_MEM=""          # کش داخل همین اجرا (فقط برای بازترسیم منو)
+REMOTE_MEM_AT=0
+REMOTE_MEM_TTL=30
 
 version_gt() {   # version_gt A B  → A > B ?
     [[ "$1" == "$2" ]] && return 1
@@ -150,55 +155,89 @@ version_gt() {   # version_gt A B  → A > B ?
     return 1
 }
 
+# بالاترین نسخهٔ معتبر از میان چند مقدار (خالی‌ها نادیده گرفته می‌شوند)
+version_max() {
+    local best=""
+    local v
+    for v in "$@"; do
+        v="$(printf '%s' "$v" | tr -d ' \r\n' | sed 's/^[vV]//')"
+        [[ "$v" =~ ^[0-9]+(\.[0-9]+)*$ ]] || continue
+        if [[ -z "$best" ]] || version_gt "$v" "$best"; then
+            best="$v"
+        fi
+    done
+    printf '%s' "$best"
+}
+
+_gh_get() {   # _gh_get URL  → بدنه (با هدر no-cache و پارامتر ضدفشرده‌سازی)
+    local url="$1"
+    command -v curl >/dev/null 2>&1 || return 0
+    curl -fsS --max-time 10 -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' \
+        -H 'Accept: application/vnd.github+json' \
+        "$url$([[ "$url" == *\?* ]] && printf '&' || printf '?')t=$(date +%s)$RANDOM" 2>/dev/null
+}
+
+# نسخهٔ زندهٔ گیت‌هاب: بالاترین مقدار از ریلیز، فایل VERSION و تگ‌ها
+remote_version_live() {
+    local repo branch tag raw tags taglist v
+    repo="$(git_repo)"
+    branch="$(git_branch)"
+
+    # ۱) ریلیز رسمی (اگر منتشر شده باشد)
+    tag="$(_gh_get "https://api.github.com/repos/$repo/releases/latest" \
+        | sed -n 's/.*"tag_name" *: *"\([^"]*\)".*/\1/p' | head -1)"
+
+    # ۲) فایل VERSION روی همان برنچ — منبع اصلی و همیشه به‌روز
+    raw="$(_gh_get "https://raw.githubusercontent.com/$repo/$branch/VERSION" | head -1)"
+
+    taglist=""
+    if [[ -z "$tag" && -z "$raw" ]]; then
+        # ۳) آخرین تگ‌ها (اگر ریلیز و فایل VERSION هر دو در دسترس نبودند)
+        taglist="$(_gh_get "https://api.github.com/repos/$repo/tags?per_page=100" \
+            | sed -n 's/.*"name" *: *"\([^"]*\)".*/\1/p' | tr '\n' ' ')"
+    fi
+
+    v="$(version_max "$tag" "$raw" $taglist)"
+    printf '%s' "$v"
+}
+
+# نسخهٔ دوردست برای نمایش/بررسی: تازه، با فایل کش فقط به‌عنوان پشتیبان آفلاین
 remote_version() {
-    # ۱) ریلیز گیت‌هاب  ۲) فایل VERSION برنچ  ۳) فایل نصب (سازگاری عقب‌رو)
-    local repo branch url cached_at cached_v now="$(date +%s)" want=""
-    repo="${PANEL_UPDATE_REPO:-}"
-    if [[ -z "$repo" ]]; then
-        repo="$(env_get PANEL_UPDATE_REPO 2>/dev/null)"
-    fi
-    [[ -z "$repo" ]] && repo="$DEFAULT_GITHUB_REPO"
-    repo="${repo#https://github.com/}"; repo="${repo#http://github.com/}"
-    repo="${repo%.git}"; repo="${repo%/}"
-    branch="${PANEL_UPDATE_BRANCH:-}"
-    if [[ -z "$branch" ]]; then
-        branch="$(env_get PANEL_UPDATE_BRANCH 2>/dev/null)"
-    fi
-    [[ -z "$branch" ]] && branch="main"
+    local fresh cached_at cached_v now want
+    now="$(date +%s)"
 
-    if [[ -f "$REMOTE_CACHE" ]]; then
-        cached_at="$(sed -n '1p' "$REMOTE_CACHE" 2>/dev/null)"
-        cached_v="$(sed -n '2p' "$REMOTE_CACHE" 2>/dev/null)"
-        if [[ -n "$cached_at" && -n "$cached_v" ]] && ((now - cached_at < REMOTE_TTL)); then
-            printf '%s' "$cached_v"
-            return 0
-        fi
+    # کش داخل همین اجرا فقط برای بازترسیم سریع منو (۳۰ ثانیه)
+    if [[ -n "$REMOTE_MEM" ]] && ((now - REMOTE_MEM_AT < REMOTE_MEM_TTL)); then
+        printf '%s' "$REMOTE_MEM"
+        return 0
     fi
 
-    if command -v curl >/dev/null 2>&1; then
-        want="$(curl -fsS --max-time 8 "https://api.github.com/repos/$repo/releases/latest" 2>/dev/null \
-            | sed -n 's/.*"tag_name" *: *"v\?\([0-9.]*\)".*/\1/p' | head -1)"
-        if [[ -z "$want" ]]; then
-            want="$(curl -fsS --max-time 10 \
-                "https://raw.githubusercontent.com/$repo/$branch/VERSION" 2>/dev/null \
-                | tr -d ' \r\n' | grep -Eo '^[0-9]+(\.[0-9]+)*$' | head -1)"
-        fi
-    fi
-
-    if [[ -z "$want" ]]; then
-        url="$(cat "$UPDATE_URL_FILE" 2>/dev/null)"
-        [[ -z "$url" ]] && url="$DEFAULT_UPDATE_URL"
-        if [[ -n "$url" ]] && command -v curl >/dev/null 2>&1; then
-            want="$(curl -fsS --max-time 12 -r 0-4096 "$url" 2>/dev/null \
-                | sed -n 's/^VERSION="\([0-9.]*\)".*/\1/p' | head -1)"
-        fi
-    fi
+    want="$(remote_version_live)"
 
     if [[ -n "$want" ]]; then
         mkdir -p "$PANEL_HOME" 2>/dev/null
         printf '%s\n%s\n' "$now" "$want" >"$REMOTE_CACHE" 2>/dev/null || true
+        REMOTE_MEM="$want"; REMOTE_MEM_AT="$now"
+        printf '%s' "$want"
+        return 0
     fi
-    printf '%s' "$want"
+
+    # آفلاین: آخرین مقدار شناخته‌شده
+    if [[ -f "$REMOTE_CACHE" ]]; then
+        cached_at="$(sed -n '1p' "$REMOTE_CACHE" 2>/dev/null)"
+        cached_v="$(sed -n '2p' "$REMOTE_CACHE" 2>/dev/null)"
+        if [[ -n "$cached_v" ]]; then
+            printf '%s' "$cached_v"
+            return 0
+        fi
+    fi
+    printf '%s' ""
+}
+
+# بررسی همیشه‌تازه (برای «update» و «check») — کش را نادیده می‌گیرد
+remote_version_now() {
+    REMOTE_MEM=""; REMOTE_MEM_AT=0
+    remote_version
 }
 
 update_available() {
@@ -647,20 +686,31 @@ update_archive() {
 
 github_update() {
     local repo branch remote tmp root f
+    local force=""
+    [[ "${1:-}" == "--force" || "${1:-}" == "-f" ]] && force="1"
     repo="$(git_repo)"
     branch="$(git_branch)"
-    remote="$(remote_version)"
-    if [[ -n "$remote" ]] && ! version_gt "$remote" "$VERSION"; then
-        ok "You are on the latest version (v$VERSION) — nothing to update."
-        return 0
+    remote="$(remote_version_now)"
+    if [[ -z "$force" ]]; then
+        if [[ -n "$remote" ]] && ! version_gt "$remote" "$VERSION"; then
+            ok "You are on the latest version (v$VERSION) — nothing to update."
+            return 0
+        fi
+        if [[ -n "$remote" ]]; then
+            step "Updating v$VERSION -> v$remote  (github.com/$repo, branch $branch)"
+        else
+            step "Updating from github.com/$repo (branch $branch)"
+        fi
+    else
+        step "Forced update from github.com/$repo (branch $branch)$([[ -n "$remote" ]] && printf ' · github has v%s' "$remote")"
     fi
-    [[ -n "$remote" ]] && step "Updating v$VERSION -> v$remote  (github.com/$repo, branch $branch)" \
-        || step "Updating from github.com/$repo (branch $branch)"
 
     command -v curl >/dev/null 2>&1 || { bad "curl is required for the update"; return 1; }
     tmp="$(mktemp -d)"
     local archive; archive="$(update_archive)"
-    if ! curl -fsSL --max-time 120 "$archive" -o "$tmp/code.tgz"; then
+    # هدر no-cache: بستهٔ تازهٔ همان لحظه دانلود می‌شود، نه نسخهٔ کش‌شدهٔ CDN
+    if ! curl -fsSL --max-time 120 -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' \
+        "$archive" -o "$tmp/code.tgz"; then
         bad "download failed: $archive"
         rm -rf "$tmp"
         return 1
@@ -702,6 +752,15 @@ github_update() {
     ok "code replaced ($copied items) — .env, database, logs and backups untouched"
 
     VERSION="$(detect_version)"
+    local pkg_version=""
+    [[ -f "$PANEL_HOME/VERSION" ]] && pkg_version="$(tr -d ' \r\n' <"$PANEL_HOME/VERSION")"
+    if [[ -n "$pkg_version" ]]; then
+        ok "installed package version: v$pkg_version"
+        if [[ -n "$remote" ]] && [[ "$pkg_version" != "$remote" ]]; then
+            warn "the installed files report v$pkg_version while github says v$remote"
+            warn "run once: sudo sibil update --force"
+        fi
+    fi
     if check_env >/dev/null 2>&1 && "${PHP_BIN:-php}" "$APP" --migrate >/dev/null 2>&1; then
         ok "database migrated to the v$VERSION schema"
     else
@@ -721,12 +780,17 @@ github_update() {
 
 cmd_update() {
     # مسیر اصلی: گیت‌هاب. اگر مخزن در دسترس نبود، نصب‌کنندهٔ تک‌فایلی
-    github_update && return 0
+    local arg="${1:-}"
+    if [[ "$arg" == "--force" || "$arg" == "-f" ]]; then
+        github_update --force
+    else
+        github_update
+    fi && return 0
     local url remote
     url="${1:-$(cat "$UPDATE_URL_FILE" 2>/dev/null)}"
     [[ -z "$url" ]] && url="$DEFAULT_UPDATE_URL"
     [[ -z "$url" ]] && return 1
-    remote="$(remote_version)"
+    remote="$(remote_version_now)"
     if [[ -n "$remote" ]] && ! version_gt "$remote" "$VERSION"; then
         ok "You are on the latest version (v$VERSION) — nothing to update."
         return 0
@@ -751,9 +815,12 @@ cmd_update() {
 
 cmd_check() {
     local remote
-    remote="$(remote_version)"
+    remote="$(remote_version_now)"
     say "  local  : v$VERSION"
-    say "  remote : ${remote:+v$remote}${remote:-unavailable}"
+    # نکته: با ${remote:-…} مقدار تکراری چاپ می‌شد؛ یک متغیر تمیز ساخته می‌شود
+    local remote_label="unavailable"
+    [[ -n "$remote" ]] && remote_label="v$remote"
+    say "  remote : $remote_label"
     say "  source : github.com/$(git_repo) (branch $(git_branch))"
     if [[ -z "$remote" ]]; then
         warn "could not read the remote version (network or repo access)"
@@ -1169,6 +1236,7 @@ cmd_help() {
     say ""
     say "    ${B}status${R}     service, config and data summary"
     say "    ${B}update${R}     fetch the latest release and restart (data kept)"
+    say "    ${B}update --force${R}  reinstall from github even if versions match"
     say "    ${B}restart${R}    restart the bot        ${B}start${R} / ${B}stop${R}"
     say "    ${B}logs${R}       follow bot_error.log / payments.log / device_guard.log"
     say "    ${B}backup${R}     create a snapshot, or import a backup .$(backup_ext)"

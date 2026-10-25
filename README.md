@@ -7,7 +7,7 @@
 فروش پنل حجمی/ساعتی، کیف پول، درگاه‌های پرداخت ایرانی و کریپتو، احراز هویت دو سطحی،
 کد تخفیف، سیستم دعوت دوستان و پنل مدیریت کامل — بدون فریم‌ورک، بدون Composer.
 
-![version](https://img.shields.io/badge/version-3.16.2-2ea043)
+![version](https://img.shields.io/badge/version-3.16.3-2ea043)
 ![php](https://img.shields.io/badge/PHP-8.1%2B-777bb4)
 ![db](https://img.shields.io/badge/SQLite-PDO-003b57)
 ![license](https://img.shields.io/badge/license-MIT-blue)
@@ -228,6 +228,21 @@ php -S 0.0.0.0:8080 src/web/180-web.php
 
 ---
 
+## انتشار نسخه روی گیت‌هاب
+
+پس از هر تغییر، بسته ساخته و همان لحظه روی گیت‌هاب قابل دانلود می‌شود:
+
+```bash
+php build/assemble.php --check
+bash build/build_bundle.sh && bash build/package.sh
+git commit -am "release: <version>" && git push
+GITHUB_TOKEN=<token> bash build/publish_release.sh
+```
+
+`publish_release.sh` تگ `v<version>` می‌سازد و ریلیز گیت‌هاب را با
+`tar.gz` · `zip` · `sibil-installer.sh` · `sha256` منتشر می‌کند، پس
+`https://github.com/XuSibiL/SIBILPANEL/releases/latest` همیشه آخرین نسخه است.
+
 ## بروزرسانی خودکار
 
 نسخهٔ تازه مستقیماً از مخزن گیت‌هاب خوانده می‌شود:
@@ -269,6 +284,8 @@ PANEL_UPDATE_RESTART=0              # ری‌استارت خودکار خامو�
 ```bash
 sudo sibil status        # وضعیت سرویس و نسخه
 sudo sibil update        # آپدیت درجا (بدون دست‌زدن به .env و دیتابیس)
+sudo sibil update --force # نصب دوبارهٔ همان نسخه از گیت‌هاب
+sudo sibil check         # مقایسهٔ نسخهٔ نصب‌شده با گیت‌هاب (همیشه تازه)
 sudo sibil backup        # بکاپ دیتابیس
 sudo sibil restore       # بازیابی بکاپ
 sudo sibil doctor        # بررسی سلامت نصب

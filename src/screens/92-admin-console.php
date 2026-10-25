@@ -31,7 +31,9 @@ function console_home_text(): string
     $pending = (int) DB::val("SELECT COUNT(*) FROM receipts WHERE status='pending'", [], 0);
     $pgs = (int) DB::val('SELECT COUNT(*) FROM pg_panels WHERE active=1', [], 0);
     $notice = '';
-    if (update_is_newer(update_remote_version()['version'], PANEL_VERSION)) {
+    /* نشان نسخهٔ تازه: خواندن با کش کوتاه تا هر بار باز کردن پنل، به گیت‌هاب
+       درخواست نزند؛ دکمهٔ «بررسی» و «بروزرسانی» همیشه تازه می‌خواند */
+    if (update_is_newer(update_remote_version(false)['version'], PANEL_VERSION)) {
         $notice .= "\n⬆️ <b>نسخهٔ تازه در گیت‌هاب موجود است</b> — «⚙️ تنظیمات ربات» → «⬆️ بروزرسانی ربات»\n";
     }
     return '⚙️ <b>پنل مدیریت ' . e(brand()) . '</b>' . "\n"

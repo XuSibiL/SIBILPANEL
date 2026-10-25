@@ -13,7 +13,9 @@ declare(strict_types=1);
 */
 
 const UPDATE_DEFAULT_REPO = 'XuSibiL/SIBILPANEL';
-const UPDATE_CACHE_TTL = 900;
+/* کش فقط برای تیک خودکار/نمایش است؛ هر بررسیِ کاربر همیشه تازه خوانده می‌شود */
+const UPDATE_CACHE_TTL = 300;
+const UPDATE_RAW_CACHE_TTL = 300;
 
 /** مخزن رسمی: مقدار .env وگرنه مخزن پیش‌فرض */
 function update_repo(): string
@@ -54,12 +56,17 @@ function update_is_newer(string $remote, string $local): bool
     return version_compare($remote, $local, '>');
 }
 
-/** یک GET ساده با هدر گیت‌هاب؛ خروجی [بدنه، کد وضعیت] */
+/**
+ * یک GET ساده با هدر گیت‌هاب؛ خروجی [بدنه، کد وضعیت].
+ * هدر no-cache اجباری است تا CDN گیت‌هاب نسخهٔ قدیمی را برنگرداند.
+ */
 function update_http_get(string $url, int $timeout = 12): array
 {
     [$body, $error, $status] = http_request('GET', $url, [
         'User-Agent: panel-updater',
         'Accept: application/vnd.github+json',
+        'Cache-Control: no-cache',
+        'Pragma: no-cache',
     ], null, false, $timeout);
     if ($body === null || $body === '') {
         return ['', (int) $status];
@@ -67,49 +74,110 @@ function update_http_get(string $url, int $timeout = 12): array
     return [(string) $body, (int) $status];
 }
 
-/** آخرین نسخهٔ منتشرشده در گیت‌هاب: اول ریلیز، بعد فایل VERSION برنچ */
-function update_remote_version(bool $force = false): array
+/** آدرس با پارامتر ضدفشرده‌سازی تا همان لحظه نسخهٔ تازه بیاید */
+function update_bust_url(string $url): string
 {
+    return $url . (str_contains($url, '?') ? '&' : '?') . 't=' . time() . mt_rand(100, 999);
+}
+
+/** بالاترین نسخهٔ معتبر از میان چند مقدار */
+function update_max_version(string ...$versions): string
+{
+    $best = '';
+    foreach ($versions as $raw) {
+        $candidate = trim(ltrim(trim($raw), 'vV'));
+        if (!preg_match('/^\d+(\.\d+)*$/', $candidate)) {
+            continue;
+        }
+        if ($best === '' || version_compare($candidate, $best, '>')) {
+            $best = $candidate;
+        }
+    }
+    return $best;
+}
+
+/**
+ * آخرین نسخهٔ منتشرشده در گیت‌هاب.
+ *  · `$force = true` (پیش‌فرض): همیشه تازه خوانده می‌شود — دکمهٔ «بررسی» و CLI
+ *  · `$force = false`: تیک خودکار/نمایش، با کش کوتاه
+ * مقدار نهایی = بالاترین نسخهٔ بین «ریلیز»، «تگ‌ها» و «فایل VERSION برنچ»، تا
+ * هیچ منبع قدیمی نسخهٔ تازه‌تر را پنهان نکند. کش فقط وقتی استفاده می‌شود که
+ * هیچ منبعی جواب ندهد (آفلاین).
+ */
+function update_remote_version(bool $force = true): array
+{
+    $repo = update_repo();
     $cached = json_decode((string) set_get('update_remote', ''), true);
     if (!$force && is_array($cached)
         && (int) ($cached['at'] ?? 0) > time() - UPDATE_CACHE_TTL
         && (string) ($cached['version'] ?? '') !== '') {
-        return ['version' => (string) $cached['version'], 'source' => (string) ($cached['source'] ?? 'cache'), 'cached' => true];
+        return ['version' => (string) $cached['version'],
+                'source' => (string) ($cached['source'] ?? 'cache'), 'cached' => true];
     }
 
-    $repo = update_repo();
-    $version = '';
-    $source = '';
+    $release = '';
+    $versionFile = '';
+    $tags = '';
+    $sources = [];
 
-    [$body, $status] = update_http_get('https://api.github.com/repos/' . $repo . '/releases/latest');
+    /* ۱) ریلیز رسمی */
+    [$body, $status] = update_http_get(update_bust_url(
+        'https://api.github.com/repos/' . $repo . '/releases/latest'));
     if ($status >= 200 && $status < 300 && $body !== '') {
         $json = json_decode($body, true);
         $tag = is_array($json) ? (string) ($json['tag_name'] ?? '') : '';
         if ($tag !== '') {
-            $version = ltrim($tag, 'vV');
-            $source = 'release';
+            $release = ltrim($tag, 'vV');
+            $sources[] = 'release';
         }
     }
 
-    if ($version === '') {
-        [$raw, $code] = update_http_get('https://raw.githubusercontent.com/' . $repo . '/'
-            . update_branch() . '/VERSION', 10);
-        $raw = trim($raw);
-        if ($code >= 200 && $code < 300 && preg_match('/^\d+(\.\d+)*$/', $raw)) {
-            $version = $raw;
-            $source = 'version-file';
+    /* ۲) فایل VERSION همان برنچ — منبع اصلی و بی‌واسطه */
+    [$raw, $code] = update_http_get(update_bust_url(
+        'https://raw.githubusercontent.com/' . $repo . '/' . update_branch() . '/VERSION'), 10);
+    $raw = trim($raw);
+    if ($code >= 200 && $code < 300 && preg_match('/^\d+(\.\d+)*$/', $raw)) {
+        $versionFile = $raw;
+        $sources[] = 'version-file';
+    }
+
+    /* ۳) تگ‌ها — فقط اگر دو منبع بالا جواب ندادند */
+    if ($release === '' && $versionFile === '') {
+        [$tagBody, $tagStatus] = update_http_get(update_bust_url(
+            'https://api.github.com/repos/' . $repo . '/tags?per_page=100'), 10);
+        if ($tagStatus >= 200 && $tagStatus < 300 && $tagBody !== '') {
+            $list = json_decode($tagBody, true);
+            if (is_array($list)) {
+                foreach ($list as $row) {
+                    $tags = update_max_version($tags, (string) ($row['name'] ?? ''));
+                }
+            }
+            if ($tags !== '') {
+                $sources[] = 'tags';
+            }
         }
     }
+
+    $version = update_max_version($release, $versionFile, $tags);
 
     if ($version !== '') {
-        set_put('update_remote', json_encode(['version' => $version, 'source' => $source, 'at' => time()]));
+        $source = $version === $release ? 'release'
+            : ($version === $versionFile ? 'version-file' : 'tags');
+        set_put('update_remote', json_encode(
+            ['version' => $version, 'source' => $source, 'at' => time()]));
+        return ['version' => $version, 'source' => $source, 'cached' => false];
     }
 
-    return ['version' => $version, 'source' => $source !== '' ? $source : 'unavailable', 'cached' => false];
+    /* هیچ منبعی جواب نداد: آخرین مقدار شناخته‌شده (حالت آفلاین) */
+    if (is_array($cached) && (string) ($cached['version'] ?? '') !== '') {
+        return ['version' => (string) $cached['version'],
+                'source' => 'offline-cache', 'cached' => true];
+    }
+    return ['version' => '', 'source' => 'unavailable', 'cached' => false];
 }
 
 /** وضعیت کامل: نسخهٔ محلی، نسخهٔ دوردست، و این‌که آپدیت هست یا نه */
-function update_status(bool $force = false): array
+function update_status(bool $force = true): array
 {
     $remote = update_remote_version($force);
     return [
@@ -236,7 +304,11 @@ function update_apply(?string $target = null): array
     $status = update_status(true);
     /* آینه/فورس: وقتی آرشیو دستی تنظیم شده، نسخه از خودِ آرشیو خوانده می‌شود */
     $forced = trim(cfg('PANEL_UPDATE_ARCHIVE_URL')) !== '' || cfg('PANEL_UPDATE_FORCE') === '1';
-    if (!$status['available'] && !$forced) {
+    /* اگر فایل VERSION روی دیسک با نسخهٔ کد یکی نیست (سرور نیمه‌آپدیت‌شده)،
+       آپدیت باید اجرا شود حتی وقتی گیت‌هاب نسخهٔ تازه‌تری نشان نمی‌دهد */
+    $onDisk = trim((string) @file_get_contents($target . '/VERSION'));
+    $mismatch = $onDisk !== '' && $onDisk !== PANEL_VERSION;
+    if (!$status['available'] && !$forced && !$mismatch) {
         return [false, 'already-latest'];
     }
     $version = (string) $status['remote'];
@@ -282,7 +354,7 @@ function update_apply(?string $target = null): array
 
 /* ── صفحهٔ مدیریت: بروزرسانی ─────────────────────────────────────────────── */
 
-function update_screen_text(bool $force = false): string
+function update_screen_text(bool $force = true): string
 {
     $status = update_status($force);
     $remote = $status['remote'] !== '' ? $status['remote'] : 'نامشخص';
@@ -292,9 +364,13 @@ function update_screen_text(bool $force = false): string
             ? '⚪️ نسخهٔ دوردست خوانده نشد؛ اتصال سرور به گیت‌هاب را بررسی کنید.'
             : '🟢 روی آخرین نسخه هستید.');
 
+    $offlineNote = ($status['source'] ?? '') === 'offline-cache'
+        ? "⚪️ اتصال به گیت‌هاب برقرار نشد؛ این شماره از آخرین بررسی ذخیره شده است."
+            . "\n" : '';
     return '⬆️ <b>بروزرسانی ربات</b>' . "\n" . SEP . "\n"
         . 'نسخهٔ نصب‌شده: <b>' . e($status['local']) . '</b>' . "\n"
         . 'آخرین نسخه در گیت‌هاب: <b>' . e($remote) . '</b>' . "\n"
+        . $offlineNote
         . $line . "\n" . SEP . "\n"
         . '📦 منبع: <code>' . e($status['repo']) . '</code> · شاخهٔ ' . e($status['branch']) . "\n"
         . 'دیتابیس، فایل تنظیمات و بکاپ‌ها در آپدیت دست‌نخورده می‌مانند.';
@@ -311,7 +387,7 @@ function update_screen_kb(bool $available): array
     return kb_clean($rows);
 }
 
-function screen_update(int|string $chat, ?int $messageId, bool $force = false): void
+function screen_update(int|string $chat, ?int $messageId, bool $force = true): void
 {
     $status = update_status($force);
     Tg::show($chat, $messageId, update_screen_text($force), update_screen_kb((bool) $status['available']));
