@@ -60,11 +60,12 @@ silence_needrestart() {
 BOT_USERNAME_IN="${PANEL_BOT_USERNAME:-}"
 APP_NAME="${PANEL_BOT_NAME:-Panel Service}"
 CHANNEL_DEFAULT="https://t.me/sibilpanel"
-VERSION="3.16.5"
+VERSION="3.17.0"
 # سازگاری با کلیدهای قدیمی
 export PANEL_HOME="${PANEL_HOME:-${SIBIL_HOME:-}}"
 export PANEL_BOT_TOKEN="${PANEL_BOT_TOKEN:-${SIBIL_BOT_TOKEN:-}}"
 export PANEL_ADMINS="${PANEL_ADMINS:-${SIBIL_ADMINS:-}}"
+export PANEL_PRIMARY_OWNER_ID="${PANEL_PRIMARY_OWNER_ID:-}"
 export PANEL_DB="${PANEL_DB:-${SIBIL_DB:-}}"
 export PANEL_WEB_URL="${PANEL_WEB_URL:-${SIBIL_WEB_URL:-}}"
 export PANEL_WEB_PORT="${PANEL_WEB_PORT:-${SIBIL_WEB_PORT:-}}"
@@ -88,7 +89,7 @@ CLI_PATH="/usr/local/bin/sibil"
 PHP_BIN="php"
 WEB_PORT_DEFAULT="8080"
 
-DOMAIN_IN=""; TOKEN_IN=""; ADMINS_IN=""; BRAND_IN=""; UPDATE_URL_IN=""; PHP_IN=""
+DOMAIN_IN=""; TOKEN_IN=""; ADMINS_IN=""; PRIMARY_OWNER_IN="${PANEL_PRIMARY_OWNER_ID:-}"; BRAND_IN=""; UPDATE_URL_IN=""; PHP_IN=""
 REPO_IN=""; BRANCH_IN="main"; SOURCE_IN=""; SUPPORT_IN=""; CHANNEL_IN=""
 MODE="install"; NO_SSL=0; DRY=0; YES=0
 SELF="${BASH_SOURCE[0]:-$0}"
@@ -614,6 +615,37 @@ validate_token() {
     printf '%s' "$api" | sed -n 's/.*"username":"\([^"]*\)".*/\1/p'
 }
 
+# نخستین شناسهٔ عددی معتبر از فهرست مدیران؛ برای قفل مالک اصلی.
+first_admin_id() {
+    local raw="$1" item
+    raw="$(printf '%s' "$raw" | tr ',\t\r\n' '    ')"
+    for item in $raw; do
+        if [[ "$item" =~ ^[0-9]+$ ]] && [[ "$item" != 0 ]]; then
+            printf '%s' "$item"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# برای نصب‌های قدیمی، فقط یک‌بار کلید صریح مالک را بدون تغییر مدیران اضافه می‌کنیم.
+ensure_primary_owner_env() {
+    [[ $DRY -eq 1 || ! -f "$PANEL_HOME/.env" ]] && return 0
+    if grep -q '^PANEL_PRIMARY_OWNER_ID=' "$PANEL_HOME/.env"; then
+        return 0
+    fi
+    local existing raw primary
+    existing="$(grep -E '^PANEL_ADMINS=' "$PANEL_HOME/.env" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '\"')"
+    raw="${ADMINS_IN:-$existing}"
+    primary="$(first_admin_id "$raw" 2>/dev/null || true)"
+    if [[ -n "$primary" ]]; then
+        printf 'PANEL_PRIMARY_OWNER_ID="%s"\n' "$primary" >>"$PANEL_HOME/.env"
+        ok "primary owner anchor added (numeric ID only)"
+    else
+        warn "no numeric admin ID found; primary-owner anchor will be set after an admin ID is configured"
+    fi
+}
+
 prompt_all() {
     step "Configuration"
     if [[ -z "$TOKEN_IN" ]]; then
@@ -640,6 +672,9 @@ prompt_all() {
         ADMINS_IN="$(ask 'admin numeric IDs (comma separated)')"
     fi
     [[ -n "$ADMINS_IN" ]] || warn "no admin id set — the management console stays locked"
+    if [[ ! "$PRIMARY_OWNER_IN" =~ ^[0-9]+$ ]] || [[ "$PRIMARY_OWNER_IN" == 0 ]]; then
+        PRIMARY_OWNER_IN="$(first_admin_id "$ADMINS_IN" 2>/dev/null || true)"
+    fi
     if [[ $NO_SSL -eq 0 && -z "$DOMAIN_IN" ]] && can_prompt; then
         DOMAIN_IN="$(ask 'domain for the bot (leave empty to skip SSL)')"
     fi
@@ -700,6 +735,7 @@ write_env() {
                 run "printf '$key=\"%s\"\\n' '$val' >> '$PANEL_HOME/.env'"
             fi
         done
+        ensure_primary_owner_env
         chmod 600 "$PANEL_HOME/.env" 2>/dev/null
         return 0
     fi
@@ -708,6 +744,8 @@ write_env() {
 # Panel Service - configuration (this is the only file you edit)
 PANEL_BOT_TOKEN="$TOKEN_IN"
 PANEL_ADMINS="$ADMINS_IN"
+# مالک اصلی قفل‌شده؛ از نخستین شناسهٔ PANEL_ADMINS در نصب اول گرفته می‌شود.
+PANEL_PRIMARY_OWNER_ID="$PRIMARY_OWNER_IN"
 PANEL_DOMAIN="$DOMAIN_IN"
 PANEL_HOME="$PANEL_HOME"
 PANEL_DB="$PANEL_HOME/sibil.sqlite3"
@@ -852,6 +890,8 @@ EnvironmentFile=$PANEL_HOME/.env
 ExecStart=$php_path $PANEL_HOME/sibil.php --poll
 Restart=always
 RestartSec=5
+# با restart، همهٔ فرزندهای همان سرویس با هم کشته می‌شوند؛ فقط یک poller می‌ماند.
+KillMode=control-group
 NoNewPrivileges=yes
 StandardOutput=append:$PANEL_HOME/sibil.log
 StandardError=append:$PANEL_HOME/sibil.log
@@ -1055,6 +1095,7 @@ do_update() {
     copy_payload
     setup_user
     ensure_env_keys
+    ensure_primary_owner_env
     ensure_web_url
     if [[ $IS_ROOT -eq 1 && $HAS_SYSTEMD -eq 1 ]]; then
         if unit_is_stale; then

@@ -253,6 +253,17 @@ CREATE TABLE IF NOT EXISTS receipts (
     card_msg    INTEGER
 );
 
+/* هر رسید برای هر مسئول مالی یک کارت خصوصی دارد؛ تا پس از تأیید، همهٔ
+   کارت‌ها (نه فقط اولین نفر) بسته و وضعیتشان یکسان شود. */
+CREATE TABLE IF NOT EXISTS receipt_cards (
+    receipt_id   INTEGER NOT NULL,
+    chat_id      TEXT    NOT NULL,
+    message_id   INTEGER NOT NULL,
+    content_type TEXT    NOT NULL DEFAULT 'photo',
+    PRIMARY KEY (receipt_id, chat_id, message_id)
+);
+CREATE INDEX IF NOT EXISTS receipt_cards_receipt_idx ON receipt_cards(receipt_id);
+
 CREATE TABLE IF NOT EXISTS payments (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     order_id    INTEGER NOT NULL,
@@ -317,6 +328,15 @@ CREATE TABLE IF NOT EXISTS discount_uses (
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT
+);
+
+/* نقش‌های چندسطحی ادمین؛ مالک اصلی عمداً این‌جا ذخیره نمی‌شود و از .env قفل است. */
+CREATE TABLE IF NOT EXISTS admin_roles (
+    tg_id       INTEGER PRIMARY KEY,
+    role        TEXT NOT NULL,
+    created_at  INTEGER NOT NULL DEFAULT 0,
+    created_by  INTEGER NOT NULL DEFAULT 0,
+    CHECK(role IN ('finance','support','manager','coowner'))
 );
 
 CREATE TABLE IF NOT EXISTS tg_state (
@@ -471,6 +491,11 @@ function db_bootstrap(): void
                 // جدول هنوز ساخته نشده — مشکلی نیست
             }
         }
+    }
+    /* نقش‌های قدیمی PANEL_ADMINS یک‌بار به سطح محدود پشتیبانی منتقل می‌شوند.
+       مالک اصلی همچنان فقط از .env تعیین می‌شود. */
+    if (function_exists('admin_roles_bootstrap')) {
+        admin_roles_bootstrap();
     }
 }
 

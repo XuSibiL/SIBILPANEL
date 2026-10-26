@@ -186,6 +186,28 @@ function wiz_finish(int $uid, array $data): void
     $values = $data['values'];
     $ctx = $data['ctx'] ?? [];
     switch ($data['flow']) {
+        case 'admin_staff_target':
+            /* این کنترل دوباره لازم است: ممکن است نقش کاربر حین ویزارد تغییر کرده باشد. */
+            if (!admin_can_manage_roles($uid)) {
+                Tg::send($uid, '⛔️ فقط مالک اصلی می‌تواند سطح دسترسی تعیین کند.',
+                    [[btn('« مدیریت', 'ad:home', null, 'danger')]]);
+                return;
+            }
+            $targetId = (int) ($values['tg_id'] ?? 0);
+            if ($targetId <= 0 || is_bot_self($targetId)) {
+                Tg::send($uid, '❌ شناسهٔ عددی معتبرِ یک حساب تلگرام را بفرستید؛ حساب خود ربات مجاز نیست.',
+                    [[btn('➕ تلاش دوباره', 'ad:staff:add', null, 'primary'),
+                     btn('« مدیران', 'ad:staff', null, 'danger')]]);
+                return;
+            }
+            if (admin_is_primary($targetId)) {
+                Tg::send($uid, '⚠️ این شناسه همان مالک اصلیِ قفل‌شده است؛ قابل تغییر نیست.',
+                    [[btn('« مدیران', 'ad:staff', null, 'danger')]]);
+                return;
+            }
+            screen_admin_staff_role_picker($uid, null, $targetId);
+            return;
+
         case 'cat_new':
             $name = trim((string) ($values['name'] ?? ''));
             if ($name === '') {

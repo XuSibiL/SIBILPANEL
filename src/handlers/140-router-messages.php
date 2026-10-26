@@ -91,13 +91,13 @@ function handle_message_inner(array $message): void
     if ($text === '/help' || $text === '/راهنما') {
         State::clear($uid);
         Tg::send($chatId, "🎓 <b>راهنما</b>\n\nیک بخش را انتخاب کنید یا جستجو کنید.",
-            help_home_kb(is_owner($uid)));
+            help_home_kb(admin_can($uid, 'full')));
         return;
     }
     if ($text === '/admin' || $text === '/مدیریت') {
         State::clear($uid);
-        if (!is_owner($uid)) {
-            Tg::send($chatId, '⛔️ پنل مدیریت فقط برای مالک ربات باز است.');
+        if (!is_console_admin($uid)) {
+            Tg::send($chatId, '⛔️ پنل مدیریت برای شما فعال نیست.');
             return;
         }
         screen_console($chatId, null);
@@ -118,7 +118,7 @@ function handle_message_inner(array $message): void
 
     /* ── بازگردانی بکاپ: مالک فایل sibil-backup-*.sqlite3 را می‌فرستد ──── */
     $doc = $message['document'] ?? null;
-    if (is_array($doc) && !empty($doc['file_id']) && is_owner($uid)) {
+    if (is_array($doc) && !empty($doc['file_id']) && admin_can($uid, 'full')) {
         $docName = (string) ($doc['file_name'] ?? '');
         $docSize = (int) ($doc['file_size'] ?? 0);
         $isBackupName = preg_match('/\.(sqlite3|db|panelbak)$/i', $docName) === 1
@@ -185,7 +185,7 @@ function handle_message_inner(array $message): void
 
         case 'help_search':
             State::clear($uid);
-            $hits = help_matches($text, is_owner($uid));
+            $hits = help_matches($text, admin_can($uid, 'full'));
             if (!$hits) {
                 Tg::send($chatId, 'چیزی پیدا نشد. یک کلمهٔ دیگر امتحان کنید.',
                     [[btn('« راهنما', 'help:home', null, 'danger')]]);
@@ -272,8 +272,9 @@ function handle_message_inner(array $message): void
 
         case 'fj_channel':
             /* ثبت کانال اجباری: تجزیه → بررسی مدیر بودن ربات → ذخیره */
-            if (!is_owner($uid)) {
+            if (!admin_can($uid, 'full')) {
                 State::clear($uid);
+                Tg::send($chatId, '⛔️ سطح دسترسی تنظیم کانال را ندارید.');
                 return;
             }
             if (in_array(trim($text), ['لغو', 'انصراف', 'cancel', '/cancel'], true)) {
@@ -281,37 +282,34 @@ function handle_message_inner(array $message): void
                 Tg::send($chatId, 'انصراف داده شد.', force_channel_admin_kb());
                 return;
             }
-            [$chOk, $chChat, $chUsername, $chWhy] = force_channel_parse($text);
+            /* parse → getChat(type) → getChatMember(admin); شناسهٔ نهایی همیشه canonical است. */
+            [$chOk, $chChat, $chUsername, $chLink, $chWhy] = force_channel_validate($text);
             if (!$chOk) {
-                Tg::send($chatId, '❌ ' . $chWhy . "\n\n" . 'دوباره بفرستید.',
-                    [[btn('🔙 انصراف / بازگشت', 'ad:fj', null, 'danger')]]);
-                return;
-            }
-            [$chAdmin, $chAdminWhy] = force_channel_bot_admin($chChat);
-            if (!$chAdmin) {
-                Tg::send($chatId, '⚠️ ' . $chAdminWhy . "\n\n" . 'دوباره بفرستید '
+                Tg::send($chatId, $chWhy . "\n\n" . 'دوباره بفرستید '
                     . 'یا «🔙 انصراف / بازگشت» را بزنید.',
                     [[btn('🔙 انصراف / بازگشت', 'ad:fj', null, 'danger')]]);
                 return;
             }
             State::clear($uid);
-            set_put('force_channel_id', $chUsername !== '' ? '@' . $chUsername : $chChat);
+            set_put('force_channel_id', $chChat);
+            set_put('force_channel_username', $chUsername);
+            set_put('force_channel_join_link', $chLink);
             set_put('force_channel_on', '1');
-            $chLink = force_channel_link();
             Tg::send($chatId, "✅ <b>کانال اجباری ذخیره و فعال شد</b>\n" . SEP . "\n"
-                . 'کانال: <code>' . e($chUsername !== '' ? '@' . $chUsername : $chChat)
-                . '</code>' . "\n"
+                . 'شناسهٔ عددی: <code>' . e($chChat) . '</code>' . "\n"
+                . 'نوع: ' . ($chUsername !== '' ? 'کانال عمومی' : 'کانال/گروه خصوصی') . "\n"
                 . 'لینک عضویت: ' . ($chLink !== '' ? '<code>' . e($chLink) . '</code>'
-                    : '—') . "\n\n"
-                . '<i>ربات مدیر این کانال است و قفل برای همهٔ کاربران فعال شد. '
+                    : '— (برای نمایش دکمهٔ عضویت، لینک خصوصی را همراه شناسه بفرستید)') . "\n\n"
+                . '<i>نوع چت و مدیر بودن ربات تأیید شد؛ قفل برای کاربران فعال است. '
                 . 'مالک و ادمین‌ها قفل نمی‌شوند.</i>',
                 force_channel_admin_kb());
             return;
 
         case 'report_group_id':
             /* ثبت گروه گزارشات: اعتبارسنجی (-100…) → پیام تست → ذخیره */
-            if (!is_owner($uid)) {
+            if (!admin_can($uid, 'full')) {
                 State::clear($uid);
+                Tg::send($chatId, '⛔️ سطح دسترسی تنظیم گروه گزارشات را ندارید.');
                 return;
             }
             if (in_array(trim($text), ['لغو', 'انصراف', 'cancel'], true)) {

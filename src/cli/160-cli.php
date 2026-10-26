@@ -129,8 +129,79 @@ function bot_commands_sync(bool $force = false): bool
     return $ok;
 }
 
+/**
+ * دکمهٔ آبی Mini App از سطح پیش‌فرض بات پاک می‌شود؛ نوع commands همان منوی
+ * دستور استاندارد تلگرام است. مهر در DB مانع درخواست تکراری در هر ری‌استارت است.
+ */
+function bot_menu_button_sync(bool $force = false): bool
+{
+    /* این درخواست ذاتاً idempotent است. عمداً در هر آغاز poll اجرا می‌شود تا اگر
+       Mini App از BotFather یا اجرای قدیمی مانده باشد، همان لحظه حذف شود؛ مهر DB
+       فقط برای گزارش/عیب‌یابی است، نه دلیلی برای رد کردن درخواست رسمی. */
+    $res = Tg::call('setChatMenuButton', ['menu_button' => ['type' => 'commands']]);
+    $ok = is_array($res) && (($res['ok'] ?? false) === true);
+    if ($ok) {
+        set_put('bot_menu_button_mode', 'commands');
+        set_put('bot_menu_button_at', (string) now_ts());
+        log_line('info', 'telegram chat menu button reset to commands');
+    } else {
+        log_line('warning', 'telegram setChatMenuButton failed; will retry on next startup');
+    }
+    return $ok;
+}
+
+/**
+ * قفل سطح‌فایل برای long polling. حتی اگر یک runner قدیمی کنار systemd روشن
+ * مانده باشد، فقط یکی اجازهٔ getUpdates دارد و /start دوبار اجرا نمی‌شود.
+ */
+function polling_lock_acquire(): bool
+{
+    $path = panel_home() . '/.poll.lock';
+    $handle = @fopen($path, 'c+');
+    if ($handle === false) {
+        log_line('error', 'could not open polling lock: ' . $path);
+        return false;
+    }
+    if (!@flock($handle, LOCK_EX | LOCK_NB)) {
+        @fclose($handle);
+        log_line('warning', 'second polling worker refused: lock is held');
+        return false;
+    }
+    @ftruncate($handle, 0);
+    @fwrite($handle, (string) getmypid() . "\n");
+    @fflush($handle);
+    $GLOBALS['panel_poll_lock'] = $handle;
+    return true;
+}
+
+function polling_lock_release(): void
+{
+    $handle = $GLOBALS['panel_poll_lock'] ?? null;
+    if (is_resource($handle)) {
+        @flock($handle, LOCK_UN);
+        @fclose($handle);
+    }
+    unset($GLOBALS['panel_poll_lock']);
+}
+
 function cli_poll(int $seconds = 0): void
 {
+    if (!polling_lock_acquire()) {
+        return;
+    }
+    try {
+    /* این سرویس فقط long polling دارد: وب‌هوک و آپدیت‌های معوق پاک می‌شوند تا
+       نه وب‌هوک قدیمی و نه worker دوم /start را دوبار تحویل ندهند. */
+    try {
+        $webhook = Tg::call('deleteWebhook', ['drop_pending_updates' => true]);
+        if (!is_array($webhook) || (($webhook['ok'] ?? false) !== true)) {
+            log_line('warning', 'deleteWebhook(drop_pending_updates=true) did not confirm');
+        } else {
+            log_line('info', 'telegram webhook cleared for single-worker polling');
+        }
+    } catch (Throwable $ex) {
+        log_line('warning', 'deleteWebhook on polling startup failed: ' . $ex->getMessage());
+    }
     /* اگر مالک از پنل درخواست بازگردانی بکاپ داده باشد، همین‌جا اعمال می‌شود */
     try {
         backup_restore_apply_pending();
@@ -151,6 +222,14 @@ function cli_poll(int $seconds = 0): void
         log_line('warning', 'bot username sync failed: ' . $ex->getMessage());
     }
     bot_commands_sync();
+    bot_menu_button_sync();
+    /* نصب‌های قدیمی ممکن است @username ذخیره کرده باشند؛ فقط پس از همان
+       اعتبارسنجی کامل Telegram به شناسهٔ canonical مهاجرت می‌شوند. */
+    try {
+        force_channel_upgrade_legacy();
+    } catch (Throwable $ex) {
+        log_line('warning', 'force-join legacy migration failed: ' . $ex->getMessage());
+    }
     /* استارتاپ: تاپیک‌های احراز هویت ساخته/نام‌گذاری شوند */
     try {
         kyc_topics_startup();
@@ -231,11 +310,15 @@ function cli_poll(int $seconds = 0): void
             if (report_ready()) {
                 post_report(daily_report_text(), 'daily');
             } else {
-                foreach (admin_ids() as $adminId) {
-                    Tg::send($adminId, daily_report_text());
+                $primary = primary_owner_id();
+                if ($primary > 0) {
+                    Tg::send($primary, daily_report_text());
                 }
             }
         }
+    }
+    } finally {
+        polling_lock_release();
     }
 }
 

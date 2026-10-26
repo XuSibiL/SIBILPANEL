@@ -5,6 +5,7 @@ declare(strict_types=1);
 
 function screen_users(int|string $chat, ?int $messageId, int $page = 1, string $query = ''): void
 {
+    $canFull = admin_can(console_actor_id(), 'full');
     purge_ghost_users();   // ردیف‌های ساختگی جستجو در فهرست نمی‌آیند
     $total = (int) DB::val('SELECT COUNT(*) FROM users WHERE 1=1' . bot_self_sql(), [], 0);
     $blocked = (int) DB::val('SELECT COUNT(*) FROM users WHERE is_blocked=1' . bot_self_sql(),
@@ -15,9 +16,11 @@ function screen_users(int|string $chat, ?int $messageId, int $page = 1, string $
     /* هیچ دکمهٔ شیشه‌ای و هیچ ردیف کاربری این‌جا نیست: فقط یک دکمهٔ جستجو،
        بعد از زدن آن ربات شناسه می‌خواهد و مستقیم کارت همان کاربر باز می‌شود. */
     $text = "👥 <b>مدیریت کاربران</b>\n" . SEP . "\n"
-        . '📊 کل کاربران: <b>' . fa_digits($total) . "</b>\n"
-        . '🟢 کیف پول دار: ' . fa_digits($rich) . "\n"
-        . '🚫 مسدود: ' . fa_digits($blocked) . "\n"
+        . '📊 کل کاربران: <b>' . fa_digits($total) . "</b>\n";
+    if ($canFull) {
+        $text .= '🟢 کیف پول دار: ' . fa_digits($rich) . "\n";
+    }
+    $text .= '🚫 مسدود: ' . fa_digits($blocked) . "\n"
         . '🆕 امروز: ' . fa_digits($today) . "\n"
         . SEP . "\n"
         . 'برای دیدن کارت یک کاربر، دکمهٔ «🔍 جستجوی کاربر» را بزنید و شناسهٔ عددی '
@@ -45,63 +48,86 @@ function screen_user_card(int|string $chat, ?int $messageId, int $tgId): void
              [btn('« کاربران', 'ad:users', null, 'danger')]]);
         return;
     }
+    $viewer = console_actor_id();
+    $canFull = admin_can($viewer, 'full');
+    $canOps = admin_can($viewer, 'ops') && !$canFull;
     $name = trim((string) ($user['name'] ?? ''));
-    $balance = (int) $user['balance'];
-    /* شارژها: هر واریزی که کیف پول را زیاد کرده (بدون پورسانت و بازگشت وجه) */
-    $deposits = (int) DB::val('SELECT COALESCE(SUM(amount),0) FROM wallet_tx '
-        . "WHERE tg_id=? AND amount>0 AND kind IN ('topup','admin')", [$tgId], 0);
     $activePanels = (int) DB::val("SELECT COUNT(*) FROM panels WHERE tg_id=? "
         . "AND status IN ('active','suspended')", [$tgId], 0);
-    $traffic = (int) DB::val('SELECT COALESCE(SUM(last_usage),0) FROM panels WHERE tg_id=?',
-        [$tgId], 0);
-    $subs = (int) DB::val('SELECT COUNT(*) FROM users WHERE referred_by=?', [$tgId], 0);
-    $level = kyc_level($tgId);
     $blocked = (int) ($user['is_blocked'] ?? 0) === 1;
-    $phone = trim((string) ($user['phone'] ?? ''));
     $uname = trim((string) ($user['uname'] ?? ''));
     $refBy = (int) ($user['referred_by'] ?? 0);
-    $refName = '';
-    if ($refBy > 0) {
-        $refUser = user_get($refBy);
-        $refName = $refUser !== null
-            ? mb_substr(trim((string) ($refUser['name'] ?: (string) $refBy)), 0, 20)
-            . ' · <code>' . $refBy . '</code>'
-            : '<code>' . $refBy . '</code>';
-    }
 
     $text = '👤 <b>اطلاعات کاربری: ' . e($name !== '' ? $name : 'بدون‌نام') . "</b>\n"
         . SEP . "\n"
         . '📌 وضعیت: ' . ($blocked ? '🚫 مسدود' : '🟢 فعال') . "\n"
         . '🔗 یوزرنیم: ' . ($uname !== '' ? '@' . e($uname) : '—') . "\n"
         . '🆔 شناسهٔ عددی: <code>' . $tgId . "</code>\n"
-        . '📱 شمارهٔ موبایل: ' . ($phone !== '' ? '<code>' . e($phone) . '</code>' : '—') . "\n"
-        . '🪪 سطح احراز هویت: ' . kyc_level_emoji($level) . ' سطح '
-            . fa_digits($level) . ' از ' . fa_digits(KYC_MAX_LEVEL) . "\n"
         . '📅 تاریخ عضویت: ' . fa_ts((int) ($user['created_at'] ?? 0)) . "\n"
-        . '🎁 معرف کاربر: ' . ($refBy > 0 ? $refName : 'ندارد (ثبت‌نام مستقیم)') . "\n"
-        . '👥 تعداد زیرمجموعه: ' . fa_digits($subs) . "\n"
-        . SEP . "\n"
-        . "💎 <b>وضعیت مالی و سرویس‌ها:</b>\n"
-        . '👛 موجودی کیف پول: <b>' . money($balance) . "</b>\n"
-        . '💵 مجموع واریزها: ' . money($deposits) . "\n"
-        . '📦 پنل‌های فعال: ' . fa_digits($activePanels) . "\n"
-        . '📊 مجموع ترافیک مصرف‌شده: ' . gb_step_text($traffic) . " گیگابایت\n"
-        . '🎁 تخفیف اختصاصی: ' . user_discount_text($user);
+        . '📦 پنل‌های فعال: ' . fa_digits($activePanels) . "\n";
+
+    if ($canFull) {
+        $balance = (int) $user['balance'];
+        $deposits = (int) DB::val('SELECT COALESCE(SUM(amount),0) FROM wallet_tx '
+            . "WHERE tg_id=? AND amount>0 AND kind IN ('topup','admin')", [$tgId], 0);
+        $traffic = (int) DB::val('SELECT COALESCE(SUM(last_usage),0) FROM panels WHERE tg_id=?',
+            [$tgId], 0);
+        $subs = (int) DB::val('SELECT COUNT(*) FROM users WHERE referred_by=?', [$tgId], 0);
+        $level = kyc_level($tgId);
+        $phone = trim((string) ($user['phone'] ?? ''));
+        $refName = '';
+        if ($refBy > 0) {
+            $refUser = user_get($refBy);
+            $refName = $refUser !== null
+                ? mb_substr(trim((string) ($refUser['name'] ?: (string) $refBy)), 0, 20)
+                . ' · <code>' . $refBy . '</code>' : '<code>' . $refBy . '</code>';
+        }
+        $text .= '📱 شمارهٔ موبایل: ' . ($phone !== '' ? '<code>' . e($phone) . '</code>' : '—') . "\n"
+            . '🪪 سطح احراز هویت: ' . kyc_level_emoji($level) . ' سطح '
+            . fa_digits($level) . ' از ' . fa_digits(KYC_MAX_LEVEL) . "\n"
+            . '🎁 معرف کاربر: ' . ($refBy > 0 ? $refName : 'ندارد (ثبت‌نام مستقیم)') . "\n"
+            . '👥 تعداد زیرمجموعه: ' . fa_digits($subs) . "\n"
+            . SEP . "\n"
+            . "💎 <b>وضعیت مالی و سرویس‌ها:</b>\n"
+            . '👛 موجودی کیف پول: <b>' . money($balance) . "</b>\n"
+            . '💵 مجموع واریزها: ' . money($deposits) . "\n"
+            . '📊 مجموع ترافیک مصرف‌شده: ' . gb_step_text($traffic) . " گیگابایت\n"
+            . '🎁 تخفیف اختصاصی: ' . user_discount_text($user);
+    } else {
+        $text .= SEP . "\n"
+            . '<i>اطلاعات مالی، شمارهٔ کارت و احراز هویت در سطح شما نمایش داده نمی‌شود.</i>';
+    }
 
     $id = $tgId;
-    $rows = [
-        [btn('➕ افزایش موجودی', 'ad:u:' . $id . ':add', null, 'success'),
-         btn('➖ کسر موجودی', 'ad:u:' . $id . ':sub', null, 'danger')],
-        [btn('📦 پنل‌ها و سرویس‌های کاربر', 'ad:u:' . $id . ':panels'),
-         btn('🧾 سوابق تراکنش‌ها', 'ad:u:' . $id . ':tx')],
-        [btn($blocked ? '🚫 رفع مسدودی' : '🚫 مسدودسازی', 'ad:u:' . $id . ':block', null,
-             $blocked ? 'success' : 'danger'),
-         btn('🎁 اعطای تخفیف اختصاصی', 'ad:u:' . $id . ':gift', null, 'success')],
-        [btn('🪪 تغییر دستی سطح احراز', 'ad:u:' . $id . ':kyc'),
-         btn('📩 ارسال پیام به کاربر', 'ad:u:' . $id . ':msg', null, 'success')],
-        [btn('🔄 همگام‌سازی و بروزرسانی', 'ad:u:' . $id . ':sync', null, 'primary'),
-         btn('🔙 بازگشت', 'ad:users', null, 'danger')],
-    ];
+    if ($canFull) {
+        $rows = [
+            [btn('➕ افزایش موجودی', 'ad:u:' . $id . ':add', null, 'success'),
+             btn('➖ کسر موجودی', 'ad:u:' . $id . ':sub', null, 'danger')],
+            [btn('📦 پنل‌ها و سرویس‌های کاربر', 'ad:u:' . $id . ':panels'),
+             btn('🧾 سوابق تراکنش‌ها', 'ad:u:' . $id . ':tx')],
+            [btn($blocked ? '🚫 رفع مسدودی' : '🚫 مسدودسازی', 'ad:u:' . $id . ':block', null,
+                 $blocked ? 'success' : 'danger'),
+             btn('🎁 اعطای تخفیف اختصاصی', 'ad:u:' . $id . ':gift', null, 'success')],
+            [btn('🪪 تغییر دستی سطح احراز', 'ad:u:' . $id . ':kyc'),
+             btn('📩 ارسال پیام به کاربر', 'ad:u:' . $id . ':msg', null, 'success')],
+            [btn('🔄 همگام‌سازی و بروزرسانی', 'ad:u:' . $id . ':sync', null, 'primary'),
+             btn('🔙 بازگشت', 'ad:users', null, 'danger')],
+        ];
+    } elseif ($canOps) {
+        $rows = [
+            [btn('📦 پنل‌ها و سرویس‌های کاربر', 'ad:u:' . $id . ':panels'),
+             btn('🔄 همگام‌سازی پنل‌ها', 'ad:u:' . $id . ':sync', null, 'primary')],
+            [btn('📩 پیام به کاربر', 'ad:u:' . $id . ':msg', null, 'success')],
+            [btn('🔙 بازگشت', 'ad:users', null, 'danger')],
+        ];
+    } else {
+        /* پشتیبانی: مشاهدهٔ کاربر و پاسخ‌گویی، بدون تغییر مالی/فنی. */
+        $rows = [
+            [btn('📦 پنل‌ها و سرویس‌های کاربر', 'ad:u:' . $id . ':panels')],
+            [btn('📩 پاسخ به کاربر', 'ad:u:' . $id . ':msg', null, 'success')],
+            [btn('🔙 بازگشت', 'ad:users', null, 'danger')],
+        ];
+    }
     Tg::show($chat, $messageId, $text, $rows);
 }
 
@@ -110,25 +136,31 @@ function screen_user_card(int|string $chat, ?int $messageId, int $tgId): void
 /** صفحهٔ اول: انتخاب نوع جستجو */
 function screen_find(int|string $chat, ?int $messageId): void
 {
+    $canFull = admin_can(console_actor_id(), 'full');
     $panels = (int) DB::val("SELECT COUNT(*) FROM panels WHERE status<>'deleted'", [], 0);
     $orders = (int) DB::val('SELECT COUNT(*) FROM orders', [], 0);
     $payments = (int) DB::val('SELECT COUNT(*) FROM payments', [], 0);
-    Tg::show($chat, $messageId,
-        "🔍 <b>جستجوی سفارشات</b>\n" . SEP . "\n"
-        . '📦 پنل‌های فروخته‌شده: ' . fa_digits($panels) . "\n"
-        . '🧾 فاکتورها: ' . fa_digits($orders) . ' · 💳 تراکنش‌ها: ' . fa_digits($payments)
-        . "\n" . SEP . "\n"
-        . 'یکی از دو نوع جستجو را انتخاب کنید:' . "\n"
-        . '<i>پنل مشتری با نام کاربری یا شناسه پیدا می‌شود؛ فاکتور با شناسه، کد پیگیری '
-        . 'یا کد سفارش.</i>',
-        [[btn('🔍 جستجوی پنل مشتری', 'ad:find:panel', null, 'success')],
-         [btn('🧾 جستجوی فاکتور و تراکنش مالی', 'ad:find:inv', null, 'success')],
-         [btn('« مدیریت', 'ad:home', null, 'danger')]]);
+    $text = "🔍 <b>جستجوی سفارشات</b>\n" . SEP . "\n"
+        . '📦 پنل‌های فروخته‌شده: ' . fa_digits($panels) . "\n";
+    $rows = [[btn('🔍 جستجوی پنل مشتری', 'ad:find:panel', null, 'success')]];
+    if ($canFull) {
+        $text .= '🧾 فاکتورها: ' . fa_digits($orders) . ' · 💳 تراکنش‌ها: '
+            . fa_digits($payments) . "\n"
+            . SEP . "\n" . 'یکی از دو نوع جستجو را انتخاب کنید:' . "\n"
+            . '<i>پنل مشتری با نام کاربری یا شناسه پیدا می‌شود؛ فاکتور با شناسه، '
+            . 'کد پیگیری یا کد سفارش.</i>';
+        $rows[] = [btn('🧾 جستجوی فاکتور و تراکنش مالی', 'ad:find:inv', null, 'success')];
+    } else {
+        $text .= SEP . "\n" . '<i>در سطح اپراتور، فقط جستجو و مدیریت پنل مشتری مجاز است.</i>';
+    }
+    $rows[] = [btn('« مدیریت', 'ad:home', null, 'danger')];
+    Tg::show($chat, $messageId, $text, $rows);
 }
 
 /** کارت کامل یک پنل فروخته‌شده برای مدیر */
 function screen_find_panel(int|string $chat, ?int $messageId, int $panelId): void
 {
+    $canFull = admin_can(console_actor_id(), 'full');
     $panel = DB::one('SELECT * FROM panels WHERE id=?', [$panelId]);
     if ($panel === null) {
         Tg::show($chat, $messageId,
@@ -163,20 +195,27 @@ function screen_find_panel(int|string $chat, ?int $messageId, int $panelId): voi
         . '📱 دستگاه مجاز: ' . fa_digits((int) ($panel['device_limit'] ?? 0)) . "\n"
         . '👥 سقف کاربر (User Limit): ' . fa_digits((int) ($panel['max_users'] ?? 0)) . "\n"
         . '🌐 سرور/نود: ' . $server . "\n"
-        . '👤 مالک در تلگرام: ' . $ownerLabel . "\n" . SEP . "\n"
-        . '💰 قیمت هر گیگ: ' . money((int) ($panel['per_gb_price'] ?? 0))
-        . ' · ⏱ ساعتی: ' . money((int) ($panel['hourly_price'] ?? 0)) . "\n";
+        . '👤 مالک در تلگرام: ' . $ownerLabel . "\n";
+    if ($canFull) {
+        $text .= SEP . "\n" . '💰 قیمت هر گیگ: ' . money((int) ($panel['per_gb_price'] ?? 0))
+            . ' · ⏱ ساعتی: ' . money((int) ($panel['hourly_price'] ?? 0)) . "\n";
+    } else {
+        $text .= SEP . "\n" . '<i>مبالغ و حذف دائمی پنل در سطح عملیات نمایش داده نمی‌شوند.</i>';
+    }
     $id = (int) $panel['id'];
     $suspended = (string) $panel['status'] === 'suspended';
-    Tg::show($chat, $messageId, $text, [
+    $rows = [
         [btn($suspended ? '🟢 فعال‌سازی پنل' : '⛔ تعلیق پنل', 'ad:find:pn:' . $id
             . ($suspended ? ':res' : ':sus'), null, $suspended ? 'success' : 'danger')],
         [btn('➕ افزایش سقف کاربر', 'ad:find:pn:' . $id . ':ulup', null, 'success'),
          btn('➖ کاهش سقف کاربر', 'ad:find:pn:' . $id . ':uldn', null, 'danger')],
         [btn('➕ تمدید حجم / تاریخ', 'ad:find:pn:' . $id . ':ext', null, 'success')],
-        [btn('🗑 حذف کامل پنل', 'ad:find:pn:' . $id . ':del', null, 'danger')],
-        [btn('« جستجوی سفارشات', 'ad:find', null, 'danger')],
-    ]);
+    ];
+    if ($canFull) {
+        $rows[] = [btn('🗑 حذف کامل پنل', 'ad:find:pn:' . $id . ':del', null, 'danger')];
+    }
+    $rows[] = [btn('« جستجوی سفارشات', 'ad:find', null, 'danger')];
+    Tg::show($chat, $messageId, $text, $rows);
 }
 
 /** کارت یک فاکتور/تراکنش برای مدیر */
@@ -704,6 +743,20 @@ function screen_broadcast(int|string $chat, ?int $messageId, string $notice = ''
 
 function screen_stats(int|string $chat, ?int $messageId): void
 {
+    if (!admin_can(console_actor_id(), 'full')) {
+        $users = (int) DB::val('SELECT COUNT(*) FROM users', [], 0);
+        $newUsers = (int) DB::val('SELECT COUNT(*) FROM users WHERE created_at>=?',
+            [period_start(1)], 0);
+        $panels = (int) DB::val('SELECT COUNT(*) FROM panels', [], 0);
+        $live = (int) DB::val("SELECT COUNT(*) FROM panels WHERE status='active'", [], 0);
+        Tg::show($chat, $messageId, "📊 <b>آمار ساده</b>\n" . SEP . "\n"
+            . '👥 کاربران: <b>' . fa_digits($users) . '</b> · امروز ' . fa_digits($newUsers) . "\n"
+            . '📦 پنل‌ها: ' . fa_digits($panels) . ' · فعال ' . fa_digits($live) . "\n\n"
+            . '<i>فروش، کیف پول و رسیدها در این سطح نمایش داده نمی‌شوند.</i>',
+            [[btn('🔄 به‌روزرسانی', 'ad:stats', null, 'primary')],
+             [btn('« مدیریت', 'ad:home', null, 'danger')]]);
+        return;
+    }
     $today = finance_stats(1);
     $week = finance_stats(7);
     $month = finance_stats(30);

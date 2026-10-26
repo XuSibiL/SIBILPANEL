@@ -3,17 +3,19 @@ declare(strict_types=1);
 
 /* 14) Review of card-to-card receipts */
 
-/** مقصد کارت رسید: مالک و ادمین‌های ربات، در چت خصوصی */
+/**
+ * مقصد کارت رسید فقط مالک اصلی، هم‌مالک و ادمین مالی است؛ سایر نقش‌ها هرگز
+ * عکس رسید یا callback تأیید پرداخت دریافت نمی‌کنند.
+ */
 function receipt_targets(): array
 {
     $ids = [];
-    $owner = owner_id();
-    if ($owner > 0) {
-        $ids[] = $owner;
-    }
-    foreach (admin_ids() as $adminId) {
-        if (!in_array($adminId, $ids, true)) {
-            $ids[] = $adminId;
+    foreach (admin_role_rows() as $row) {
+        $id = (int) ($row['tg_id'] ?? 0);
+        $role = (string) ($row['role'] ?? '');
+        if ($id > 0 && in_array($role, ['owner', ADMIN_ROLE_COOWNER, ADMIN_ROLE_FINANCE], true)
+            && !in_array($id, $ids, true)) {
+            $ids[] = $id;
         }
     }
     return $ids;
@@ -116,9 +118,8 @@ function receipt_card_kb(int $receiptId): array
 }
 
 /**
- * ارسال کارت رسید به «یک» مقصد:
- * تاپیک رسیدهای گروه گزارشات؛ اگر گروه تنظیم نشده باشد، به پیام خصوصی ادمین اصلی.
- * خروجی: [چت, شناسهٔ پیام]
+ * ارسال کارت رسید به همهٔ مسئولان مجاز در چت خصوصی؛ هر کارت جداگانه ثبت می‌شود
+ * تا تأیید یا رد در تمام مقصدها بسته شود. خروجی: نخستین [چت، شناسهٔ پیام].
  */
 function receipt_post_card(int $receiptId): array
 {
@@ -130,18 +131,52 @@ function receipt_post_card(int $receiptId): array
     $caption = receipt_card_text($receipt, $order, 'pending');
     $kb = receipt_card_kb($receiptId);
     $photo = (string) ($receipt['photo_id'] ?? '');
-    /* کارت (عکس + دکمه‌ها) فقط در چت خصوصی مدیر می‌آید؛ دکمه در گروه کار نمی‌کند */
+    $type = $photo !== '' ? 'photo' : 'text';
+
+    /* در retry احتمالی، پیام دوباره برای همان مسئول ارسال نشود. */
+    $known = [];
+    foreach (DB::all('SELECT chat_id, message_id, content_type FROM receipt_cards WHERE receipt_id=?',
+        [$receiptId]) as $card) {
+        $chat = (string) ($card['chat_id'] ?? '');
+        $msg = (int) ($card['message_id'] ?? 0);
+        if ($chat !== '' && $msg > 0) {
+            $known[$chat] = ['message_id' => $msg, 'content_type' => (string) ($card['content_type'] ?? 'photo')];
+        }
+    }
+    /* رسیدهای ثبت‌شده با نسخه‌های قدیمی فقط یک card_chat/card_msg دارند. */
+    $legacyChat = (string) ($receipt['card_chat'] ?? '');
+    $legacyMsg = (int) ($receipt['card_msg'] ?? 0);
+    if ($legacyChat !== '' && $legacyMsg > 0 && !isset($known[$legacyChat])) {
+        $known[$legacyChat] = ['message_id' => $legacyMsg, 'content_type' => $type];
+        DB::exec('INSERT OR IGNORE INTO receipt_cards(receipt_id, chat_id, message_id, content_type) VALUES(?,?,?,?)',
+            [$receiptId, $legacyChat, $legacyMsg, $type]);
+    }
+
     $sent = ['', 0];
     foreach (receipt_targets() as $adminId) {
+        $chat = (string) $adminId;
+        if (isset($known[$chat])) {
+            if ($sent[1] === 0) {
+                $sent = [$chat, (int) $known[$chat]['message_id']];
+            }
+            continue;
+        }
         if ($photo !== '') {
             $msgId = Tg::photoThread($adminId, $photo, $caption, 0, kb_ensure_back(kb_clean($kb)));
         } else {
             $msgId = (int) Tg::send($adminId, $caption, $kb);
         }
-        if ($msgId && $sent[1] === 0) {
-            $sent = [(string) $adminId, (int) $msgId];
+        if ($msgId <= 0) {
+            continue;
+        }
+        DB::exec('INSERT OR IGNORE INTO receipt_cards(receipt_id, chat_id, message_id, content_type) VALUES(?,?,?,?)',
+            [$receiptId, $chat, $msgId, $type]);
+        $known[$chat] = ['message_id' => $msgId, 'content_type' => $type];
+        if ($sent[1] === 0) {
+            $sent = [$chat, $msgId];
         }
     }
+    /* ستون‌های قدیمی برای سازگاری و بازیابی یک کارت نمونه باقی می‌مانند. */
     if ($sent[1] > 0) {
         DB::exec('UPDATE receipts SET card_chat=?, card_msg=? WHERE id=?',
             [$sent[0], $sent[1], $receiptId]);
@@ -166,16 +201,36 @@ function receipt_close_card(int $receiptId, bool $approve, int $adminId, string 
         return;
     }
     $caption = receipt_card_text($receipt, $order, $approve ? 'approved' : 'rejected', $footer);
-    $chat = (string) ($receipt['card_chat'] ?? '');
-    $msgId = (int) ($receipt['card_msg'] ?? 0);
-    if ($chat === '' || $msgId <= 0) {
-        return;
+    $cards = DB::all('SELECT chat_id, message_id, content_type FROM receipt_cards WHERE receipt_id=?', [$receiptId]);
+    /* fallback برای رسیدهای ساخته‌شده پیش از جدول receipt_cards */
+    if ($cards === []) {
+        $chat = (string) ($receipt['card_chat'] ?? '');
+        $msgId = (int) ($receipt['card_msg'] ?? 0);
+        if ($chat !== '' && $msgId > 0) {
+            $cards[] = ['chat_id' => $chat, 'message_id' => $msgId,
+                'content_type' => (string) ($receipt['photo_id'] ?? '') !== '' ? 'photo' : 'text'];
+        }
     }
-    Tg::editCaption($chat, $msgId, $caption, null);
+    foreach ($cards as $card) {
+        $chat = (string) ($card['chat_id'] ?? '');
+        $msgId = (int) ($card['message_id'] ?? 0);
+        if ($chat === '' || $msgId <= 0) {
+            continue;
+        }
+        if ((string) ($card['content_type'] ?? 'photo') === 'text') {
+            Tg::edit($chat, $msgId, $caption, []);
+        } else {
+            Tg::editCaption($chat, $msgId, $caption, null);
+        }
+    }
 }
 
 function review_receipt(int $receiptId, bool $approve, int $adminId): array
 {
+    /* دفاع لایه‌ای: حتی فراخوانی مستقیم این سرویس هم فقط برای نقش رسید است. */
+    if (!admin_can($adminId, 'receipt')) {
+        return [false, 'دسترسی بررسی رسید ندارید.'];
+    }
     $receipt = DB::one('SELECT * FROM receipts WHERE id=?', [$receiptId]);
     if ($receipt === null) {
         return [false, 'رسید پیدا نشد'];
@@ -187,8 +242,14 @@ function review_receipt(int $receiptId, bool $approve, int $adminId): array
     if ($order === null) {
         return [false, 'سفارش پیدا نشد'];
     }
-    DB::exec('UPDATE receipts SET status=?, reviewed_by=?, reviewed_at=? WHERE id=?',
+    /* سه مسئول ممکن است هم‌زمان روی یک کارت بزنند؛ فقط اولین نفر حق
+       تغییر pending را دارد تا تحویل/اعتبار هرگز دوبار اجرا نشود. */
+    $claimed = DB::update("UPDATE receipts SET status=?, reviewed_by=?, reviewed_at=? "
+        . "WHERE id=? AND status='pending'",
         [$approve ? 'approved' : 'rejected', $adminId, now_ts(), $receiptId]);
+    if ($claimed !== 1) {
+        return [false, 'این رسید همین حالا توسط مسئول دیگری بررسی شد'];
+    }
     log_payment('card receipt reviewed', [
         'receipt' => $receiptId, 'approve' => $approve, 'admin' => $adminId,
         'tg' => (int) $receipt['tg_id'], 'amount' => (int) $receipt['amount'],
@@ -223,11 +284,14 @@ function review_receipt(int $receiptId, bool $approve, int $adminId): array
 
 function screen_receipts(int|string $chat, ?int $messageId): void
 {
+    $full = admin_can(console_actor_id(), 'full');
+    $backData = $full ? 'ad:finance' : 'ad:home';
+    $backText = $full ? '« مالی' : '« مدیریت';
     $rows = DB::all("SELECT * FROM receipts WHERE status='pending' ORDER BY id LIMIT 10");
     if (!$rows) {
         Tg::show($chat, $messageId, '🧾 رسید در انتظاری نیست.',
             [[btn('🔎 جستجو با کد پیگیری', 'ad:rsearch', null, 'success')],
-             [btn('« مالی', 'ad:finance', null, 'danger')]]);
+             [btn($backText, $backData, null, 'danger')]]);
         return;
     }
     Tg::send($chat, '🔎 اگر رسید مشخصی را می‌خواهی، با کد پیگیری جستجو کنید.',
@@ -246,5 +310,7 @@ function screen_receipts(int|string $chat, ?int $messageId): void
             Tg::send($chat, $caption, $markup);
         }
     }
+    Tg::send($chat, 'برای بازگشت به منوی مدیریت:',
+        [[btn($backText, $backData, null, 'danger')]]);
 }
 

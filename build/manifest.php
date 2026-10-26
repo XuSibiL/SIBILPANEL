@@ -13,6 +13,7 @@ return [
     'config/40-settings.php',
     'services/50-telegram.php',
     'core/60-state.php',
+    'services/65-rbac.php',
     'services/70-domain.php',
     'services/80-pasarguard.php',
     'services/85-update.php',

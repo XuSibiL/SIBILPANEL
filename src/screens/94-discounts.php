@@ -4922,8 +4922,8 @@ function kyc_callback(int $uid, int|string $chat, int $messageId, array $parts):
     $arg2 = (int) ($parts[3] ?? 0);
 
     if (in_array($action, ['ok', 'no', 'pending', 'banner', 'resend'], true)
-        && !is_admin($uid) && !is_owner($uid)) {
-        Tg::send($chat, '⛔️ این بخش فقط برای مدیر است.');
+        && !admin_can($uid, 'full')) {
+        Tg::send($chat, '⛔️ این بخش فقط برای مالک یا هم‌مالک فعال است.');
         return;
     }
 
@@ -5090,7 +5090,7 @@ function screen_kyc_pending(int|string $chat, ?int $messageId): void
 
 function kyc_admin_review(int $reqId, bool $approve, int $adminId, string $reason = ''): array
 {
-    if (!is_admin($adminId) && !is_owner($adminId)) {
+    if (!admin_can($adminId, 'full')) {
         return [false, 'دسترسی ندارید'];
     }
     $req = DB::one('SELECT * FROM kyc_requests WHERE id=?', [$reqId]);

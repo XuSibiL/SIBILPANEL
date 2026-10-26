@@ -16,6 +16,7 @@ PANEL_HOME_DEFAULT="${PANEL_HOME_DEFAULT:-/opt/sibil}"
 export PANEL_HOME="${PANEL_HOME:-${SIBIL_HOME:-$PANEL_HOME_DEFAULT}}"
 export PANEL_BOT_TOKEN="${PANEL_BOT_TOKEN:-${SIBIL_BOT_TOKEN:-}}"
 export PANEL_ADMINS="${PANEL_ADMINS:-${SIBIL_ADMINS:-}}"
+export PANEL_PRIMARY_OWNER_ID="${PANEL_PRIMARY_OWNER_ID:-}"
 export PANEL_DB="${PANEL_DB:-${SIBIL_DB:-}}"
 export PANEL_WEB_URL="${PANEL_WEB_URL:-${SIBIL_WEB_URL:-}}"
 export PANEL_WEB_PORT="${PANEL_WEB_PORT:-${SIBIL_WEB_PORT:-}}"
@@ -117,6 +118,38 @@ env_set() {
         sed -i "s|^$key=.*|$key=\"$value\"|" "$ENV_FILE"
     else
         printf '%s="%s"\n' "$key" "$value" >>"$ENV_FILE"
+    fi
+}
+
+# نخستین شناسهٔ عددی قابل استفاده از PANEL_ADMINS.
+first_admin_id() {
+    local raw="$1" item
+    raw="$(printf '%s' "$raw" | tr ',\t\r\n' '    ')"
+    for item in $raw; do
+        if [[ "$item" =~ ^[0-9]+$ ]] && [[ "$item" != 0 ]]; then
+            printf '%s' "$item"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# آپدیت نصب قدیمی فقط یک کلید صریح به .env اضافه می‌کند؛ نه .env و نه فهرست
+# مدیران قبلی را بازنویسی نمی‌کند. DB در --migrate با همین مقدار همگام می‌شود.
+ensure_primary_owner_anchor() {
+    [[ -f "$ENV_FILE" ]] || return 0
+    local current admins primary
+    current="$(env_get PANEL_PRIMARY_OWNER_ID)"
+    [[ "$current" =~ ^[0-9]+$ ]] && [[ "$current" != 0 ]] && return 0
+    admins="$(env_get PANEL_ADMINS)"
+    [[ -n "$admins" ]] || admins="$(env_get PANEL_ADMIN_IDS)"
+    primary="$(first_admin_id "$admins" 2>/dev/null || true)"
+    if [[ -n "$primary" ]]; then
+        env_set PANEL_PRIMARY_OWNER_ID "$primary"
+        chmod 600 "$ENV_FILE" 2>/dev/null || true
+        ok "primary owner ID anchored in .env"
+    else
+        warn "PANEL_PRIMARY_OWNER_ID is missing; add a numeric PANEL_ADMINS ID, then run: sibil migrate"
     fi
 }
 
@@ -323,6 +356,11 @@ check_env() {
 cmd_start() {
     check_env || return 1
     if service_active; then ok "already running"; return 0; fi
+    # بدون systemd هم هیچ runner دوم ساخته نمی‌شود؛ خود PHP هم .poll.lock دارد.
+    if ! has_systemd && [[ -n "$(bot_pids)" ]]; then
+        ok "already running (existing polling process)"
+        return 0
+    fi
     if has_systemd && is_root; then
         systemctl reset-failed "$SERVICE" >/dev/null 2>&1 || true
         systemctl start "$SERVICE" && ok "bot service started"
@@ -349,13 +387,14 @@ reset_webhook() {
     local token
     token="$(env_get PANEL_BOT_TOKEN)"
     [[ -n "$token" ]] || return 0
-    curl -fsS --max-time 10 "https://api.telegram.org/bot$token/deleteWebhook?drop_pending_updates=false" \
+    curl -fsS --max-time 10 "https://api.telegram.org/bot$token/deleteWebhook?drop_pending_updates=true" \
         >/dev/null 2>&1 && return 0 || return 1
 }
 
 # هم‌تراز کردن دیتابیس با کد فعلی (idempotent، هیچ داده‌ای پاک نمی‌شود)
 cmd_migrate() {
     check_env || return 1
+    ensure_primary_owner_anchor
     step "Database migration"
     if [[ -f "$PANEL_HOME/migration.php" ]]; then
         PANEL_HOME="$PANEL_HOME" PANEL_ENV="$ENV_FILE" "$PHP_BIN" "$PANEL_HOME/migration.php" "$@"
@@ -796,6 +835,7 @@ github_update() {
             warn "run once: sudo sibil update --force"
         fi
     fi
+    ensure_primary_owner_anchor
     if check_env >/dev/null 2>&1 && "${PHP_BIN:-php}" "$APP" --migrate >/dev/null 2>&1; then
         ok "database migrated to the v$VERSION schema"
     else
@@ -904,7 +944,7 @@ cmd_config() {
         cmd_restart
         return 0
     fi
-    local keys=(PANEL_BOT_TOKEN PANEL_ADMINS PANEL_DOMAIN PANEL_BRAND)
+    local keys=(PANEL_BOT_TOKEN PANEL_ADMINS PANEL_PRIMARY_OWNER_ID PANEL_DOMAIN PANEL_BRAND)
     local key current value
     for key in "${keys[@]}"; do
         current="$(env_get "$key")"

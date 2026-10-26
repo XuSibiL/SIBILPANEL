@@ -16,13 +16,63 @@ function console_lock_text(): string
         . 'برای باز شدن پنل، روی دکمهٔ زیر بزنید و آموزش گام‌به‌گام را انجام دهید.';
 }
 
-function console_home_text(): string
+/** شناسهٔ بازکنندهٔ کنسول؛ روتر آن را در هر callback پر می‌کند. */
+function console_actor_id(?int $uid = null): int
 {
+    if ($uid !== null && $uid > 0) {
+        return $uid;
+    }
+    $active = (int) ($GLOBALS['panel_act_uid'] ?? 0);
+    /* صفحه‌های کنسول فقط از روتر ادمین فراخوانی می‌شوند. اگر یک فراخوانی داخلی/
+       تست، شناسهٔ آخرین خریدار را در global جا گذاشته باشد، آن را بازیگر کنسول
+       فرض نکنیم و به مالک اصلی برگردیم؛ روتر واقعی همیشه شناسهٔ مدیر معتبر دارد. */
+    return $active > 0 && admin_is_console($active) ? $active : primary_owner_id();
+}
+
+function console_home_text(?int $uid = null): string
+{
+    $uid = console_actor_id($uid);
+    $role = admin_role_of($uid);
+    $roleLabel = admin_role_label($role);
     if (report_required()) {
-        /* قفل اجباری: هیچ شمارنده و آماری تا ثبت گروه گزارشات نشان داده نمی‌شود */
         return '⚙️ <b>پنل مدیریت ' . e(brand()) . '</b>' . "\n" . SEP . "\n"
             . console_lock_text();
     }
+
+    /* سطح ۱: فقط رسید کارت‌به‌کارت، بدون آمار مالی یا تنظیمات دیگر. */
+    if (admin_can($uid, 'receipt') && !admin_can($uid, 'full')) {
+        $pending = (int) DB::val("SELECT COUNT(*) FROM receipts WHERE status='pending'", [], 0);
+        return "💳 <b>پنل رسیدهای کارت‌به‌کارت</b>\n" . SEP . "\n"
+            . 'سطح شما: ' . e($roleLabel) . "\n"
+            . '🧾 رسیدهای در انتظار: <b>' . fa_digits($pending) . '</b>' . "\n\n"
+            . '<i>فقط تأیید یا رد رسیدها در این سطح مجاز است.</i>';
+    }
+
+    /* سطح ۲: فقط آمار ساده و کاربران. */
+    if (admin_can($uid, 'stats.simple') && !admin_can($uid, 'full')) {
+        $users = (int) DB::val('SELECT COUNT(*) FROM users', [], 0);
+        $today = (int) DB::val('SELECT COUNT(*) FROM users WHERE created_at>=?', [now_ts() - DAY], 0);
+        $live = (int) DB::val("SELECT COUNT(*) FROM panels WHERE status='active'", [], 0);
+        return "💬 <b>پنل پشتیبانی</b>\n" . SEP . "\n"
+            . 'سطح شما: ' . e($roleLabel) . "\n"
+            . '👥 کاربران: ' . fa_digits($users) . ' · امروز: ' . fa_digits($today) . "\n"
+            . '📦 پنل‌های فعال: ' . fa_digits($live) . "\n\n"
+            . '<i>از جستجوی کاربران برای پاسخ‌گویی و پیگیری استفاده کنید.</i>';
+    }
+
+    /* سطح ۳: پنل‌ها، سرورها، تمدید و لاگ امن؛ نه رازها و نه مالی. */
+    if (admin_can($uid, 'ops') && !admin_can($uid, 'full')) {
+        $pgs = (int) DB::val('SELECT COUNT(*) FROM pg_panels WHERE active=1', [], 0);
+        $live = (int) DB::val("SELECT COUNT(*) FROM panels WHERE status='active'", [], 0);
+        $susp = (int) DB::val("SELECT COUNT(*) FROM panels WHERE status='suspended'", [], 0);
+        return "🛠 <b>پنل عملیات فنی</b>\n" . SEP . "\n"
+            . 'سطح شما: ' . e($roleLabel) . "\n"
+            . '🔌 سرور/پنل متصل: ' . fa_digits($pgs) . "\n"
+            . '📦 پنل‌های فعال: ' . fa_digits($live) . ' · معلق: ' . fa_digits($susp) . "\n\n"
+            . '<i>کلیدهای API، درگاه‌ها، تنظیمات ربات و دیتابیس در این سطح پنهان‌اند.</i>';
+    }
+
+    /* مالک اصلی و هم‌مالک: منوی کامل. */
     $users = (int) DB::val('SELECT COUNT(*) FROM users', [], 0);
     $activeUsers = (int) DB::val("SELECT COUNT(*) FROM users WHERE tg_id IN "
         . '(SELECT DISTINCT tg_id FROM panels WHERE status=\'active\')', [], 0);
@@ -31,13 +81,12 @@ function console_home_text(): string
     $pending = (int) DB::val("SELECT COUNT(*) FROM receipts WHERE status='pending'", [], 0);
     $pgs = (int) DB::val('SELECT COUNT(*) FROM pg_panels WHERE active=1', [], 0);
     $notice = '';
-    /* نشان نسخهٔ تازه: خواندن با کش کوتاه تا هر بار باز کردن پنل، به گیت‌هاب
-       درخواست نزند؛ دکمهٔ «بررسی» و «بروزرسانی» همیشه تازه می‌خواند */
     if (update_is_newer(update_remote_version(false)['version'], PANEL_VERSION)) {
         $notice .= "\n⬆️ <b>نسخهٔ تازه در گیت‌هاب موجود است</b> — «⚙️ تنظیمات ربات» → «⬆️ بروزرسانی ربات»\n";
     }
     return '⚙️ <b>پنل مدیریت ' . e(brand()) . '</b>' . "\n"
         . SEP . "\n"
+        . 'سطح شما: ' . e($roleLabel) . "\n"
         . $notice
         . '👥 کاربران کل: ' . fa_digits($users) . ' | 🟢 فعال: ' . fa_digits($activeUsers) . "\n"
         . '🔌 پنل‌های متصل: ' . fa_digits($pgs) . ' | 📦 محصولات: ' . fa_digits($products) . "\n"
@@ -47,16 +96,43 @@ function console_home_text(): string
         . 'یک بخش را انتخاب کنید:';
 }
 
-function console_kb(): array
+function console_kb(?int $uid = null): array
 {
+    $uid = console_actor_id($uid);
     if (report_required()) {
-        /* فقط یک دکمه: تنظیم گروه گزارشات — بقیهٔ مدیریت قفل است */
+        if (admin_can($uid, 'full')) {
+            return kb_clean([
+                [btn('📢 تنظیم گپ گزارشات (الزامی)', 'ad:report:setup', null, 'success')],
+            ]);
+        }
         return kb_clean([
-            [btn('📢 تنظیم گپ گزارشات (الزامی)', 'ad:report:setup', null, 'success')],
+            [btn('🔄 بررسی دوباره', 'ad:home', null, 'primary')],
+            [btn('🔙 بازگشت به منوی کاربری', 'home', null, 'danger')],
         ]);
     }
-    /* منوی مدیریت — دقیقاً دو ستون، بدون دکمهٔ تکراری و بدون دکمهٔ شیشه‌ای */
-    return kb_clean([
+    if (admin_can($uid, 'receipt') && !admin_can($uid, 'full')) {
+        return kb_clean([
+            [btn('🧾 رسیدهای کارت‌به‌کارت', 'ad:receipts', null, 'success')],
+            [btn('🔙 بازگشت به منوی کاربری', 'home', null, 'danger')],
+        ]);
+    }
+    if (admin_can($uid, 'stats.simple') && !admin_can($uid, 'full')) {
+        return kb_clean([
+            [btn('👥 کاربران و پاسخ‌گویی', 'ad:users', null, 'primary'),
+             btn('📊 آمار ساده', 'ad:stats', null, 'primary')],
+            [btn('🔙 بازگشت به منوی کاربری', 'home', null, 'danger')],
+        ]);
+    }
+    if (admin_can($uid, 'ops') && !admin_can($uid, 'full')) {
+        return kb_clean([
+            [btn('🔌 سرورها و پنل‌ها', 'ad:panel', null, 'primary'),
+             btn('🏢 پنل‌های فروخته‌شده', 'ad:panels', null, 'primary')],
+            [btn('🔍 جستجو / تمدید پنل مشتری', 'ad:find', null, 'success'),
+             btn('📜 لاگ عملیات', 'ad:ops:logs', null, 'primary')],
+            [btn('🔙 بازگشت به منوی کاربری', 'home', null, 'danger')],
+        ]);
+    }
+    $rows = [
         [btn('📊 آمار و گزارشات', 'ad:stats', null, 'primary'),
          btn('🧾 رسیدها و مالی', 'ad:finance', null, 'primary')],
         [btn('👥 مدیریت کاربران', 'ad:users', null, 'primary'),
@@ -66,8 +142,14 @@ function console_kb(): array
         [btn('🔍 جستجوی سفارشات', 'ad:find', null, 'primary'),
          btn('📢 پیام همگانی', 'ad:broadcast', null, 'success')],
         [btn('📢 قفل کانال اجباری', 'ad:fj', null, 'success')],
-        [btn('🔙 بازگشت به منوی کاربری', 'home', null, 'danger')],
-    ]);
+    ];
+    /* فقط مالک اصلی می‌تواند به نقش‌ها دست بزند؛ هم‌مالک منوی کامل دارد اما
+       هرگز نمی‌تواند مالک یا هم‌مالک دیگری را عزل کند. */
+    if (admin_can_manage_roles($uid)) {
+        $rows[] = [btn('👥 تعیین مالک و ادمین‌ها', 'ad:staff', null, 'success')];
+    }
+    $rows[] = [btn('🔙 بازگشت به منوی کاربری', 'home', null, 'danger')];
+    return kb_clean($rows);
 }
 
 function group_kb(string $group): array
@@ -96,15 +178,241 @@ function group_kb(string $group): array
     return $rows;
 }
 
-function screen_console(int|string $chat, ?int $messageId): void
+function screen_console(int|string $chat, ?int $messageId, ?int $uid = null): void
 {
-    /* پنل مدیریت نقطهٔ شروع است؛ دکمهٔ «بازگشت» روی آن معنا ندارد */
     $GLOBALS['panel_console_root'] = true;
     try {
-        Tg::show($chat, $messageId, console_home_text(), console_kb());
+        $actor = console_actor_id($uid);
+        Tg::show($chat, $messageId, console_home_text($actor), console_kb($actor));
     } finally {
         $GLOBALS['panel_console_root'] = false;
     }
+}
+
+/** آخرین لاگ‌ها برای اپراتور؛ رازهای شناخته‌شده پیش از نمایش ماسک می‌شوند. */
+function ops_log_safe_line(string $line): string
+{
+    $line = preg_replace('/\b\d{6,12}:[A-Za-z0-9_-]{20,}\b/', '[BOT_TOKEN_HIDDEN]', $line) ?? $line;
+    $line = preg_replace('/\b(?:pg_key|apikey)-[A-Za-z0-9_-]+\b/i', '[API_KEY_HIDDEN]', $line) ?? $line;
+    $line = preg_replace('/\b(?:ghp|github_pat)_[A-Za-z0-9_]+\b/i', '[GITHUB_TOKEN_HIDDEN]', $line) ?? $line;
+    /* پاسخ خام API گاهی JSON یا query string حاوی راز دارد. */
+    $line = preg_replace('/([?&](?:token|api[_-]?key|key|secret|password)=)[^&\s]+/i',
+        '$1[SECRET_HIDDEN]', $line) ?? $line;
+    $line = preg_replace('/((?:api[_-]?key|token|secret|password|authorization)\s*["\']?\s*[:=]\s*["\']?)[^,\s"\'}]+/i',
+        '$1[SECRET_HIDDEN]', $line) ?? $line;
+    $line = preg_replace('/\b(?:sqlite|mysql|pgsql):[^\s]+/i', '[DATABASE_DSN_HIDDEN]', $line) ?? $line;
+    return $line;
+}
+
+function screen_ops_logs(int|string $chat, ?int $messageId): void
+{
+    $paths = [log_dir() . '/bot_error.log', log_dir() . '/device_guard.log', panel_home() . '/sibil.log'];
+    $lines = [];
+    foreach ($paths as $path) {
+        if (!is_file($path) || !is_readable($path)) {
+            continue;
+        }
+        $all = @file($path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [];
+        foreach (array_slice($all, -8) as $line) {
+            $lines[] = ops_log_safe_line((string) $line);
+        }
+    }
+    $body = $lines ? implode("\n", array_slice($lines, -20)) : 'لاگ قابل نمایشی ثبت نشده است.';
+    $body = mb_substr($body, 0, 3200);
+    Tg::show($chat, $messageId, "📜 <b>لاگ عملیات</b>\n" . SEP . "\n<pre>"
+        . e($body) . '</pre>',
+        [[btn('🔄 به‌روزرسانی', 'ad:ops:logs', null, 'primary')],
+         [btn('« مدیریت', 'ad:home', null, 'danger')]]);
+}
+
+/** نام کوتاه مدیر، نخست به‌صورت متن ساده برای دکمه و سپس HTML امن برای پیام. */
+function admin_staff_plain_display(int $targetId): string
+{
+    $user = user_get($targetId);
+    if ($user === null) {
+        return (string) $targetId;
+    }
+    $name = trim((string) ($user['name'] ?? ''));
+    $uname = trim((string) ($user['uname'] ?? ''));
+    $label = $name !== '' ? mb_substr($name, 0, 22) : ($uname !== '' ? '@' . $uname : 'کاربر');
+    return $label . ' · ' . $targetId;
+}
+
+function admin_staff_display(int $targetId): string
+{
+    $user = user_get($targetId);
+    if ($user === null) {
+        return '<code>' . $targetId . '</code>';
+    }
+    $name = trim((string) ($user['name'] ?? ''));
+    $uname = trim((string) ($user['uname'] ?? ''));
+    $label = $name !== '' ? mb_substr($name, 0, 22) : ($uname !== '' ? '@' . $uname : 'کاربر');
+    return e($label) . ' · <code>' . $targetId . '</code>';
+}
+
+/** فهرست نقش‌های مدیریتی؛ تنها مالک اصلی به این صفحه دسترسی دارد. */
+function screen_admin_staff(int|string $chat, ?int $messageId, int $page = 1): void
+{
+    $actor = console_actor_id();
+    if (!admin_can_manage_roles($actor)) {
+        Tg::show($chat, $messageId, '⛔️ فقط مالک اصلی می‌تواند سطح دسترسی تعیین کند.',
+            [[btn('« مدیریت', 'ad:home', null, 'danger')]]);
+        return;
+    }
+    $all = admin_role_rows();
+    $perPage = 7;
+    $pages = max(1, (int) ceil(count($all) / $perPage));
+    $page = max(1, min($page, $pages));
+    $slice = array_slice($all, ($page - 1) * $perPage, $perPage);
+    $primary = primary_owner_id();
+    $text = '👥 <b>تعیین مالک و ادمین‌ها</b>' . "\n" . SEP . "\n"
+        . '👑 مالک اصلیِ قفل‌شده: <code>' . $primary . "</code>\n"
+        . '<i>شناسهٔ مالک اصلی در .env و پایگاه‌داده همگام است؛ حذف یا تنزل آن ممکن نیست.</i>'
+        . "\n\n" . 'مدیران فعال: <b>' . fa_digits(count($all)) . '</b>'
+        . ' · صفحه ' . fa_digits($page) . ' از ' . fa_digits($pages) . "\n"
+        . SEP . "\n" . 'روی هر نفر بزنید تا سطح دسترسی‌اش را ببینید یا تغییر دهید.';
+    $rows = [];
+    foreach ($slice as $row) {
+        $id = (int) ($row['tg_id'] ?? 0);
+        $role = (string) ($row['role'] ?? '');
+        if ($id <= 0) {
+            continue;
+        }
+        $lock = $role === 'owner' ? ' 🔒' : '';
+        $rows[] = [btn(admin_role_label($role) . $lock . ' · ' . admin_staff_plain_display($id),
+            'ad:staff:member:' . $id, null, $role === 'owner' ? 'primary' : 'auto')];
+    }
+    $rows[] = [btn('➕ افزودن ادمین با شناسهٔ عددی', 'ad:staff:add', null, 'success')];
+    $nav = [];
+    if ($page > 1) {
+        $nav[] = btn('› صفحهٔ قبل', 'ad:staff:page:' . ($page - 1));
+    }
+    if ($page < $pages) {
+        $nav[] = btn('صفحهٔ بعد ‹', 'ad:staff:page:' . ($page + 1));
+    }
+    if ($nav !== []) {
+        $rows[] = $nav;
+    }
+    $rows[] = [btn('« مدیریت', 'ad:home', null, 'danger')];
+    Tg::show($chat, $messageId, $text, $rows);
+}
+
+/** کارت یک مدیر و انتخاب سطح او. */
+function screen_admin_staff_member(int|string $chat, ?int $messageId, int $targetId): void
+{
+    $primary = primary_owner_id();
+    $role = admin_role_of($targetId);
+    if ($targetId <= 0 || $role === '') {
+        screen_admin_staff($chat, $messageId);
+        return;
+    }
+    if ($targetId === $primary) {
+        Tg::show($chat, $messageId,
+            '👑 <b>مالک اصلی</b>' . "\n" . SEP . "\n"
+            . 'حساب: ' . admin_staff_display($targetId) . "\n"
+            . 'سطح: ' . admin_role_label('owner') . "\n\n"
+            . '<i>این شناسه از .env خوانده و در DB همگام می‌شود؛ هیچ ادمینی، حتی هم‌مالک، '
+            . 'نمی‌تواند آن را حذف یا تنزل دهد.</i>',
+            [[btn('« فهرست مدیران', 'ad:staff', null, 'danger')]]);
+        return;
+    }
+    $text = '👤 <b>سطح دسترسی مدیر</b>' . "\n" . SEP . "\n"
+        . 'حساب: ' . admin_staff_display($targetId) . "\n"
+        . 'سطح فعلی: <b>' . admin_role_label($role) . "</b>\n\n"
+        . 'یک سطح را انتخاب کنید. تغییر سطح همان لحظه اعمال می‌شود و ویزاردهای قبلی بسته می‌شوند.';
+    $rows = [];
+    foreach (admin_role_choices() as $key => $label) {
+        $rows[] = [btn(($key === $role ? '✅ ' : '') . $label,
+            'ad:staff:assign:' . $targetId . ':' . $key, null,
+            $key === $role ? 'success' : 'primary')];
+    }
+    $rows[] = [btn('🗑 حذف کامل دسترسی', 'ad:staff:remove:' . $targetId, null, 'danger')];
+    $rows[] = [btn('« فهرست مدیران', 'ad:staff', null, 'danger')];
+    Tg::show($chat, $messageId, $text, $rows);
+}
+
+/** مرحلهٔ دوم افزودن مدیر پس از دریافت شناسهٔ عددی. */
+function screen_admin_staff_role_picker(int|string $chat, ?int $messageId, int $targetId): void
+{
+    if ($targetId <= 0) {
+        screen_admin_staff($chat, $messageId);
+        return;
+    }
+    if (admin_is_primary($targetId)) {
+        screen_admin_staff_member($chat, $messageId, $targetId);
+        return;
+    }
+    $current = admin_role_of($targetId);
+    $rows = [];
+    foreach (admin_role_choices() as $key => $label) {
+        $rows[] = [btn(($key === $current ? '✅ ' : '') . $label,
+            'ad:staff:assign:' . $targetId . ':' . $key, null,
+            $key === $current ? 'success' : 'primary')];
+    }
+    $rows[] = [btn('« فهرست مدیران', 'ad:staff', null, 'danger')];
+    Tg::show($chat, $messageId, '➕ <b>افزودن یا تغییر ادمین</b>' . "\n" . SEP . "\n"
+        . 'حساب: ' . admin_staff_display($targetId) . "\n\n"
+        . 'اکنون سطح دسترسی را انتخاب کنید:', $rows);
+}
+
+/** callbackهای مدیریت نقش؛ گارد مرکزی نیز پیش از این تابع مالک اصلی را کنترل می‌کند. */
+function admin_staff_callback(int $uid, int|string $chat, ?int $messageId, string $cbId,
+                              array $parts): void
+{
+    if (!admin_can_manage_roles($uid)) {
+        Tg::answer($cbId, '⛔️ فقط مالک اصلی مجاز است.', true);
+        screen_console($chat, $messageId, $uid);
+        return;
+    }
+    $op = (string) ($parts[2] ?? '');
+    if ($op === '' || $op === 'page') {
+        screen_admin_staff($chat, $messageId, (int) ($parts[3] ?? 1));
+        return;
+    }
+    if ($op === 'add') {
+        wiz_start($uid, 'admin_staff_target', [
+            step_def('tg_id', 'شناسهٔ عددی تلگرام ادمین را بفرستید.' . "\n"
+                . '<i>نام کاربری کافی نیست؛ فقط عدد معتبر تلگرام را وارد کنید.</i>',
+                'int', null, '👥 افزودن ادمین'),
+        ]);
+        return;
+    }
+    $targetId = (int) ($parts[3] ?? 0);
+    if ($op === 'member') {
+        screen_admin_staff_member($chat, $messageId, $targetId);
+        return;
+    }
+    if ($op === 'assign') {
+        $role = (string) ($parts[4] ?? '');
+        [$ok, $note] = admin_role_assign($uid, $targetId, $role);
+        Tg::answer($cbId, $note, !$ok);
+        if ($ok) {
+            screen_admin_staff_member($chat, $messageId, $targetId);
+        } else {
+            screen_admin_staff($chat, $messageId);
+        }
+        return;
+    }
+    if ($op === 'remove') {
+        if ($targetId <= 0 || admin_is_primary($targetId)) {
+            Tg::answer($cbId, 'مالک اصلی قفل است.', true);
+            screen_admin_staff_member($chat, $messageId, $targetId);
+            return;
+        }
+        Tg::show($chat, $messageId, '🗑 <b>حذف دسترسی ادمین</b>' . "\n\n"
+            . 'دسترسی «' . admin_staff_display($targetId) . '» کامل حذف شود؟' . "\n"
+            . '<i>اگر هم‌مالک باشد نیز فقط مالک اصلی می‌تواند او را حذف کند.</i>',
+            [[btn('🗑 بله، حذف شود', 'ad:staff:removeok:' . $targetId, null, 'danger')],
+             [btn('« انصراف', 'ad:staff:member:' . $targetId, null, 'primary')]]);
+        return;
+    }
+    if ($op === 'removeok') {
+        [$ok, $note] = admin_role_remove($uid, $targetId);
+        Tg::answer($cbId, $note, !$ok);
+        screen_admin_staff($chat, $messageId);
+        return;
+    }
+    screen_admin_staff($chat, $messageId);
 }
 
 function screen_categories(int|string $chat, ?int $messageId): void
@@ -241,14 +549,20 @@ const PRODUCT_FIELDS = [
 
 function screen_pg_panels(int|string $chat, ?int $messageId): void
 {
+    $canFull = admin_can(console_actor_id(), 'full');
     $panels = DB::all('SELECT * FROM pg_panels ORDER BY is_default DESC, id');
     if (!$panels) {
-        Tg::show($chat, $messageId,
-            "🔌 <b>پنل‌های پاسارگارد</b>\n\nهنوز هیچ پنلی وصل نیست.\n"
-            . 'با «➕ افزودن پنل» نام، آدرس و <b>کلید API</b> پنل را بدهید.',
-            [[btn('➕ افزودن پنل', 'ad:pg:new', null, 'success')],
-             [btn('⚙️ تنظیمات اتصال', 'ad:setg:paneltest')],
-             [btn('« مدیریت', 'ad:home', null, 'danger')]]);
+        $rows = [[btn('« مدیریت', 'ad:home', null, 'danger')]];
+        $hint = 'هنوز هیچ پنلی وصل نیست.';
+        if ($canFull) {
+            $rows = [[btn('➕ افزودن پنل', 'ad:pg:new', null, 'success')],
+                [btn('⚙️ تنظیمات اتصال', 'ad:setg:paneltest')],
+                [btn('« مدیریت', 'ad:home', null, 'danger')]];
+            $hint .= "\nبا «➕ افزودن پنل» نام، آدرس و <b>کلید API</b> پنل را بدهید.";
+        } else {
+            $hint .= "\n<i>افزودن پنل و کلید API فقط برای مالک یا هم‌مالک مجاز است.</i>";
+        }
+        Tg::show($chat, $messageId, "🔌 <b>پنل‌های پاسارگارد</b>\n\n" . $hint, $rows);
         return;
     }
     $text = "🔌 <b>پنل‌های پاسارگارد</b>\n" . SEP . "\n"
@@ -256,7 +570,7 @@ function screen_pg_panels(int|string $chat, ?int $messageId): void
         . SEP . "\n\n";
     /* تست اتصال دستی حذف شد؛ اتصال هر پنل همان لحظهٔ ورود به داشبورد
        خودکار بررسی می‌شود */
-    $rows = [[btn('➕ افزودن پنل', 'ad:pg:new', null, 'success')]];
+    $rows = $canFull ? [[btn('➕ افزودن پنل', 'ad:pg:new', null, 'success')]] : [];
     foreach ($panels as $panel) {
         $flags = [];
         if ((int) $panel['is_default'] === 1) {
@@ -274,7 +588,9 @@ function screen_pg_panels(int|string $chat, ?int $messageId): void
         $rows[] = [btn(((int) $panel['is_default'] === 1 ? '⭐ ' : '') . $panel['name'],
             'ad:pg:' . $panel['id'], null, (int) $panel['active'] === 1 ? 'primary' : 'danger')];
     }
-    $rows[] = [btn('⚙️ تنظیمات اتصال', 'ad:setg:paneltest')];
+    if ($canFull) {
+        $rows[] = [btn('⚙️ تنظیمات اتصال', 'ad:setg:paneltest')];
+    }
     $rows[] = [btn('« مدیریت', 'ad:home', null, 'danger')];
     Tg::show($chat, $messageId, $text . 'روی هر پنل بزنید تا داشبوردش باز شود.', $rows);
 }
@@ -339,6 +655,7 @@ function pg_size(int $bytes): string
  */
 function screen_pg_panel(int|string $chat, ?int $messageId, int $panelId): void
 {
+    $canFull = admin_can(console_actor_id(), 'full');
     $panel = DB::one('SELECT * FROM pg_panels WHERE id=?', [$panelId]);
     if ($panel === null) {
         screen_pg_panels($chat, $messageId);
@@ -350,6 +667,18 @@ function screen_pg_panel(int|string $chat, ?int $messageId, int $panelId): void
     $sold = (int) DB::val('SELECT COUNT(*) FROM panels WHERE pg_panel_id=?', [$panelId], 0);
     $traffic = (int) DB::val('SELECT COALESCE(SUM(last_usage),0) FROM panels WHERE pg_panel_id=?',
         [$panelId], 0);
+    $serviceSummary = $canFull
+        ? '💰 <b>وضعیت فروش این پنل</b>' . "\n"
+            . '• تعداد کل فروش: ' . fa_digits($sales['count']) . ' عدد' . "\n"
+            . '• مجموع فروش: ' . money($sales['total']) . "\n"
+            . '• محصولات روی این پنل: ' . fa_digits($products)
+            . ' · پنل‌های فروخته‌شده: ' . fa_digits($sold) . "\n"
+        : '📦 <b>وضعیت سرویس‌های این پنل</b>' . "\n"
+            . '• محصولات روی این پنل: ' . fa_digits($products)
+            . ' · پنل‌های فروخته‌شده: ' . fa_digits($sold) . "\n";
+    $offlineHint = $canFull
+        ? 'می‌توانید پنل را از ربات حذف کنید.'
+        : 'با مالک یا هم‌مالک برای تغییر اتصال هماهنگ کنید.';
 
     /* ورود به داشبورد = تست خودکار اتصال؛ هیچ دکمهٔ تست دستی لازم نیست */
     $head = '📊 <b>آمار و وضعیت پنل: ' . e((string) $panel['name']) . '</b>' . "\n"
@@ -359,7 +688,7 @@ function screen_pg_panel(int|string $chat, ?int $messageId, int $panelId): void
             . '⚠️ خطا در برقراری ارتباط با پنل پاسارگاد (سرور در دسترس نیست یا اطلاعات '
             . 'لاگین نامعتبر است).' . "\n\n"
             . ($live['error'] !== '' ? 'جزئیات خطا: <code>'
-                . e(mb_substr($live['error'], 0, 160)) . "</code>\n\n" : '')
+                . e(mb_substr(ops_log_safe_line((string) $live['error']), 0, 160)) . "</code>\n\n" : '')
             . '📡 وضعیت اتصال: قطع ❌' . "\n"
             . SEP . "\n"
             . 'آدرس ثبت‌شده: <code>' . e(normalize_panel_url((string) $panel['url'])) . '</code>'
@@ -368,8 +697,8 @@ function screen_pg_panel(int|string $chat, ?int $messageId, int $panelId): void
             . 'وضعیت در ربات: ' . ((int) $panel['active'] === 1 ? '🟢 روشن' : '🔴 خاموش')
             . ((int) $panel['is_default'] === 1 ? ' · پیش‌فرض ⭐' : '') . "\n"
             . SEP . "\n"
-            . '<i>آمار جعلی یا خالی نمایش داده نمی‌شود. اگر سرور از کار افتاده، همین‌جا '
-            . 'می‌توانید پنل را از ربات حذف کنید.</i>';
+            . '<i>آمار جعلی یا خالی نمایش داده نمی‌شود. اگر سرور از کار افتاده، '
+            . $offlineHint . '</i>';
     } else {
         $text = $head
             . '📡 وضعیت اتصال: متصل و آنلاین ✅' . "\n"
@@ -382,35 +711,36 @@ function screen_pg_panel(int|string $chat, ?int $messageId, int $panelId): void
             . '• رم کل سرور: ' . pg_size($live['mem_total']) . "\n"
             . '• مصرف رم پنل: ' . pg_size($live['mem_used']) . "\n"
             . '• ترافیک مصرف‌شدهٔ پنل‌های فروخته‌شده: ' . pg_size($traffic) . "\n\n"
-            . '💰 <b>وضعیت فروش این پنل</b>' . "\n"
-            . '• تعداد کل فروش: ' . fa_digits($sales['count']) . ' عدد' . "\n"
-            . '• مجموع فروش: ' . money($sales['total']) . "\n"
-            . '• محصولات روی این پنل: ' . fa_digits($products)
-            . ' · پنل‌های فروخته‌شده: ' . fa_digits($sold) . "\n"
+            . $serviceSummary
             . SEP . "\n"
             . 'آدرس: <code>' . e(normalize_panel_url((string) $panel['url'])) . '</code>' . "\n"
             . 'وضعیت در ربات: ' . ((int) $panel['active'] === 1 ? '🟢 روشن' : '🔴 خاموش')
             . ((int) $panel['is_default'] === 1 ? ' · پیش‌فرض ⭐' : '') . "\n"
             . 'آخرین اتصال موفق: ' . fa_ts((int) $panel['last_ok_at']) . "\n"
             . (!empty($panel['last_error']) ? 'آخرین خطا: <code>'
-                . e(mb_substr((string) $panel['last_error'], 0, 160)) . "</code>\n" : '')
+                . e(mb_substr(ops_log_safe_line((string) $panel['last_error']), 0, 160)) . "</code>\n" : '')
             . "\n" . 'برای مدیریت این پنل یکی از گزینه‌های زیر را انتخاب کنید:';
     }
 
-    Tg::show($chat, $messageId, $text, [
+    /* اپراتور فقط ابزارهای روزانهٔ سرور را می‌بیند؛ اتصال و ساختار سرور
+       (آدرس، کلید، حذف، دسته، پیش‌فرض و روشن/خاموش) برای مالک/هم‌مالک است. */
+    $rows = [
         [btn('🔄 بروزرسانی آمار', 'ad:pg:' . $panelId, null, 'success'),
-         btn('🗑 حذف این پنل از ربات', 'ad:pg:' . $panelId . ':del', null, 'danger')],
-        [btn('📱 کنترل دستگاه‌ها (HWID)', 'ad:pg:' . $panelId . ':dev'),
-         btn('✏️ ویرایش نام / آدرس', 'ad:pg:' . $panelId . ':edit')],
+         btn('📱 کنترل دستگاه‌ها (HWID)', 'ad:pg:' . $panelId . ':dev')],
         [btn('🔄 همگام‌سازی کاربران', 'ad:pg:' . $panelId . ':sync'),
          btn('🎭 نقش‌ها', 'ad:pg:' . $panelId . ':roles')],
-        [btn('🗂 دسته', 'ad:pg:' . $panelId . ':cat')],
-        [btn('⭐ پیش‌فرض', 'ad:pg:' . $panelId . ':default'),
-         btn((int) $panel['active'] === 1 ? '🔴 خاموش کنید' : '🟢 روشن کنید',
-             'ad:pg:' . $panelId . ':toggle', null, 'danger')],
-        [btn('🔑 تغییر کلید API', 'ad:pg:' . $panelId . ':key', null, 'success')],
-        [btn('🔙 بازگشت به لیست پنل‌ها', 'ad:panel', null, 'danger')],
-    ]);
+    ];
+    if ($canFull) {
+        $rows[] = [btn('🗑 حذف این پنل از ربات', 'ad:pg:' . $panelId . ':del', null, 'danger')];
+        $rows[] = [btn('✏️ ویرایش نام / آدرس', 'ad:pg:' . $panelId . ':edit'),
+            btn('🔑 تغییر کلید API', 'ad:pg:' . $panelId . ':key', null, 'success')];
+        $rows[] = [btn('🗂 دسته', 'ad:pg:' . $panelId . ':cat')];
+        $rows[] = [btn('⭐ پیش‌فرض', 'ad:pg:' . $panelId . ':default'),
+            btn((int) $panel['active'] === 1 ? '🔴 خاموش کنید' : '🟢 روشن کنید',
+                'ad:pg:' . $panelId . ':toggle', null, 'danger')];
+    }
+    $rows[] = [btn('🔙 بازگشت به لیست پنل‌ها', 'ad:panel', null, 'danger')];
+    Tg::show($chat, $messageId, $text, $rows);
 }
 
 /**
@@ -419,6 +749,7 @@ function screen_pg_panel(int|string $chat, ?int $messageId, int $panelId): void
  */
 function screen_pg_devices(int|string $chat, ?int $messageId, int $panelId): void
 {
+    $canFull = admin_can(console_actor_id(), 'full');
     $panel = DB::one('SELECT * FROM pg_panels WHERE id=?', [$panelId]);
     if ($panel === null) {
         screen_pg_panels($chat, $messageId);
@@ -447,14 +778,14 @@ function screen_pg_devices(int|string $chat, ?int $messageId, int $panelId): voi
                 . fa_digits($leftMin) . ' دقیقه مانده' . "\n";
         }
     }
-    $rows = [
-        [btn('🔄 بررسی دوباره', 'ad:pg:' . $panelId . ':dev', null, 'success')],
-        [btn($guard ? '🔴 خاموش کردن کنترل' : '🟢 روشن کردن کنترل',
-            'ad:tgl:device_guard_on:devices', null, $guard ? 'danger' : 'success')],
-        [btn('✏️ سقف دستگاه', 'ad:set:device_max_devices'),
-         btn('✏️ مدت جریمه', 'ad:set:device_cut_minutes')],
-        [btn('« داشبورد پنل', 'ad:pg:' . $panelId, null, 'danger')],
-    ];
+    $rows = [[btn('🔄 بررسی دوباره', 'ad:pg:' . $panelId . ':dev', null, 'success')]];
+    if ($canFull) {
+        $rows[] = [btn($guard ? '🔴 خاموش کردن کنترل' : '🟢 روشن کردن کنترل',
+            'ad:tgl:device_guard_on:devices', null, $guard ? 'danger' : 'success')];
+        $rows[] = [btn('✏️ سقف دستگاه', 'ad:set:device_max_devices'),
+            btn('✏️ مدت جریمه', 'ad:set:device_cut_minutes')];
+    }
+    $rows[] = [btn('« داشبورد پنل', 'ad:pg:' . $panelId, null, 'danger')];
     Tg::show($chat, $messageId, $text, $rows);
 }
 

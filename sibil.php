@@ -21,7 +21,7 @@
 
 declare(strict_types=1);
 
-const PANEL_VERSION = '3.16.5';
+const PANEL_VERSION = '3.17.0';
 const IRAN_OFFSET   = 3.5 * 3600;
 const DAY           = 86400;
 
@@ -132,20 +132,22 @@ function admin_ids(): array
     return $ids;
 }
 
-/** شناسهٔ حساب‌های مدیریتی: مالک و ادمین‌ها — این‌ها «کاربر» نیستند */
+/** شناسهٔ حساب‌های مدیریتیِ فعال — نقش‌ها از admin_roles خوانده می‌شوند.
+ *  PANEL_ADMINS فقط برای تعیین مالکِ قفل‌شده و مهاجرت یک‌بارهٔ نصب قدیمی است. */
 function staff_ids(): array
 {
-    $ids = [];
-    $owner = owner_id();
-    if ($owner > 0) {
-        $ids[] = $owner;
-    }
-    foreach (admin_ids() as $adminId) {
-        if (!in_array($adminId, $ids, true)) {
-            $ids[] = $adminId;
+    if (function_exists('admin_role_rows')) {
+        $ids = [];
+        foreach (admin_role_rows() as $row) {
+            $id = (int) ($row['tg_id'] ?? 0);
+            if ($id > 0 && !in_array($id, $ids, true)) {
+                $ids[] = $id;
+            }
         }
+        return $ids;
     }
-    return $ids;
+    $owner = primary_owner_env_id();
+    return $owner > 0 ? [$owner] : [];
 }
 
 function is_staff(int $uid): bool
@@ -187,30 +189,28 @@ function bot_self_sql(string $column = 'tg_id', string $prefix = ' AND '): strin
     return $self > 0 ? $prefix . $column . '<>' . $self : '';
 }
 
+/** مدیر فعال: مالک اصلی یا یکی از نقش‌های دیتابیسی. */
 function is_admin(int $uid): bool
 {
-    return in_array($uid, admin_ids(), true);
+    return function_exists('admin_is_console') ? admin_is_console($uid) : false;
 }
 
-/** مالک ربات: تنها کسی که پنل مدیریت برایش باز است */
+/** مالک ربات: فقط مالک اصلیِ قفل‌شده؛ هم‌مالک در این تعریف نیست. */
 function owner_id(): int
 {
-    $row = DB::one("SELECT value FROM settings WHERE key='owner_id'");
-    $id = $row === null ? 0 : (int) $row['value'];
-    if ($id > 0) {
-        return $id;
-    }
-    $first = admin_ids()[0] ?? 0;
-    if ($first > 0) {
-        set_put('owner_id', (string) $first);
-        return $first;
-    }
-    return 0;
+    return function_exists('primary_owner_id') ? primary_owner_id() : primary_owner_env_id();
 }
 
 function is_owner(int $uid): bool
 {
-    return $uid > 0 && $uid === owner_id();
+    return function_exists('admin_is_primary') ? admin_is_primary($uid)
+        : ($uid > 0 && $uid === owner_id());
+}
+
+/** آیا این کاربر برای ورود به کنسول مدیریت مجاز است؟ */
+function is_console_admin(int $uid): bool
+{
+    return function_exists('admin_is_console') ? admin_is_console($uid) : is_owner($uid);
 }
 
 /** آدرس داشبورد پنل کاربر (همان لینکی که خودتان باز می‌کنید) */
@@ -785,6 +785,17 @@ CREATE TABLE IF NOT EXISTS receipts (
     card_msg    INTEGER
 );
 
+/* هر رسید برای هر مسئول مالی یک کارت خصوصی دارد؛ تا پس از تأیید، همهٔ
+   کارت‌ها (نه فقط اولین نفر) بسته و وضعیتشان یکسان شود. */
+CREATE TABLE IF NOT EXISTS receipt_cards (
+    receipt_id   INTEGER NOT NULL,
+    chat_id      TEXT    NOT NULL,
+    message_id   INTEGER NOT NULL,
+    content_type TEXT    NOT NULL DEFAULT 'photo',
+    PRIMARY KEY (receipt_id, chat_id, message_id)
+);
+CREATE INDEX IF NOT EXISTS receipt_cards_receipt_idx ON receipt_cards(receipt_id);
+
 CREATE TABLE IF NOT EXISTS payments (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     order_id    INTEGER NOT NULL,
@@ -849,6 +860,15 @@ CREATE TABLE IF NOT EXISTS discount_uses (
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT
+);
+
+/* نقش‌های چندسطحی ادمین؛ مالک اصلی عمداً این‌جا ذخیره نمی‌شود و از .env قفل است. */
+CREATE TABLE IF NOT EXISTS admin_roles (
+    tg_id       INTEGER PRIMARY KEY,
+    role        TEXT NOT NULL,
+    created_at  INTEGER NOT NULL DEFAULT 0,
+    created_by  INTEGER NOT NULL DEFAULT 0,
+    CHECK(role IN ('finance','support','manager','coowner'))
 );
 
 CREATE TABLE IF NOT EXISTS tg_state (
@@ -1004,6 +1024,11 @@ function db_bootstrap(): void
             }
         }
     }
+    /* نقش‌های قدیمی PANEL_ADMINS یک‌بار به سطح محدود پشتیبانی منتقل می‌شوند.
+       مالک اصلی همچنان فقط از .env تعیین می‌شود. */
+    if (function_exists('admin_roles_bootstrap')) {
+        admin_roles_bootstrap();
+    }
 }
 
 /* 4) Settings */
@@ -1061,8 +1086,10 @@ const SETTING_DEFAULTS = [
     'last_backup_at'       => '0',
     'panel_pass_len'       => '12',
     'prepaid_hours'        => '24',   // ساعت‌های پیش‌پرداخت‌شدهٔ اول پنل (غیرقابل استرداد)
-    'force_channel_on'     => '0',
-    'force_channel_id'     => '',
+    'force_channel_on'        => '0',
+    'force_channel_id'        => '',
+    'force_channel_username'  => '',
+    'force_channel_join_link' => '',
     'trial_in_panels'      => '0',
     'admin_trial_unlimited' => '1',
     'kyc_on'               => '1',
@@ -2093,6 +2120,351 @@ final class State
     }
 }
 
+/* 6) RBAC — نقش‌های مدیریتی ربات
+   ─────────────────────────────────────────────────────────────────────────
+   مالک اصلی از فایل محیطی قفل می‌شود؛ نقش‌های دیگر در SQLite نگهداری می‌شوند
+   تا با حذف یک ادمین، دسترسی او واقعاً همان لحظه قطع شود.
+
+   نقش‌ها:
+   - finance  : فقط رسید کارت‌به‌کارت
+   - support  : کاربران، آمار ساده و پاسخ به کاربر
+   - manager  : عملیات پنل/سرور، تمدید و لاگ امن
+   - coowner  : همهٔ بخش‌های عملیاتی مالک
+
+   هیچ نقش دیتابیسی نمی‌تواند مالک اصلی را بسازد، حذف کند یا تنزل دهد.
+*/
+
+const ADMIN_ROLE_FINANCE = 'finance';
+const ADMIN_ROLE_SUPPORT = 'support';
+const ADMIN_ROLE_MANAGER = 'manager';
+const ADMIN_ROLE_COOWNER = 'coowner';
+
+const ADMIN_ROLE_LABELS = [
+    ADMIN_ROLE_FINANCE => '💳 ادمین مالی و رسید',
+    ADMIN_ROLE_SUPPORT => '💬 ادمین پشتیبانی',
+    ADMIN_ROLE_MANAGER => '🛠 مدیر فنی / اپراتور',
+    ADMIN_ROLE_COOWNER => '👑 هم‌مالک',
+];
+
+/** همهٔ نقش‌هایی که مالک اصلی می‌تواند به یک حساب بدهد. */
+function admin_role_choices(): array
+{
+    return ADMIN_ROLE_LABELS;
+}
+
+function admin_role_valid(string $role): bool
+{
+    return array_key_exists($role, ADMIN_ROLE_LABELS);
+}
+
+/**
+ * مالک قفل‌شدهٔ فایل .env. در نصب‌های قدیمی، اولین PANEL_ADMINS همان قفل است.
+ * این fallback عمداً وجود دارد تا آپدیت، .env کاربر را تغییر ندهد.
+ */
+function primary_owner_env_id(): int
+{
+    $explicit = trim(cfg('PANEL_PRIMARY_OWNER_ID', ''));
+    if ($explicit !== '' && ctype_digit($explicit) && (int) $explicit > 0) {
+        return (int) $explicit;
+    }
+    $legacy = admin_ids();
+    return (int) ($legacy[0] ?? 0);
+}
+
+/**
+ * شناسهٔ مالک اصلی: ENV بر DB اولویت دارد و مقدار DB را به همان قفل همگام می‌کند.
+ * بنابراین حتی اگر کسی از مسیر قدیمی owner_id را دستکاری کند، در اجرای بعدی
+ * با مقدار فایل محیطی برمی‌گردد. نوشتن به .env هرگز انجام نمی‌شود.
+ */
+function primary_owner_id(): int
+{
+    $envId = primary_owner_env_id();
+    $dbId = 0;
+    try {
+        $row = DB::one("SELECT value FROM settings WHERE key='primary_owner_id'");
+        $dbId = $row === null ? 0 : (int) ($row['value'] ?? 0);
+    } catch (Throwable $ignored) {
+        // در مراحل بسیار ابتدایی بوت، جدول settings شاید هنوز ساخته نشده باشد.
+    }
+
+    $winner = $envId > 0 ? $envId : $dbId;
+    if ($winner <= 0) {
+        try {
+            $legacy = DB::one("SELECT value FROM settings WHERE key='owner_id'");
+            $winner = (int) ($legacy['value'] ?? 0);
+        } catch (Throwable $ignored) {
+        }
+    }
+    if ($winner <= 0) {
+        return 0;
+    }
+
+    try {
+        if ($dbId !== $winner) {
+            set_put('primary_owner_id', (string) $winner);
+        }
+        /* سازگاری با نسخه‌های قبلی که owner_id را می‌خوانند. */
+        if ((int) set_get('owner_id', '0') !== $winner) {
+            set_put('owner_id', (string) $winner);
+        }
+    } catch (Throwable $ignored) {
+    }
+    return $winner;
+}
+
+function admin_is_primary(int $uid): bool
+{
+    return $uid > 0 && $uid === primary_owner_id();
+}
+
+/** نقش یک کاربر؛ owner فقط نقش محاسباتی است و هیچ‌وقت در DB ثبت نمی‌شود. */
+function admin_role_of(int $uid): string
+{
+    if ($uid <= 0) {
+        return '';
+    }
+    if (admin_is_primary($uid)) {
+        return 'owner';
+    }
+    try {
+        $row = DB::one('SELECT role FROM admin_roles WHERE tg_id=?', [$uid]);
+        $role = trim((string) ($row['role'] ?? ''));
+        return admin_role_valid($role) ? $role : '';
+    } catch (Throwable $ignored) {
+        return '';
+    }
+}
+
+function admin_role_label(string $role): string
+{
+    return $role === 'owner' ? '👑 مالک اصلی (قفل‌شده)' : (ADMIN_ROLE_LABELS[$role] ?? '—');
+}
+
+/** آیا این شناسه یکی از مدیرانِ قابل‌ورود به کنسول است؟ */
+function admin_is_console(int $uid): bool
+{
+    return admin_role_of($uid) !== '';
+}
+
+/**
+ * capabilityهای ثابت. owner/coowner همه‌چیز دارند؛ فقط مدیریت نقش‌ها برای
+ * مالک اصلی است تا او همیشه بتواند هم‌مالک را عزل کند.
+ */
+function admin_can(int $uid, string $capability): bool
+{
+    $role = admin_role_of($uid);
+    if ($role === '') {
+        return false;
+    }
+    if ($capability === 'console') {
+        return true;
+    }
+    if ($role === 'owner' || $role === ADMIN_ROLE_COOWNER) {
+        return true;
+    }
+    return match ($role) {
+        ADMIN_ROLE_FINANCE => in_array($capability, ['receipt'], true),
+        ADMIN_ROLE_SUPPORT => in_array($capability, ['support', 'users.view', 'stats.simple'], true),
+        ADMIN_ROLE_MANAGER => in_array($capability, ['ops', 'ops.logs', 'users.view', 'support'], true),
+        default => false,
+    };
+}
+
+function admin_can_manage_roles(int $uid): bool
+{
+    return admin_is_primary($uid);
+}
+
+/** همهٔ مدیران فعال، با مالک اصلی در ابتدای فهرست. */
+function admin_role_rows(): array
+{
+    $rows = [];
+    $primary = primary_owner_id();
+    if ($primary > 0) {
+        $rows[] = ['tg_id' => $primary, 'role' => 'owner', 'created_at' => 0, 'created_by' => 0];
+    }
+    try {
+        foreach (DB::all('SELECT tg_id, role, created_at, created_by FROM admin_roles '
+            . 'ORDER BY CASE role WHEN \'' . ADMIN_ROLE_COOWNER . '\' THEN 0 '
+            . 'WHEN \'' . ADMIN_ROLE_MANAGER . '\' THEN 1 '
+            . 'WHEN \'' . ADMIN_ROLE_SUPPORT . '\' THEN 2 ELSE 3 END, tg_id') as $row) {
+            $id = (int) ($row['tg_id'] ?? 0);
+            $role = (string) ($row['role'] ?? '');
+            if ($id > 0 && $id !== $primary && admin_role_valid($role)) {
+                $rows[] = ['tg_id' => $id, 'role' => $role,
+                    'created_at' => (int) ($row['created_at'] ?? 0),
+                    'created_by' => (int) ($row['created_by'] ?? 0)];
+            }
+        }
+    } catch (Throwable $ignored) {
+    }
+    return $rows;
+}
+
+function admin_role_assign(int $actorId, int $targetId, string $role): array
+{
+    if (!admin_can_manage_roles($actorId)) {
+        return [false, 'فقط مالک اصلی می‌تواند سطح دسترسی تعیین کند.'];
+    }
+    if ($targetId <= 0 || !admin_role_valid($role) || is_bot_self($targetId)) {
+        return [false, 'شناسه یا سطح دسترسی معتبر نیست.'];
+    }
+    if (admin_is_primary($targetId)) {
+        return [false, '⚠️ مالک اصلی از فایل .env قفل است و قابل تغییر نیست.'];
+    }
+    DB::exec('INSERT INTO admin_roles(tg_id, role, created_at, created_by) VALUES(?,?,?,?) '
+        . 'ON CONFLICT(tg_id) DO UPDATE SET role=excluded.role, created_at=excluded.created_at, '
+        . 'created_by=excluded.created_by', [$targetId, $role, now_ts(), $actorId]);
+    State::clear($targetId);  // هیچ ویزارد قدیمی با سطح قبلی ادامه پیدا نمی‌کند
+    log_line('info', 'rbac role assigned', ['by' => $actorId, 'to' => $targetId, 'role' => $role]);
+    return [true, admin_role_label($role) . ' برای <code>' . $targetId . '</code> ذخیره شد.'];
+}
+
+function admin_role_remove(int $actorId, int $targetId): array
+{
+    if (!admin_can_manage_roles($actorId)) {
+        return [false, 'فقط مالک اصلی می‌تواند ادمین را حذف کند.'];
+    }
+    if ($targetId <= 0) {
+        return [false, 'شناسه نامعتبر است.'];
+    }
+    if (admin_is_primary($targetId)) {
+        return [false, '⚠️ مالک اصلی قفل است و قابل حذف یا تنزل نیست.'];
+    }
+    $deleted = DB::exec('DELETE FROM admin_roles WHERE tg_id=?', [$targetId]);
+    State::clear($targetId);
+    log_line('info', 'rbac role removed', ['by' => $actorId, 'to' => $targetId]);
+    return [$deleted > 0, $deleted > 0 ? 'دسترسی ادمین حذف شد.' : 'این شناسه ادمین ثبت‌شده نیست.'];
+}
+
+/**
+ * یک‌بار مدیران قدیمی PANEL_ADMINS (غیر از مالک اول) را به سطح محدود پشتیبانی
+ * وارد می‌کند. بعد از آن مالک اصلی می‌تواند از خود ربات نقشش را عوض یا حذف کند.
+ */
+function admin_roles_bootstrap(): void
+{
+    try {
+        if (set_get('rbac_legacy_imported', '') === '1') {
+            return;
+        }
+        $primary = primary_owner_id();
+        foreach (admin_ids() as $id) {
+            if ($id > 0 && $id !== $primary) {
+                DB::exec('INSERT OR IGNORE INTO admin_roles(tg_id, role, created_at, created_by) '
+                    . 'VALUES(?,?,?,?)', [$id, ADMIN_ROLE_SUPPORT, now_ts(), $primary]);
+            }
+        }
+        set_put('rbac_legacy_imported', '1');
+    } catch (Throwable $ex) {
+        log_line('warning', 'rbac bootstrap failed: ' . $ex->getMessage());
+    }
+}
+
+/**
+ * حداقل capability لازم برای هر callback مدیریتی. این گارد علاوه بر پنهان شدن
+ * دکمه‌هاست؛ پس کپی کردن callback_data نیز سطح دسترسی را دور نمی‌زند.
+ */
+function admin_callback_capability(string $data): string
+{
+    $parts = explode(':', $data);
+    if (($parts[0] ?? '') !== 'ad') {
+        return '';
+    }
+    $action = (string) ($parts[1] ?? '');
+    return match ($action) {
+        'home' => 'console',
+        'receipts', 'rsearch', 'rc' => 'receipt',
+        'stats' => 'stats.simple',
+        'users', 'usearch' => 'users.view',
+        'u' => admin_user_callback_capability($parts),
+        'support' => 'support',
+        'panel', 'panels', 'psearch', 'ops' => admin_panel_callback_capability($parts),
+        'pg' => admin_pg_callback_capability($parts),
+        'find' => admin_find_callback_capability($parts),
+        'role', 'rolep' => admin_role_callback_capability($parts),
+        'staff' => 'roles.manage',
+        /* همهٔ بخش‌های مالی، درگاه، تنظیمات، دیتابیس، بکاپ، آپدیت، محصولات و
+           پیام همگانی فقط برای مالک/هم‌مالک است. */
+        'finance', 'paygrp', 'late', 'pay', 'payweb', 'finset', 'fin', 'cats', 'cat',
+        'products', 'prod', 'pf', 'set', 'setg', 'report', 'restore', 'backup', 'slots',
+        'tools', 'settings', 'upd', 'tgl', 'bc', 'broadcast', 'ref', 'fj', 'g', 'help' => 'full',
+        default => 'full',
+    };
+}
+
+function admin_user_callback_capability(array $parts): string
+{
+    $sub = (string) ($parts[3] ?? '');
+    if ($sub === '' || $sub === 'panels') {
+        return 'users.view';
+    }
+    if ($sub === 'msg') {
+        return 'support';
+    }
+    if ($sub === 'sync') {
+        return 'ops';
+    }
+    return 'full';
+}
+
+function admin_panel_callback_capability(array $parts): string
+{
+    /* مسیر قدیمی ad:panel:new نباید بتواند گارد افزودن اتصال را دور بزند. */
+    return (($parts[2] ?? '') === 'new') ? 'full' : 'ops';
+}
+
+function admin_pg_callback_capability(array $parts): string
+{
+    $id = (string) ($parts[2] ?? '');
+    $op = (string) ($parts[3] ?? '');
+    /* فقط مشاهده، تست، دستگاه، همگام‌سازی و نقش‌های سرور برای اپراتور است.
+       هر تغییری که اتصال/ساختار سرور را عوض کند، در سطح کامل باقی می‌ماند. */
+    if (in_array($id, ['new', 'newapi', 'savekey', 'newpass', 'quick'], true)
+        || in_array($op, ['key', 'edit', 'del', 'del2', 'default', 'toggle', 'cat', 'setcat'], true)) {
+        return 'full';
+    }
+    if ($id === 'testall' || ctype_digit($id)) {
+        return 'ops';
+    }
+    return 'full';
+}
+
+function admin_find_callback_capability(array $parts): string
+{
+    $op = (string) ($parts[2] ?? '');
+    if ($op === 'inv') {
+        return 'full';
+    }
+    if ($op !== 'pn') {
+        return 'ops';
+    }
+    $action = (string) ($parts[4] ?? '');
+    /* تمدید، تعلیق و سقف کاربر عملیات روزانه‌اند؛ حذف دائمی فقط مالک/هم‌مالک. */
+    return in_array($action, ['', 'sus', 'res', 'ulup', 'uldn', 'ext'], true) ? 'ops' : 'full';
+}
+
+function admin_role_callback_capability(array $parts): string
+{
+    /* نقش روی محصول یعنی تغییر کالای فروش؛ فقط سطح کامل. نقش صرفاً برای دیدن
+       یک سرور در صفحهٔ اپراتور، محصول صفر دارد و مجاز است. */
+    $last = (int) ($parts[count($parts) - 1] ?? 0);
+    return $last > 0 ? 'full' : 'ops';
+}
+
+function admin_callback_allowed(int $uid, string $data): bool
+{
+    if (!str_starts_with($data, 'ad:')) {
+        return true;
+    }
+    if (!admin_is_console($uid)) {
+        return false;
+    }
+    $cap = admin_callback_capability($data);
+    if ($cap === 'roles.manage') {
+        return admin_can_manage_roles($uid);
+    }
+    return admin_can($uid, $cap);
+}
 /* 7) Domain: users, wallet, orders, catalog */
 
 /**
@@ -4225,6 +4597,7 @@ function receipt_find_card(int|string $chat, ?int $messageId, string $code, int 
 /** کارت یک پنل، پیدا شده با نام کاربری — برای بخش مدیریت */
 function panel_find_card(int|string $chat, ?int $messageId, string $username): void
 {
+    $canFull = admin_can(console_actor_id(), 'full');
     $username = ltrim(trim($username), '@');
     $panel = DB::one("SELECT * FROM panels WHERE panel_username=? AND status<>'deleted' "
         . 'ORDER BY id DESC LIMIT 1', [$username]);
@@ -4243,8 +4616,12 @@ function panel_find_card(int|string $chat, ?int $messageId, string $username): v
         . 'نوع: ' . ((int) $panel['is_trial'] === 1 ? '🧪 تست' : '🛒 خریداری‌شده') . "\n"
         . 'سقف کاربر: ' . ((int) $panel['max_users'] > 0
             ? (string) (int) $panel['max_users'] : 'نامحدود') . "\n"
-        . 'ساخته‌شده: ' . fa_ts((int) $panel['created_at']) . "\n"
-        . 'مصرف کل: ' . money((int) $panel['spent_total']);
+        . 'ساخته‌شده: ' . fa_ts((int) $panel['created_at']);
+    if ($canFull) {
+        $text .= "\n" . 'مصرف کل: ' . money((int) $panel['spent_total']);
+    } else {
+        $text .= "\n" . '<i>مبالغ مصرفی در سطح عملیات نمایش داده نمی‌شود.</i>';
+    }
     Tg::show($chat, $messageId, $text,
         [[btn('👤 کارت کاربر', 'ad:u:' . (int) $panel['tg_id'], null, 'success')],
          [btn('🔎 جستجوی دیگر', 'ad:psearch', null, 'primary')],
@@ -4958,13 +5335,63 @@ function console_lock_text(): string
         . 'برای باز شدن پنل، روی دکمهٔ زیر بزنید و آموزش گام‌به‌گام را انجام دهید.';
 }
 
-function console_home_text(): string
+/** شناسهٔ بازکنندهٔ کنسول؛ روتر آن را در هر callback پر می‌کند. */
+function console_actor_id(?int $uid = null): int
 {
+    if ($uid !== null && $uid > 0) {
+        return $uid;
+    }
+    $active = (int) ($GLOBALS['panel_act_uid'] ?? 0);
+    /* صفحه‌های کنسول فقط از روتر ادمین فراخوانی می‌شوند. اگر یک فراخوانی داخلی/
+       تست، شناسهٔ آخرین خریدار را در global جا گذاشته باشد، آن را بازیگر کنسول
+       فرض نکنیم و به مالک اصلی برگردیم؛ روتر واقعی همیشه شناسهٔ مدیر معتبر دارد. */
+    return $active > 0 && admin_is_console($active) ? $active : primary_owner_id();
+}
+
+function console_home_text(?int $uid = null): string
+{
+    $uid = console_actor_id($uid);
+    $role = admin_role_of($uid);
+    $roleLabel = admin_role_label($role);
     if (report_required()) {
-        /* قفل اجباری: هیچ شمارنده و آماری تا ثبت گروه گزارشات نشان داده نمی‌شود */
         return '⚙️ <b>پنل مدیریت ' . e(brand()) . '</b>' . "\n" . SEP . "\n"
             . console_lock_text();
     }
+
+    /* سطح ۱: فقط رسید کارت‌به‌کارت، بدون آمار مالی یا تنظیمات دیگر. */
+    if (admin_can($uid, 'receipt') && !admin_can($uid, 'full')) {
+        $pending = (int) DB::val("SELECT COUNT(*) FROM receipts WHERE status='pending'", [], 0);
+        return "💳 <b>پنل رسیدهای کارت‌به‌کارت</b>\n" . SEP . "\n"
+            . 'سطح شما: ' . e($roleLabel) . "\n"
+            . '🧾 رسیدهای در انتظار: <b>' . fa_digits($pending) . '</b>' . "\n\n"
+            . '<i>فقط تأیید یا رد رسیدها در این سطح مجاز است.</i>';
+    }
+
+    /* سطح ۲: فقط آمار ساده و کاربران. */
+    if (admin_can($uid, 'stats.simple') && !admin_can($uid, 'full')) {
+        $users = (int) DB::val('SELECT COUNT(*) FROM users', [], 0);
+        $today = (int) DB::val('SELECT COUNT(*) FROM users WHERE created_at>=?', [now_ts() - DAY], 0);
+        $live = (int) DB::val("SELECT COUNT(*) FROM panels WHERE status='active'", [], 0);
+        return "💬 <b>پنل پشتیبانی</b>\n" . SEP . "\n"
+            . 'سطح شما: ' . e($roleLabel) . "\n"
+            . '👥 کاربران: ' . fa_digits($users) . ' · امروز: ' . fa_digits($today) . "\n"
+            . '📦 پنل‌های فعال: ' . fa_digits($live) . "\n\n"
+            . '<i>از جستجوی کاربران برای پاسخ‌گویی و پیگیری استفاده کنید.</i>';
+    }
+
+    /* سطح ۳: پنل‌ها، سرورها، تمدید و لاگ امن؛ نه رازها و نه مالی. */
+    if (admin_can($uid, 'ops') && !admin_can($uid, 'full')) {
+        $pgs = (int) DB::val('SELECT COUNT(*) FROM pg_panels WHERE active=1', [], 0);
+        $live = (int) DB::val("SELECT COUNT(*) FROM panels WHERE status='active'", [], 0);
+        $susp = (int) DB::val("SELECT COUNT(*) FROM panels WHERE status='suspended'", [], 0);
+        return "🛠 <b>پنل عملیات فنی</b>\n" . SEP . "\n"
+            . 'سطح شما: ' . e($roleLabel) . "\n"
+            . '🔌 سرور/پنل متصل: ' . fa_digits($pgs) . "\n"
+            . '📦 پنل‌های فعال: ' . fa_digits($live) . ' · معلق: ' . fa_digits($susp) . "\n\n"
+            . '<i>کلیدهای API، درگاه‌ها، تنظیمات ربات و دیتابیس در این سطح پنهان‌اند.</i>';
+    }
+
+    /* مالک اصلی و هم‌مالک: منوی کامل. */
     $users = (int) DB::val('SELECT COUNT(*) FROM users', [], 0);
     $activeUsers = (int) DB::val("SELECT COUNT(*) FROM users WHERE tg_id IN "
         . '(SELECT DISTINCT tg_id FROM panels WHERE status=\'active\')', [], 0);
@@ -4973,13 +5400,12 @@ function console_home_text(): string
     $pending = (int) DB::val("SELECT COUNT(*) FROM receipts WHERE status='pending'", [], 0);
     $pgs = (int) DB::val('SELECT COUNT(*) FROM pg_panels WHERE active=1', [], 0);
     $notice = '';
-    /* نشان نسخهٔ تازه: خواندن با کش کوتاه تا هر بار باز کردن پنل، به گیت‌هاب
-       درخواست نزند؛ دکمهٔ «بررسی» و «بروزرسانی» همیشه تازه می‌خواند */
     if (update_is_newer(update_remote_version(false)['version'], PANEL_VERSION)) {
         $notice .= "\n⬆️ <b>نسخهٔ تازه در گیت‌هاب موجود است</b> — «⚙️ تنظیمات ربات» → «⬆️ بروزرسانی ربات»\n";
     }
     return '⚙️ <b>پنل مدیریت ' . e(brand()) . '</b>' . "\n"
         . SEP . "\n"
+        . 'سطح شما: ' . e($roleLabel) . "\n"
         . $notice
         . '👥 کاربران کل: ' . fa_digits($users) . ' | 🟢 فعال: ' . fa_digits($activeUsers) . "\n"
         . '🔌 پنل‌های متصل: ' . fa_digits($pgs) . ' | 📦 محصولات: ' . fa_digits($products) . "\n"
@@ -4989,16 +5415,43 @@ function console_home_text(): string
         . 'یک بخش را انتخاب کنید:';
 }
 
-function console_kb(): array
+function console_kb(?int $uid = null): array
 {
+    $uid = console_actor_id($uid);
     if (report_required()) {
-        /* فقط یک دکمه: تنظیم گروه گزارشات — بقیهٔ مدیریت قفل است */
+        if (admin_can($uid, 'full')) {
+            return kb_clean([
+                [btn('📢 تنظیم گپ گزارشات (الزامی)', 'ad:report:setup', null, 'success')],
+            ]);
+        }
         return kb_clean([
-            [btn('📢 تنظیم گپ گزارشات (الزامی)', 'ad:report:setup', null, 'success')],
+            [btn('🔄 بررسی دوباره', 'ad:home', null, 'primary')],
+            [btn('🔙 بازگشت به منوی کاربری', 'home', null, 'danger')],
         ]);
     }
-    /* منوی مدیریت — دقیقاً دو ستون، بدون دکمهٔ تکراری و بدون دکمهٔ شیشه‌ای */
-    return kb_clean([
+    if (admin_can($uid, 'receipt') && !admin_can($uid, 'full')) {
+        return kb_clean([
+            [btn('🧾 رسیدهای کارت‌به‌کارت', 'ad:receipts', null, 'success')],
+            [btn('🔙 بازگشت به منوی کاربری', 'home', null, 'danger')],
+        ]);
+    }
+    if (admin_can($uid, 'stats.simple') && !admin_can($uid, 'full')) {
+        return kb_clean([
+            [btn('👥 کاربران و پاسخ‌گویی', 'ad:users', null, 'primary'),
+             btn('📊 آمار ساده', 'ad:stats', null, 'primary')],
+            [btn('🔙 بازگشت به منوی کاربری', 'home', null, 'danger')],
+        ]);
+    }
+    if (admin_can($uid, 'ops') && !admin_can($uid, 'full')) {
+        return kb_clean([
+            [btn('🔌 سرورها و پنل‌ها', 'ad:panel', null, 'primary'),
+             btn('🏢 پنل‌های فروخته‌شده', 'ad:panels', null, 'primary')],
+            [btn('🔍 جستجو / تمدید پنل مشتری', 'ad:find', null, 'success'),
+             btn('📜 لاگ عملیات', 'ad:ops:logs', null, 'primary')],
+            [btn('🔙 بازگشت به منوی کاربری', 'home', null, 'danger')],
+        ]);
+    }
+    $rows = [
         [btn('📊 آمار و گزارشات', 'ad:stats', null, 'primary'),
          btn('🧾 رسیدها و مالی', 'ad:finance', null, 'primary')],
         [btn('👥 مدیریت کاربران', 'ad:users', null, 'primary'),
@@ -5008,8 +5461,14 @@ function console_kb(): array
         [btn('🔍 جستجوی سفارشات', 'ad:find', null, 'primary'),
          btn('📢 پیام همگانی', 'ad:broadcast', null, 'success')],
         [btn('📢 قفل کانال اجباری', 'ad:fj', null, 'success')],
-        [btn('🔙 بازگشت به منوی کاربری', 'home', null, 'danger')],
-    ]);
+    ];
+    /* فقط مالک اصلی می‌تواند به نقش‌ها دست بزند؛ هم‌مالک منوی کامل دارد اما
+       هرگز نمی‌تواند مالک یا هم‌مالک دیگری را عزل کند. */
+    if (admin_can_manage_roles($uid)) {
+        $rows[] = [btn('👥 تعیین مالک و ادمین‌ها', 'ad:staff', null, 'success')];
+    }
+    $rows[] = [btn('🔙 بازگشت به منوی کاربری', 'home', null, 'danger')];
+    return kb_clean($rows);
 }
 
 function group_kb(string $group): array
@@ -5038,15 +5497,241 @@ function group_kb(string $group): array
     return $rows;
 }
 
-function screen_console(int|string $chat, ?int $messageId): void
+function screen_console(int|string $chat, ?int $messageId, ?int $uid = null): void
 {
-    /* پنل مدیریت نقطهٔ شروع است؛ دکمهٔ «بازگشت» روی آن معنا ندارد */
     $GLOBALS['panel_console_root'] = true;
     try {
-        Tg::show($chat, $messageId, console_home_text(), console_kb());
+        $actor = console_actor_id($uid);
+        Tg::show($chat, $messageId, console_home_text($actor), console_kb($actor));
     } finally {
         $GLOBALS['panel_console_root'] = false;
     }
+}
+
+/** آخرین لاگ‌ها برای اپراتور؛ رازهای شناخته‌شده پیش از نمایش ماسک می‌شوند. */
+function ops_log_safe_line(string $line): string
+{
+    $line = preg_replace('/\b\d{6,12}:[A-Za-z0-9_-]{20,}\b/', '[BOT_TOKEN_HIDDEN]', $line) ?? $line;
+    $line = preg_replace('/\b(?:pg_key|apikey)-[A-Za-z0-9_-]+\b/i', '[API_KEY_HIDDEN]', $line) ?? $line;
+    $line = preg_replace('/\b(?:ghp|github_pat)_[A-Za-z0-9_]+\b/i', '[GITHUB_TOKEN_HIDDEN]', $line) ?? $line;
+    /* پاسخ خام API گاهی JSON یا query string حاوی راز دارد. */
+    $line = preg_replace('/([?&](?:token|api[_-]?key|key|secret|password)=)[^&\s]+/i',
+        '$1[SECRET_HIDDEN]', $line) ?? $line;
+    $line = preg_replace('/((?:api[_-]?key|token|secret|password|authorization)\s*["\']?\s*[:=]\s*["\']?)[^,\s"\'}]+/i',
+        '$1[SECRET_HIDDEN]', $line) ?? $line;
+    $line = preg_replace('/\b(?:sqlite|mysql|pgsql):[^\s]+/i', '[DATABASE_DSN_HIDDEN]', $line) ?? $line;
+    return $line;
+}
+
+function screen_ops_logs(int|string $chat, ?int $messageId): void
+{
+    $paths = [log_dir() . '/bot_error.log', log_dir() . '/device_guard.log', panel_home() . '/sibil.log'];
+    $lines = [];
+    foreach ($paths as $path) {
+        if (!is_file($path) || !is_readable($path)) {
+            continue;
+        }
+        $all = @file($path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [];
+        foreach (array_slice($all, -8) as $line) {
+            $lines[] = ops_log_safe_line((string) $line);
+        }
+    }
+    $body = $lines ? implode("\n", array_slice($lines, -20)) : 'لاگ قابل نمایشی ثبت نشده است.';
+    $body = mb_substr($body, 0, 3200);
+    Tg::show($chat, $messageId, "📜 <b>لاگ عملیات</b>\n" . SEP . "\n<pre>"
+        . e($body) . '</pre>',
+        [[btn('🔄 به‌روزرسانی', 'ad:ops:logs', null, 'primary')],
+         [btn('« مدیریت', 'ad:home', null, 'danger')]]);
+}
+
+/** نام کوتاه مدیر، نخست به‌صورت متن ساده برای دکمه و سپس HTML امن برای پیام. */
+function admin_staff_plain_display(int $targetId): string
+{
+    $user = user_get($targetId);
+    if ($user === null) {
+        return (string) $targetId;
+    }
+    $name = trim((string) ($user['name'] ?? ''));
+    $uname = trim((string) ($user['uname'] ?? ''));
+    $label = $name !== '' ? mb_substr($name, 0, 22) : ($uname !== '' ? '@' . $uname : 'کاربر');
+    return $label . ' · ' . $targetId;
+}
+
+function admin_staff_display(int $targetId): string
+{
+    $user = user_get($targetId);
+    if ($user === null) {
+        return '<code>' . $targetId . '</code>';
+    }
+    $name = trim((string) ($user['name'] ?? ''));
+    $uname = trim((string) ($user['uname'] ?? ''));
+    $label = $name !== '' ? mb_substr($name, 0, 22) : ($uname !== '' ? '@' . $uname : 'کاربر');
+    return e($label) . ' · <code>' . $targetId . '</code>';
+}
+
+/** فهرست نقش‌های مدیریتی؛ تنها مالک اصلی به این صفحه دسترسی دارد. */
+function screen_admin_staff(int|string $chat, ?int $messageId, int $page = 1): void
+{
+    $actor = console_actor_id();
+    if (!admin_can_manage_roles($actor)) {
+        Tg::show($chat, $messageId, '⛔️ فقط مالک اصلی می‌تواند سطح دسترسی تعیین کند.',
+            [[btn('« مدیریت', 'ad:home', null, 'danger')]]);
+        return;
+    }
+    $all = admin_role_rows();
+    $perPage = 7;
+    $pages = max(1, (int) ceil(count($all) / $perPage));
+    $page = max(1, min($page, $pages));
+    $slice = array_slice($all, ($page - 1) * $perPage, $perPage);
+    $primary = primary_owner_id();
+    $text = '👥 <b>تعیین مالک و ادمین‌ها</b>' . "\n" . SEP . "\n"
+        . '👑 مالک اصلیِ قفل‌شده: <code>' . $primary . "</code>\n"
+        . '<i>شناسهٔ مالک اصلی در .env و پایگاه‌داده همگام است؛ حذف یا تنزل آن ممکن نیست.</i>'
+        . "\n\n" . 'مدیران فعال: <b>' . fa_digits(count($all)) . '</b>'
+        . ' · صفحه ' . fa_digits($page) . ' از ' . fa_digits($pages) . "\n"
+        . SEP . "\n" . 'روی هر نفر بزنید تا سطح دسترسی‌اش را ببینید یا تغییر دهید.';
+    $rows = [];
+    foreach ($slice as $row) {
+        $id = (int) ($row['tg_id'] ?? 0);
+        $role = (string) ($row['role'] ?? '');
+        if ($id <= 0) {
+            continue;
+        }
+        $lock = $role === 'owner' ? ' 🔒' : '';
+        $rows[] = [btn(admin_role_label($role) . $lock . ' · ' . admin_staff_plain_display($id),
+            'ad:staff:member:' . $id, null, $role === 'owner' ? 'primary' : 'auto')];
+    }
+    $rows[] = [btn('➕ افزودن ادمین با شناسهٔ عددی', 'ad:staff:add', null, 'success')];
+    $nav = [];
+    if ($page > 1) {
+        $nav[] = btn('› صفحهٔ قبل', 'ad:staff:page:' . ($page - 1));
+    }
+    if ($page < $pages) {
+        $nav[] = btn('صفحهٔ بعد ‹', 'ad:staff:page:' . ($page + 1));
+    }
+    if ($nav !== []) {
+        $rows[] = $nav;
+    }
+    $rows[] = [btn('« مدیریت', 'ad:home', null, 'danger')];
+    Tg::show($chat, $messageId, $text, $rows);
+}
+
+/** کارت یک مدیر و انتخاب سطح او. */
+function screen_admin_staff_member(int|string $chat, ?int $messageId, int $targetId): void
+{
+    $primary = primary_owner_id();
+    $role = admin_role_of($targetId);
+    if ($targetId <= 0 || $role === '') {
+        screen_admin_staff($chat, $messageId);
+        return;
+    }
+    if ($targetId === $primary) {
+        Tg::show($chat, $messageId,
+            '👑 <b>مالک اصلی</b>' . "\n" . SEP . "\n"
+            . 'حساب: ' . admin_staff_display($targetId) . "\n"
+            . 'سطح: ' . admin_role_label('owner') . "\n\n"
+            . '<i>این شناسه از .env خوانده و در DB همگام می‌شود؛ هیچ ادمینی، حتی هم‌مالک، '
+            . 'نمی‌تواند آن را حذف یا تنزل دهد.</i>',
+            [[btn('« فهرست مدیران', 'ad:staff', null, 'danger')]]);
+        return;
+    }
+    $text = '👤 <b>سطح دسترسی مدیر</b>' . "\n" . SEP . "\n"
+        . 'حساب: ' . admin_staff_display($targetId) . "\n"
+        . 'سطح فعلی: <b>' . admin_role_label($role) . "</b>\n\n"
+        . 'یک سطح را انتخاب کنید. تغییر سطح همان لحظه اعمال می‌شود و ویزاردهای قبلی بسته می‌شوند.';
+    $rows = [];
+    foreach (admin_role_choices() as $key => $label) {
+        $rows[] = [btn(($key === $role ? '✅ ' : '') . $label,
+            'ad:staff:assign:' . $targetId . ':' . $key, null,
+            $key === $role ? 'success' : 'primary')];
+    }
+    $rows[] = [btn('🗑 حذف کامل دسترسی', 'ad:staff:remove:' . $targetId, null, 'danger')];
+    $rows[] = [btn('« فهرست مدیران', 'ad:staff', null, 'danger')];
+    Tg::show($chat, $messageId, $text, $rows);
+}
+
+/** مرحلهٔ دوم افزودن مدیر پس از دریافت شناسهٔ عددی. */
+function screen_admin_staff_role_picker(int|string $chat, ?int $messageId, int $targetId): void
+{
+    if ($targetId <= 0) {
+        screen_admin_staff($chat, $messageId);
+        return;
+    }
+    if (admin_is_primary($targetId)) {
+        screen_admin_staff_member($chat, $messageId, $targetId);
+        return;
+    }
+    $current = admin_role_of($targetId);
+    $rows = [];
+    foreach (admin_role_choices() as $key => $label) {
+        $rows[] = [btn(($key === $current ? '✅ ' : '') . $label,
+            'ad:staff:assign:' . $targetId . ':' . $key, null,
+            $key === $current ? 'success' : 'primary')];
+    }
+    $rows[] = [btn('« فهرست مدیران', 'ad:staff', null, 'danger')];
+    Tg::show($chat, $messageId, '➕ <b>افزودن یا تغییر ادمین</b>' . "\n" . SEP . "\n"
+        . 'حساب: ' . admin_staff_display($targetId) . "\n\n"
+        . 'اکنون سطح دسترسی را انتخاب کنید:', $rows);
+}
+
+/** callbackهای مدیریت نقش؛ گارد مرکزی نیز پیش از این تابع مالک اصلی را کنترل می‌کند. */
+function admin_staff_callback(int $uid, int|string $chat, ?int $messageId, string $cbId,
+                              array $parts): void
+{
+    if (!admin_can_manage_roles($uid)) {
+        Tg::answer($cbId, '⛔️ فقط مالک اصلی مجاز است.', true);
+        screen_console($chat, $messageId, $uid);
+        return;
+    }
+    $op = (string) ($parts[2] ?? '');
+    if ($op === '' || $op === 'page') {
+        screen_admin_staff($chat, $messageId, (int) ($parts[3] ?? 1));
+        return;
+    }
+    if ($op === 'add') {
+        wiz_start($uid, 'admin_staff_target', [
+            step_def('tg_id', 'شناسهٔ عددی تلگرام ادمین را بفرستید.' . "\n"
+                . '<i>نام کاربری کافی نیست؛ فقط عدد معتبر تلگرام را وارد کنید.</i>',
+                'int', null, '👥 افزودن ادمین'),
+        ]);
+        return;
+    }
+    $targetId = (int) ($parts[3] ?? 0);
+    if ($op === 'member') {
+        screen_admin_staff_member($chat, $messageId, $targetId);
+        return;
+    }
+    if ($op === 'assign') {
+        $role = (string) ($parts[4] ?? '');
+        [$ok, $note] = admin_role_assign($uid, $targetId, $role);
+        Tg::answer($cbId, $note, !$ok);
+        if ($ok) {
+            screen_admin_staff_member($chat, $messageId, $targetId);
+        } else {
+            screen_admin_staff($chat, $messageId);
+        }
+        return;
+    }
+    if ($op === 'remove') {
+        if ($targetId <= 0 || admin_is_primary($targetId)) {
+            Tg::answer($cbId, 'مالک اصلی قفل است.', true);
+            screen_admin_staff_member($chat, $messageId, $targetId);
+            return;
+        }
+        Tg::show($chat, $messageId, '🗑 <b>حذف دسترسی ادمین</b>' . "\n\n"
+            . 'دسترسی «' . admin_staff_display($targetId) . '» کامل حذف شود؟' . "\n"
+            . '<i>اگر هم‌مالک باشد نیز فقط مالک اصلی می‌تواند او را حذف کند.</i>',
+            [[btn('🗑 بله، حذف شود', 'ad:staff:removeok:' . $targetId, null, 'danger')],
+             [btn('« انصراف', 'ad:staff:member:' . $targetId, null, 'primary')]]);
+        return;
+    }
+    if ($op === 'removeok') {
+        [$ok, $note] = admin_role_remove($uid, $targetId);
+        Tg::answer($cbId, $note, !$ok);
+        screen_admin_staff($chat, $messageId);
+        return;
+    }
+    screen_admin_staff($chat, $messageId);
 }
 
 function screen_categories(int|string $chat, ?int $messageId): void
@@ -5183,14 +5868,20 @@ const PRODUCT_FIELDS = [
 
 function screen_pg_panels(int|string $chat, ?int $messageId): void
 {
+    $canFull = admin_can(console_actor_id(), 'full');
     $panels = DB::all('SELECT * FROM pg_panels ORDER BY is_default DESC, id');
     if (!$panels) {
-        Tg::show($chat, $messageId,
-            "🔌 <b>پنل‌های پاسارگارد</b>\n\nهنوز هیچ پنلی وصل نیست.\n"
-            . 'با «➕ افزودن پنل» نام، آدرس و <b>کلید API</b> پنل را بدهید.',
-            [[btn('➕ افزودن پنل', 'ad:pg:new', null, 'success')],
-             [btn('⚙️ تنظیمات اتصال', 'ad:setg:paneltest')],
-             [btn('« مدیریت', 'ad:home', null, 'danger')]]);
+        $rows = [[btn('« مدیریت', 'ad:home', null, 'danger')]];
+        $hint = 'هنوز هیچ پنلی وصل نیست.';
+        if ($canFull) {
+            $rows = [[btn('➕ افزودن پنل', 'ad:pg:new', null, 'success')],
+                [btn('⚙️ تنظیمات اتصال', 'ad:setg:paneltest')],
+                [btn('« مدیریت', 'ad:home', null, 'danger')]];
+            $hint .= "\nبا «➕ افزودن پنل» نام، آدرس و <b>کلید API</b> پنل را بدهید.";
+        } else {
+            $hint .= "\n<i>افزودن پنل و کلید API فقط برای مالک یا هم‌مالک مجاز است.</i>";
+        }
+        Tg::show($chat, $messageId, "🔌 <b>پنل‌های پاسارگارد</b>\n\n" . $hint, $rows);
         return;
     }
     $text = "🔌 <b>پنل‌های پاسارگارد</b>\n" . SEP . "\n"
@@ -5198,7 +5889,7 @@ function screen_pg_panels(int|string $chat, ?int $messageId): void
         . SEP . "\n\n";
     /* تست اتصال دستی حذف شد؛ اتصال هر پنل همان لحظهٔ ورود به داشبورد
        خودکار بررسی می‌شود */
-    $rows = [[btn('➕ افزودن پنل', 'ad:pg:new', null, 'success')]];
+    $rows = $canFull ? [[btn('➕ افزودن پنل', 'ad:pg:new', null, 'success')]] : [];
     foreach ($panels as $panel) {
         $flags = [];
         if ((int) $panel['is_default'] === 1) {
@@ -5216,7 +5907,9 @@ function screen_pg_panels(int|string $chat, ?int $messageId): void
         $rows[] = [btn(((int) $panel['is_default'] === 1 ? '⭐ ' : '') . $panel['name'],
             'ad:pg:' . $panel['id'], null, (int) $panel['active'] === 1 ? 'primary' : 'danger')];
     }
-    $rows[] = [btn('⚙️ تنظیمات اتصال', 'ad:setg:paneltest')];
+    if ($canFull) {
+        $rows[] = [btn('⚙️ تنظیمات اتصال', 'ad:setg:paneltest')];
+    }
     $rows[] = [btn('« مدیریت', 'ad:home', null, 'danger')];
     Tg::show($chat, $messageId, $text . 'روی هر پنل بزنید تا داشبوردش باز شود.', $rows);
 }
@@ -5281,6 +5974,7 @@ function pg_size(int $bytes): string
  */
 function screen_pg_panel(int|string $chat, ?int $messageId, int $panelId): void
 {
+    $canFull = admin_can(console_actor_id(), 'full');
     $panel = DB::one('SELECT * FROM pg_panels WHERE id=?', [$panelId]);
     if ($panel === null) {
         screen_pg_panels($chat, $messageId);
@@ -5292,6 +5986,18 @@ function screen_pg_panel(int|string $chat, ?int $messageId, int $panelId): void
     $sold = (int) DB::val('SELECT COUNT(*) FROM panels WHERE pg_panel_id=?', [$panelId], 0);
     $traffic = (int) DB::val('SELECT COALESCE(SUM(last_usage),0) FROM panels WHERE pg_panel_id=?',
         [$panelId], 0);
+    $serviceSummary = $canFull
+        ? '💰 <b>وضعیت فروش این پنل</b>' . "\n"
+            . '• تعداد کل فروش: ' . fa_digits($sales['count']) . ' عدد' . "\n"
+            . '• مجموع فروش: ' . money($sales['total']) . "\n"
+            . '• محصولات روی این پنل: ' . fa_digits($products)
+            . ' · پنل‌های فروخته‌شده: ' . fa_digits($sold) . "\n"
+        : '📦 <b>وضعیت سرویس‌های این پنل</b>' . "\n"
+            . '• محصولات روی این پنل: ' . fa_digits($products)
+            . ' · پنل‌های فروخته‌شده: ' . fa_digits($sold) . "\n";
+    $offlineHint = $canFull
+        ? 'می‌توانید پنل را از ربات حذف کنید.'
+        : 'با مالک یا هم‌مالک برای تغییر اتصال هماهنگ کنید.';
 
     /* ورود به داشبورد = تست خودکار اتصال؛ هیچ دکمهٔ تست دستی لازم نیست */
     $head = '📊 <b>آمار و وضعیت پنل: ' . e((string) $panel['name']) . '</b>' . "\n"
@@ -5301,7 +6007,7 @@ function screen_pg_panel(int|string $chat, ?int $messageId, int $panelId): void
             . '⚠️ خطا در برقراری ارتباط با پنل پاسارگاد (سرور در دسترس نیست یا اطلاعات '
             . 'لاگین نامعتبر است).' . "\n\n"
             . ($live['error'] !== '' ? 'جزئیات خطا: <code>'
-                . e(mb_substr($live['error'], 0, 160)) . "</code>\n\n" : '')
+                . e(mb_substr(ops_log_safe_line((string) $live['error']), 0, 160)) . "</code>\n\n" : '')
             . '📡 وضعیت اتصال: قطع ❌' . "\n"
             . SEP . "\n"
             . 'آدرس ثبت‌شده: <code>' . e(normalize_panel_url((string) $panel['url'])) . '</code>'
@@ -5310,8 +6016,8 @@ function screen_pg_panel(int|string $chat, ?int $messageId, int $panelId): void
             . 'وضعیت در ربات: ' . ((int) $panel['active'] === 1 ? '🟢 روشن' : '🔴 خاموش')
             . ((int) $panel['is_default'] === 1 ? ' · پیش‌فرض ⭐' : '') . "\n"
             . SEP . "\n"
-            . '<i>آمار جعلی یا خالی نمایش داده نمی‌شود. اگر سرور از کار افتاده، همین‌جا '
-            . 'می‌توانید پنل را از ربات حذف کنید.</i>';
+            . '<i>آمار جعلی یا خالی نمایش داده نمی‌شود. اگر سرور از کار افتاده، '
+            . $offlineHint . '</i>';
     } else {
         $text = $head
             . '📡 وضعیت اتصال: متصل و آنلاین ✅' . "\n"
@@ -5324,35 +6030,36 @@ function screen_pg_panel(int|string $chat, ?int $messageId, int $panelId): void
             . '• رم کل سرور: ' . pg_size($live['mem_total']) . "\n"
             . '• مصرف رم پنل: ' . pg_size($live['mem_used']) . "\n"
             . '• ترافیک مصرف‌شدهٔ پنل‌های فروخته‌شده: ' . pg_size($traffic) . "\n\n"
-            . '💰 <b>وضعیت فروش این پنل</b>' . "\n"
-            . '• تعداد کل فروش: ' . fa_digits($sales['count']) . ' عدد' . "\n"
-            . '• مجموع فروش: ' . money($sales['total']) . "\n"
-            . '• محصولات روی این پنل: ' . fa_digits($products)
-            . ' · پنل‌های فروخته‌شده: ' . fa_digits($sold) . "\n"
+            . $serviceSummary
             . SEP . "\n"
             . 'آدرس: <code>' . e(normalize_panel_url((string) $panel['url'])) . '</code>' . "\n"
             . 'وضعیت در ربات: ' . ((int) $panel['active'] === 1 ? '🟢 روشن' : '🔴 خاموش')
             . ((int) $panel['is_default'] === 1 ? ' · پیش‌فرض ⭐' : '') . "\n"
             . 'آخرین اتصال موفق: ' . fa_ts((int) $panel['last_ok_at']) . "\n"
             . (!empty($panel['last_error']) ? 'آخرین خطا: <code>'
-                . e(mb_substr((string) $panel['last_error'], 0, 160)) . "</code>\n" : '')
+                . e(mb_substr(ops_log_safe_line((string) $panel['last_error']), 0, 160)) . "</code>\n" : '')
             . "\n" . 'برای مدیریت این پنل یکی از گزینه‌های زیر را انتخاب کنید:';
     }
 
-    Tg::show($chat, $messageId, $text, [
+    /* اپراتور فقط ابزارهای روزانهٔ سرور را می‌بیند؛ اتصال و ساختار سرور
+       (آدرس، کلید، حذف، دسته، پیش‌فرض و روشن/خاموش) برای مالک/هم‌مالک است. */
+    $rows = [
         [btn('🔄 بروزرسانی آمار', 'ad:pg:' . $panelId, null, 'success'),
-         btn('🗑 حذف این پنل از ربات', 'ad:pg:' . $panelId . ':del', null, 'danger')],
-        [btn('📱 کنترل دستگاه‌ها (HWID)', 'ad:pg:' . $panelId . ':dev'),
-         btn('✏️ ویرایش نام / آدرس', 'ad:pg:' . $panelId . ':edit')],
+         btn('📱 کنترل دستگاه‌ها (HWID)', 'ad:pg:' . $panelId . ':dev')],
         [btn('🔄 همگام‌سازی کاربران', 'ad:pg:' . $panelId . ':sync'),
          btn('🎭 نقش‌ها', 'ad:pg:' . $panelId . ':roles')],
-        [btn('🗂 دسته', 'ad:pg:' . $panelId . ':cat')],
-        [btn('⭐ پیش‌فرض', 'ad:pg:' . $panelId . ':default'),
-         btn((int) $panel['active'] === 1 ? '🔴 خاموش کنید' : '🟢 روشن کنید',
-             'ad:pg:' . $panelId . ':toggle', null, 'danger')],
-        [btn('🔑 تغییر کلید API', 'ad:pg:' . $panelId . ':key', null, 'success')],
-        [btn('🔙 بازگشت به لیست پنل‌ها', 'ad:panel', null, 'danger')],
-    ]);
+    ];
+    if ($canFull) {
+        $rows[] = [btn('🗑 حذف این پنل از ربات', 'ad:pg:' . $panelId . ':del', null, 'danger')];
+        $rows[] = [btn('✏️ ویرایش نام / آدرس', 'ad:pg:' . $panelId . ':edit'),
+            btn('🔑 تغییر کلید API', 'ad:pg:' . $panelId . ':key', null, 'success')];
+        $rows[] = [btn('🗂 دسته', 'ad:pg:' . $panelId . ':cat')];
+        $rows[] = [btn('⭐ پیش‌فرض', 'ad:pg:' . $panelId . ':default'),
+            btn((int) $panel['active'] === 1 ? '🔴 خاموش کنید' : '🟢 روشن کنید',
+                'ad:pg:' . $panelId . ':toggle', null, 'danger')];
+    }
+    $rows[] = [btn('🔙 بازگشت به لیست پنل‌ها', 'ad:panel', null, 'danger')];
+    Tg::show($chat, $messageId, $text, $rows);
 }
 
 /**
@@ -5361,6 +6068,7 @@ function screen_pg_panel(int|string $chat, ?int $messageId, int $panelId): void
  */
 function screen_pg_devices(int|string $chat, ?int $messageId, int $panelId): void
 {
+    $canFull = admin_can(console_actor_id(), 'full');
     $panel = DB::one('SELECT * FROM pg_panels WHERE id=?', [$panelId]);
     if ($panel === null) {
         screen_pg_panels($chat, $messageId);
@@ -5389,14 +6097,14 @@ function screen_pg_devices(int|string $chat, ?int $messageId, int $panelId): voi
                 . fa_digits($leftMin) . ' دقیقه مانده' . "\n";
         }
     }
-    $rows = [
-        [btn('🔄 بررسی دوباره', 'ad:pg:' . $panelId . ':dev', null, 'success')],
-        [btn($guard ? '🔴 خاموش کردن کنترل' : '🟢 روشن کردن کنترل',
-            'ad:tgl:device_guard_on:devices', null, $guard ? 'danger' : 'success')],
-        [btn('✏️ سقف دستگاه', 'ad:set:device_max_devices'),
-         btn('✏️ مدت جریمه', 'ad:set:device_cut_minutes')],
-        [btn('« داشبورد پنل', 'ad:pg:' . $panelId, null, 'danger')],
-    ];
+    $rows = [[btn('🔄 بررسی دوباره', 'ad:pg:' . $panelId . ':dev', null, 'success')]];
+    if ($canFull) {
+        $rows[] = [btn($guard ? '🔴 خاموش کردن کنترل' : '🟢 روشن کردن کنترل',
+            'ad:tgl:device_guard_on:devices', null, $guard ? 'danger' : 'success')];
+        $rows[] = [btn('✏️ سقف دستگاه', 'ad:set:device_max_devices'),
+            btn('✏️ مدت جریمه', 'ad:set:device_cut_minutes')];
+    }
+    $rows[] = [btn('« داشبورد پنل', 'ad:pg:' . $panelId, null, 'danger')];
     Tg::show($chat, $messageId, $text, $rows);
 }
 
@@ -10537,8 +11245,8 @@ function kyc_callback(int $uid, int|string $chat, int $messageId, array $parts):
     $arg2 = (int) ($parts[3] ?? 0);
 
     if (in_array($action, ['ok', 'no', 'pending', 'banner', 'resend'], true)
-        && !is_admin($uid) && !is_owner($uid)) {
-        Tg::send($chat, '⛔️ این بخش فقط برای مدیر است.');
+        && !admin_can($uid, 'full')) {
+        Tg::send($chat, '⛔️ این بخش فقط برای مالک یا هم‌مالک فعال است.');
         return;
     }
 
@@ -10705,7 +11413,7 @@ function screen_kyc_pending(int|string $chat, ?int $messageId): void
 
 function kyc_admin_review(int $reqId, bool $approve, int $adminId, string $reason = ''): array
 {
-    if (!is_admin($adminId) && !is_owner($adminId)) {
+    if (!admin_can($adminId, 'full')) {
         return [false, 'دسترسی ندارید'];
     }
     $req = DB::one('SELECT * FROM kyc_requests WHERE id=?', [$reqId]);
@@ -11948,17 +12656,19 @@ function pay_from_wallet(array $order): array
 
 /* 14) Review of card-to-card receipts */
 
-/** مقصد کارت رسید: مالک و ادمین‌های ربات، در چت خصوصی */
+/**
+ * مقصد کارت رسید فقط مالک اصلی، هم‌مالک و ادمین مالی است؛ سایر نقش‌ها هرگز
+ * عکس رسید یا callback تأیید پرداخت دریافت نمی‌کنند.
+ */
 function receipt_targets(): array
 {
     $ids = [];
-    $owner = owner_id();
-    if ($owner > 0) {
-        $ids[] = $owner;
-    }
-    foreach (admin_ids() as $adminId) {
-        if (!in_array($adminId, $ids, true)) {
-            $ids[] = $adminId;
+    foreach (admin_role_rows() as $row) {
+        $id = (int) ($row['tg_id'] ?? 0);
+        $role = (string) ($row['role'] ?? '');
+        if ($id > 0 && in_array($role, ['owner', ADMIN_ROLE_COOWNER, ADMIN_ROLE_FINANCE], true)
+            && !in_array($id, $ids, true)) {
+            $ids[] = $id;
         }
     }
     return $ids;
@@ -12061,9 +12771,8 @@ function receipt_card_kb(int $receiptId): array
 }
 
 /**
- * ارسال کارت رسید به «یک» مقصد:
- * تاپیک رسیدهای گروه گزارشات؛ اگر گروه تنظیم نشده باشد، به پیام خصوصی ادمین اصلی.
- * خروجی: [چت, شناسهٔ پیام]
+ * ارسال کارت رسید به همهٔ مسئولان مجاز در چت خصوصی؛ هر کارت جداگانه ثبت می‌شود
+ * تا تأیید یا رد در تمام مقصدها بسته شود. خروجی: نخستین [چت، شناسهٔ پیام].
  */
 function receipt_post_card(int $receiptId): array
 {
@@ -12075,18 +12784,52 @@ function receipt_post_card(int $receiptId): array
     $caption = receipt_card_text($receipt, $order, 'pending');
     $kb = receipt_card_kb($receiptId);
     $photo = (string) ($receipt['photo_id'] ?? '');
-    /* کارت (عکس + دکمه‌ها) فقط در چت خصوصی مدیر می‌آید؛ دکمه در گروه کار نمی‌کند */
+    $type = $photo !== '' ? 'photo' : 'text';
+
+    /* در retry احتمالی، پیام دوباره برای همان مسئول ارسال نشود. */
+    $known = [];
+    foreach (DB::all('SELECT chat_id, message_id, content_type FROM receipt_cards WHERE receipt_id=?',
+        [$receiptId]) as $card) {
+        $chat = (string) ($card['chat_id'] ?? '');
+        $msg = (int) ($card['message_id'] ?? 0);
+        if ($chat !== '' && $msg > 0) {
+            $known[$chat] = ['message_id' => $msg, 'content_type' => (string) ($card['content_type'] ?? 'photo')];
+        }
+    }
+    /* رسیدهای ثبت‌شده با نسخه‌های قدیمی فقط یک card_chat/card_msg دارند. */
+    $legacyChat = (string) ($receipt['card_chat'] ?? '');
+    $legacyMsg = (int) ($receipt['card_msg'] ?? 0);
+    if ($legacyChat !== '' && $legacyMsg > 0 && !isset($known[$legacyChat])) {
+        $known[$legacyChat] = ['message_id' => $legacyMsg, 'content_type' => $type];
+        DB::exec('INSERT OR IGNORE INTO receipt_cards(receipt_id, chat_id, message_id, content_type) VALUES(?,?,?,?)',
+            [$receiptId, $legacyChat, $legacyMsg, $type]);
+    }
+
     $sent = ['', 0];
     foreach (receipt_targets() as $adminId) {
+        $chat = (string) $adminId;
+        if (isset($known[$chat])) {
+            if ($sent[1] === 0) {
+                $sent = [$chat, (int) $known[$chat]['message_id']];
+            }
+            continue;
+        }
         if ($photo !== '') {
             $msgId = Tg::photoThread($adminId, $photo, $caption, 0, kb_ensure_back(kb_clean($kb)));
         } else {
             $msgId = (int) Tg::send($adminId, $caption, $kb);
         }
-        if ($msgId && $sent[1] === 0) {
-            $sent = [(string) $adminId, (int) $msgId];
+        if ($msgId <= 0) {
+            continue;
+        }
+        DB::exec('INSERT OR IGNORE INTO receipt_cards(receipt_id, chat_id, message_id, content_type) VALUES(?,?,?,?)',
+            [$receiptId, $chat, $msgId, $type]);
+        $known[$chat] = ['message_id' => $msgId, 'content_type' => $type];
+        if ($sent[1] === 0) {
+            $sent = [$chat, $msgId];
         }
     }
+    /* ستون‌های قدیمی برای سازگاری و بازیابی یک کارت نمونه باقی می‌مانند. */
     if ($sent[1] > 0) {
         DB::exec('UPDATE receipts SET card_chat=?, card_msg=? WHERE id=?',
             [$sent[0], $sent[1], $receiptId]);
@@ -12111,16 +12854,36 @@ function receipt_close_card(int $receiptId, bool $approve, int $adminId, string 
         return;
     }
     $caption = receipt_card_text($receipt, $order, $approve ? 'approved' : 'rejected', $footer);
-    $chat = (string) ($receipt['card_chat'] ?? '');
-    $msgId = (int) ($receipt['card_msg'] ?? 0);
-    if ($chat === '' || $msgId <= 0) {
-        return;
+    $cards = DB::all('SELECT chat_id, message_id, content_type FROM receipt_cards WHERE receipt_id=?', [$receiptId]);
+    /* fallback برای رسیدهای ساخته‌شده پیش از جدول receipt_cards */
+    if ($cards === []) {
+        $chat = (string) ($receipt['card_chat'] ?? '');
+        $msgId = (int) ($receipt['card_msg'] ?? 0);
+        if ($chat !== '' && $msgId > 0) {
+            $cards[] = ['chat_id' => $chat, 'message_id' => $msgId,
+                'content_type' => (string) ($receipt['photo_id'] ?? '') !== '' ? 'photo' : 'text'];
+        }
     }
-    Tg::editCaption($chat, $msgId, $caption, null);
+    foreach ($cards as $card) {
+        $chat = (string) ($card['chat_id'] ?? '');
+        $msgId = (int) ($card['message_id'] ?? 0);
+        if ($chat === '' || $msgId <= 0) {
+            continue;
+        }
+        if ((string) ($card['content_type'] ?? 'photo') === 'text') {
+            Tg::edit($chat, $msgId, $caption, []);
+        } else {
+            Tg::editCaption($chat, $msgId, $caption, null);
+        }
+    }
 }
 
 function review_receipt(int $receiptId, bool $approve, int $adminId): array
 {
+    /* دفاع لایه‌ای: حتی فراخوانی مستقیم این سرویس هم فقط برای نقش رسید است. */
+    if (!admin_can($adminId, 'receipt')) {
+        return [false, 'دسترسی بررسی رسید ندارید.'];
+    }
     $receipt = DB::one('SELECT * FROM receipts WHERE id=?', [$receiptId]);
     if ($receipt === null) {
         return [false, 'رسید پیدا نشد'];
@@ -12132,8 +12895,14 @@ function review_receipt(int $receiptId, bool $approve, int $adminId): array
     if ($order === null) {
         return [false, 'سفارش پیدا نشد'];
     }
-    DB::exec('UPDATE receipts SET status=?, reviewed_by=?, reviewed_at=? WHERE id=?',
+    /* سه مسئول ممکن است هم‌زمان روی یک کارت بزنند؛ فقط اولین نفر حق
+       تغییر pending را دارد تا تحویل/اعتبار هرگز دوبار اجرا نشود. */
+    $claimed = DB::update("UPDATE receipts SET status=?, reviewed_by=?, reviewed_at=? "
+        . "WHERE id=? AND status='pending'",
         [$approve ? 'approved' : 'rejected', $adminId, now_ts(), $receiptId]);
+    if ($claimed !== 1) {
+        return [false, 'این رسید همین حالا توسط مسئول دیگری بررسی شد'];
+    }
     log_payment('card receipt reviewed', [
         'receipt' => $receiptId, 'approve' => $approve, 'admin' => $adminId,
         'tg' => (int) $receipt['tg_id'], 'amount' => (int) $receipt['amount'],
@@ -12168,11 +12937,14 @@ function review_receipt(int $receiptId, bool $approve, int $adminId): array
 
 function screen_receipts(int|string $chat, ?int $messageId): void
 {
+    $full = admin_can(console_actor_id(), 'full');
+    $backData = $full ? 'ad:finance' : 'ad:home';
+    $backText = $full ? '« مالی' : '« مدیریت';
     $rows = DB::all("SELECT * FROM receipts WHERE status='pending' ORDER BY id LIMIT 10");
     if (!$rows) {
         Tg::show($chat, $messageId, '🧾 رسید در انتظاری نیست.',
             [[btn('🔎 جستجو با کد پیگیری', 'ad:rsearch', null, 'success')],
-             [btn('« مالی', 'ad:finance', null, 'danger')]]);
+             [btn($backText, $backData, null, 'danger')]]);
         return;
     }
     Tg::send($chat, '🔎 اگر رسید مشخصی را می‌خواهی، با کد پیگیری جستجو کنید.',
@@ -12191,6 +12963,8 @@ function screen_receipts(int|string $chat, ?int $messageId): void
             Tg::send($chat, $caption, $markup);
         }
     }
+    Tg::send($chat, 'برای بازگشت به منوی مدیریت:',
+        [[btn($backText, $backData, null, 'danger')]]);
 }
 
 /* 15) Wizard engine — هر ورودی چندمرحله‌ای از همین‌جا رد می‌شود */
@@ -12378,6 +13152,28 @@ function wiz_finish(int $uid, array $data): void
     $values = $data['values'];
     $ctx = $data['ctx'] ?? [];
     switch ($data['flow']) {
+        case 'admin_staff_target':
+            /* این کنترل دوباره لازم است: ممکن است نقش کاربر حین ویزارد تغییر کرده باشد. */
+            if (!admin_can_manage_roles($uid)) {
+                Tg::send($uid, '⛔️ فقط مالک اصلی می‌تواند سطح دسترسی تعیین کند.',
+                    [[btn('« مدیریت', 'ad:home', null, 'danger')]]);
+                return;
+            }
+            $targetId = (int) ($values['tg_id'] ?? 0);
+            if ($targetId <= 0 || is_bot_self($targetId)) {
+                Tg::send($uid, '❌ شناسهٔ عددی معتبرِ یک حساب تلگرام را بفرستید؛ حساب خود ربات مجاز نیست.',
+                    [[btn('➕ تلاش دوباره', 'ad:staff:add', null, 'primary'),
+                     btn('« مدیران', 'ad:staff', null, 'danger')]]);
+                return;
+            }
+            if (admin_is_primary($targetId)) {
+                Tg::send($uid, '⚠️ این شناسه همان مالک اصلیِ قفل‌شده است؛ قابل تغییر نیست.',
+                    [[btn('« مدیران', 'ad:staff', null, 'danger')]]);
+                return;
+            }
+            screen_admin_staff_role_picker($uid, null, $targetId);
+            return;
+
         case 'cat_new':
             $name = trim((string) ($values['name'] ?? ''));
             if ($name === '') {
@@ -13203,7 +13999,8 @@ function handle_callback_inner(array $cb): void
         return;
     }
     if ($head === 'help') {
-        $admin = is_owner($uid);
+        /* راهنمای حاوی اتصال/API و مالی فقط برای سطح کامل است. */
+        $admin = admin_can($uid, 'full');
         if ($data === 'help:home') {
             Tg::show($chatId, $messageId,
                 "🎓 <b>راهنما</b>\n\nیک بخش را انتخاب کنید یا جستجو کنید.",
@@ -13705,8 +14502,8 @@ function handle_callback_inner(array $cb): void
     /* ── مدیریت ───────────────────────────────────────────────────────── */
     /* ── 📢 قفل کانال اجباری (مسیر مستقیم پنل مدیریت) ─────────────────── */
     if ($head === 'fj') {
-        if (!is_owner($uid)) {
-            Tg::answer($cbId, '⛔️ این بخش فقط برای مالک ربات است.', true);
+        if (!admin_can($uid, 'full')) {
+            Tg::answer($cbId, '⛔️ تنظیم قفل کانال فقط برای مالک و هم‌مالک است.', true);
             return;
         }
         $op = (string) ($parts[1] ?? '');
@@ -13728,12 +14525,16 @@ function handle_callback_inner(array $cb): void
                 . 'آیدی یا لینک کانال را بفرستید:' . "\n"
                 . '· <code>@my_channel</code>' . "\n"
                 . '· <code>https://t.me/my_channel</code>' . "\n"
-                . '· یا شناسهٔ عددی <code>-1001234567890</code>' . "\n\n"
-                . '<i>ربات باید در آن کانال «مدیر» باشد؛ وگرنه ذخیره نمی‌شود.</i>',
+                . '· یا شناسهٔ عددی <code>-1001234567890</code>' . "\n"
+                . '· کانال خصوصی: <code>-100… https://t.me/+…</code>' . "\n\n"
+                . '<i>ربات ابتدا نوع چت را بررسی می‌کند، سپس باید در آن «مدیر» باشد. '
+                . 'لینک خصوصیِ تنها شناسهٔ کانال را آشکار نمی‌کند.</i>',
                 [[btn('🔙 انصراف / بازگشت', 'ad:fj', null, 'danger')]]);
             return;
         } elseif ($op === 'del') {
             set_put('force_channel_id', '');
+            set_put('force_channel_username', '');
+            set_put('force_channel_join_link', '');
             set_put('force_channel_on', '0');
             Tg::answer($cbId, '🗑 کانال اجباری حذف شد.');
         }
@@ -13746,9 +14547,18 @@ function handle_callback_inner(array $cb): void
         Tg::send($chatId, 'این دکمه دیگر معتبر نیست.', home_kb($uid));
         return;
     }
-    if (!is_owner($uid)) {
-        Tg::answer($cbId, '⛔️ پنل مدیریت فقط برای مالک ربات باز است.', true);
-        Tg::send($chatId, '⛔️ این بخش فقط برای مالک ربات است.', home_kb($uid));
+    if (!is_console_admin($uid)) {
+        Tg::answer($cbId, '⛔️ این بخش برای مدیران تعیین‌شده است.', true);
+        Tg::send($chatId, '⛔️ این بخش فقط برای مدیران تعیین‌شده باز است.', home_kb($uid));
+        return;
+    }
+    /* گارد مرکزی RBAC: حتی callback کپی‌شده هم از سطح دسترسی بالاتر عبور نمی‌کند. */
+    if (!admin_callback_allowed($uid, $data)) {
+        Tg::answer($cbId, '⛔️ سطح دسترسی شما برای این بخش کافی نیست.', true);
+        Tg::send($chatId, '⛔️ <b>دسترسی کافی نیست</b>
+
+'
+            . 'این بخش در سطح دسترسی شما فعال نشده است.', console_kb());
         return;
     }
     /* ⛔️ قفل اجباری: تا ثبت گروه گزارشات، فقط همان یک دکمه کار می‌کند */
@@ -14226,7 +15036,9 @@ function handle_callback_inner(array $cb): void
             $tgId = (int) ($parts[2] ?? 0);
             $user = user_get($tgId);
             if ($user === null) {
-                screen_wallets($chatId, $messageId);
+                Tg::show($chatId, $messageId,
+                    '🔎 کاربر موردنظر پیدا نشد یا دیگر در ربات ثبت نیست.',
+                    [[btn('« کاربران', 'ad:users', null, 'danger')]]);
                 return;
             }
             $sub = (string) ($parts[3] ?? '');
@@ -14839,6 +15651,12 @@ function handle_callback_inner(array $cb): void
         case 'setg':
             screen_settings($chatId, null, (string) ($parts[2] ?? 'home'));
             return;
+        case 'staff':
+            admin_staff_callback($uid, $chatId, $messageId, $cbId, $parts);
+            return;
+        case 'ops':
+            screen_ops_logs($chatId, $messageId);
+            return;
         case 'upd':
             /* بروزرسانی از مخزن گیت‌هاب: نمایش وضعیت، بررسی مجدد، اجرا */
             $op = (string) ($parts[2] ?? '');
@@ -15016,13 +15834,13 @@ function handle_message_inner(array $message): void
     if ($text === '/help' || $text === '/راهنما') {
         State::clear($uid);
         Tg::send($chatId, "🎓 <b>راهنما</b>\n\nیک بخش را انتخاب کنید یا جستجو کنید.",
-            help_home_kb(is_owner($uid)));
+            help_home_kb(admin_can($uid, 'full')));
         return;
     }
     if ($text === '/admin' || $text === '/مدیریت') {
         State::clear($uid);
-        if (!is_owner($uid)) {
-            Tg::send($chatId, '⛔️ پنل مدیریت فقط برای مالک ربات باز است.');
+        if (!is_console_admin($uid)) {
+            Tg::send($chatId, '⛔️ پنل مدیریت برای شما فعال نیست.');
             return;
         }
         screen_console($chatId, null);
@@ -15043,7 +15861,7 @@ function handle_message_inner(array $message): void
 
     /* ── بازگردانی بکاپ: مالک فایل sibil-backup-*.sqlite3 را می‌فرستد ──── */
     $doc = $message['document'] ?? null;
-    if (is_array($doc) && !empty($doc['file_id']) && is_owner($uid)) {
+    if (is_array($doc) && !empty($doc['file_id']) && admin_can($uid, 'full')) {
         $docName = (string) ($doc['file_name'] ?? '');
         $docSize = (int) ($doc['file_size'] ?? 0);
         $isBackupName = preg_match('/\.(sqlite3|db|panelbak)$/i', $docName) === 1
@@ -15110,7 +15928,7 @@ function handle_message_inner(array $message): void
 
         case 'help_search':
             State::clear($uid);
-            $hits = help_matches($text, is_owner($uid));
+            $hits = help_matches($text, admin_can($uid, 'full'));
             if (!$hits) {
                 Tg::send($chatId, 'چیزی پیدا نشد. یک کلمهٔ دیگر امتحان کنید.',
                     [[btn('« راهنما', 'help:home', null, 'danger')]]);
@@ -15197,8 +16015,9 @@ function handle_message_inner(array $message): void
 
         case 'fj_channel':
             /* ثبت کانال اجباری: تجزیه → بررسی مدیر بودن ربات → ذخیره */
-            if (!is_owner($uid)) {
+            if (!admin_can($uid, 'full')) {
                 State::clear($uid);
+                Tg::send($chatId, '⛔️ سطح دسترسی تنظیم کانال را ندارید.');
                 return;
             }
             if (in_array(trim($text), ['لغو', 'انصراف', 'cancel', '/cancel'], true)) {
@@ -15206,37 +16025,34 @@ function handle_message_inner(array $message): void
                 Tg::send($chatId, 'انصراف داده شد.', force_channel_admin_kb());
                 return;
             }
-            [$chOk, $chChat, $chUsername, $chWhy] = force_channel_parse($text);
+            /* parse → getChat(type) → getChatMember(admin); شناسهٔ نهایی همیشه canonical است. */
+            [$chOk, $chChat, $chUsername, $chLink, $chWhy] = force_channel_validate($text);
             if (!$chOk) {
-                Tg::send($chatId, '❌ ' . $chWhy . "\n\n" . 'دوباره بفرستید.',
-                    [[btn('🔙 انصراف / بازگشت', 'ad:fj', null, 'danger')]]);
-                return;
-            }
-            [$chAdmin, $chAdminWhy] = force_channel_bot_admin($chChat);
-            if (!$chAdmin) {
-                Tg::send($chatId, '⚠️ ' . $chAdminWhy . "\n\n" . 'دوباره بفرستید '
+                Tg::send($chatId, $chWhy . "\n\n" . 'دوباره بفرستید '
                     . 'یا «🔙 انصراف / بازگشت» را بزنید.',
                     [[btn('🔙 انصراف / بازگشت', 'ad:fj', null, 'danger')]]);
                 return;
             }
             State::clear($uid);
-            set_put('force_channel_id', $chUsername !== '' ? '@' . $chUsername : $chChat);
+            set_put('force_channel_id', $chChat);
+            set_put('force_channel_username', $chUsername);
+            set_put('force_channel_join_link', $chLink);
             set_put('force_channel_on', '1');
-            $chLink = force_channel_link();
             Tg::send($chatId, "✅ <b>کانال اجباری ذخیره و فعال شد</b>\n" . SEP . "\n"
-                . 'کانال: <code>' . e($chUsername !== '' ? '@' . $chUsername : $chChat)
-                . '</code>' . "\n"
+                . 'شناسهٔ عددی: <code>' . e($chChat) . '</code>' . "\n"
+                . 'نوع: ' . ($chUsername !== '' ? 'کانال عمومی' : 'کانال/گروه خصوصی') . "\n"
                 . 'لینک عضویت: ' . ($chLink !== '' ? '<code>' . e($chLink) . '</code>'
-                    : '—') . "\n\n"
-                . '<i>ربات مدیر این کانال است و قفل برای همهٔ کاربران فعال شد. '
+                    : '— (برای نمایش دکمهٔ عضویت، لینک خصوصی را همراه شناسه بفرستید)') . "\n\n"
+                . '<i>نوع چت و مدیر بودن ربات تأیید شد؛ قفل برای کاربران فعال است. '
                 . 'مالک و ادمین‌ها قفل نمی‌شوند.</i>',
                 force_channel_admin_kb());
             return;
 
         case 'report_group_id':
             /* ثبت گروه گزارشات: اعتبارسنجی (-100…) → پیام تست → ذخیره */
-            if (!is_owner($uid)) {
+            if (!admin_can($uid, 'full')) {
                 State::clear($uid);
+                Tg::send($chatId, '⛔️ سطح دسترسی تنظیم گروه گزارشات را ندارید.');
                 return;
             }
             if (in_array(trim($text), ['لغو', 'انصراف', 'cancel'], true)) {
@@ -16383,8 +17199,79 @@ function bot_commands_sync(bool $force = false): bool
     return $ok;
 }
 
+/**
+ * دکمهٔ آبی Mini App از سطح پیش‌فرض بات پاک می‌شود؛ نوع commands همان منوی
+ * دستور استاندارد تلگرام است. مهر در DB مانع درخواست تکراری در هر ری‌استارت است.
+ */
+function bot_menu_button_sync(bool $force = false): bool
+{
+    /* این درخواست ذاتاً idempotent است. عمداً در هر آغاز poll اجرا می‌شود تا اگر
+       Mini App از BotFather یا اجرای قدیمی مانده باشد، همان لحظه حذف شود؛ مهر DB
+       فقط برای گزارش/عیب‌یابی است، نه دلیلی برای رد کردن درخواست رسمی. */
+    $res = Tg::call('setChatMenuButton', ['menu_button' => ['type' => 'commands']]);
+    $ok = is_array($res) && (($res['ok'] ?? false) === true);
+    if ($ok) {
+        set_put('bot_menu_button_mode', 'commands');
+        set_put('bot_menu_button_at', (string) now_ts());
+        log_line('info', 'telegram chat menu button reset to commands');
+    } else {
+        log_line('warning', 'telegram setChatMenuButton failed; will retry on next startup');
+    }
+    return $ok;
+}
+
+/**
+ * قفل سطح‌فایل برای long polling. حتی اگر یک runner قدیمی کنار systemd روشن
+ * مانده باشد، فقط یکی اجازهٔ getUpdates دارد و /start دوبار اجرا نمی‌شود.
+ */
+function polling_lock_acquire(): bool
+{
+    $path = panel_home() . '/.poll.lock';
+    $handle = @fopen($path, 'c+');
+    if ($handle === false) {
+        log_line('error', 'could not open polling lock: ' . $path);
+        return false;
+    }
+    if (!@flock($handle, LOCK_EX | LOCK_NB)) {
+        @fclose($handle);
+        log_line('warning', 'second polling worker refused: lock is held');
+        return false;
+    }
+    @ftruncate($handle, 0);
+    @fwrite($handle, (string) getmypid() . "\n");
+    @fflush($handle);
+    $GLOBALS['panel_poll_lock'] = $handle;
+    return true;
+}
+
+function polling_lock_release(): void
+{
+    $handle = $GLOBALS['panel_poll_lock'] ?? null;
+    if (is_resource($handle)) {
+        @flock($handle, LOCK_UN);
+        @fclose($handle);
+    }
+    unset($GLOBALS['panel_poll_lock']);
+}
+
 function cli_poll(int $seconds = 0): void
 {
+    if (!polling_lock_acquire()) {
+        return;
+    }
+    try {
+    /* این سرویس فقط long polling دارد: وب‌هوک و آپدیت‌های معوق پاک می‌شوند تا
+       نه وب‌هوک قدیمی و نه worker دوم /start را دوبار تحویل ندهند. */
+    try {
+        $webhook = Tg::call('deleteWebhook', ['drop_pending_updates' => true]);
+        if (!is_array($webhook) || (($webhook['ok'] ?? false) !== true)) {
+            log_line('warning', 'deleteWebhook(drop_pending_updates=true) did not confirm');
+        } else {
+            log_line('info', 'telegram webhook cleared for single-worker polling');
+        }
+    } catch (Throwable $ex) {
+        log_line('warning', 'deleteWebhook on polling startup failed: ' . $ex->getMessage());
+    }
     /* اگر مالک از پنل درخواست بازگردانی بکاپ داده باشد، همین‌جا اعمال می‌شود */
     try {
         backup_restore_apply_pending();
@@ -16405,6 +17292,14 @@ function cli_poll(int $seconds = 0): void
         log_line('warning', 'bot username sync failed: ' . $ex->getMessage());
     }
     bot_commands_sync();
+    bot_menu_button_sync();
+    /* نصب‌های قدیمی ممکن است @username ذخیره کرده باشند؛ فقط پس از همان
+       اعتبارسنجی کامل Telegram به شناسهٔ canonical مهاجرت می‌شوند. */
+    try {
+        force_channel_upgrade_legacy();
+    } catch (Throwable $ex) {
+        log_line('warning', 'force-join legacy migration failed: ' . $ex->getMessage());
+    }
     /* استارتاپ: تاپیک‌های احراز هویت ساخته/نام‌گذاری شوند */
     try {
         kyc_topics_startup();
@@ -16485,11 +17380,15 @@ function cli_poll(int $seconds = 0): void
             if (report_ready()) {
                 post_report(daily_report_text(), 'daily');
             } else {
-                foreach (admin_ids() as $adminId) {
-                    Tg::send($adminId, daily_report_text());
+                $primary = primary_owner_id();
+                if ($primary > 0) {
+                    Tg::send($primary, daily_report_text());
                 }
             }
         }
+    }
+    } finally {
+        polling_lock_release();
     }
 }
 
@@ -16664,93 +17563,213 @@ function cli_main(array $argv): int
 
 /* 26) قفل عضویت اجباری کانال
    ─────────────────────────────────────────────────────────────────────────
-   مدیر از مسیر «⚙️ پنل مدیریت ➔ 📢 قفل کانال اجباری» کانال را وصل می‌کند.
-   پیش از ذخیره، ربات با getChatMember بررسی می‌کند که خودش در آن کانال
-   «مدیر» باشد؛ وگرنه قفل هرگز کار نمی‌کند و کاربر بی‌گناه بسته می‌شود.
-   مالک و ادمین‌ها هیچ‌وقت قفل نمی‌شوند.
+   پیش از ذخیرهٔ کانال، ابتدا getChat اجرا می‌شود تا معلوم شود ورودی واقعاً
+   channel/supergroup است؛ فقط بعد از آن getChatMember وضعیت مدیر بودن ربات را
+   بررسی می‌کند. بنابراین آیدی یک ربات یا کاربر، خطای گمراه‌کنندهٔ «ربات مدیر
+   نیست» تولید نمی‌کند.
 */
 
-/** شناسهٔ عددی خود ربات — از پیش‌شمارهٔ توکن خوانده می‌شود */
+/** شناسهٔ عددی خود ربات — از پیش‌شمارهٔ توکن یا override خوانده می‌شود. */
 function bot_numeric_id(): int
 {
-    static $id = null;
-    if ($id === null) {
-        $id = 0;
-        $token = bot_token();
-        if ($token !== '' && str_contains($token, ':')) {
-            $id = (int) substr($token, 0, (int) strpos($token, ':'));
-        }
-        $override = (int) cfg('PANEL_BOT_ID', '0');
-        if ($override > 0) {
-            $id = $override;
-        }
-    }
-    return $id;
+    $override = (int) cfg('PANEL_BOT_ID', '0');
+    return $override > 0 ? $override : bot_self_id();
 }
 
-/** مقدار خام ذخیره‌شده (@name یا لینک t.me یا شناسهٔ عددی) */
+/** شناسهٔ canonical ذخیره‌شده؛ بعد از اعتبارسنجی همیشه شناسهٔ عددی تلگرام است. */
 function force_channel_raw(): string
 {
     return trim((string) set_get('force_channel_id', ''));
 }
 
-/** آیا قفل روشن است و کانالی هم تنظیم شده است؟ */
+function force_channel_join_link(): string
+{
+    return trim((string) set_get('force_channel_join_link', ''));
+}
+
+/** آیا یک شناسهٔ canonical معتبر کانال/سوپرگروه ذخیره شده است؟ */
+function force_channel_canonical_id(string $chat): bool
+{
+    return preg_match('/^-100\d{6,}$/', trim($chat)) === 1;
+}
+
+/** آیا قفل روشن است و کانال معتبرِ ذخیره‌شده‌ای دارد؟
+ * شناسه‌های قدیمی @username تا مهاجرت getChat هرگز قفل را فعال نمی‌کنند. */
 function force_channel_ready(): bool
 {
-    return set_bool('force_channel_on', false) && force_channel_raw() !== '';
+    return set_bool('force_channel_on', false) && force_channel_canonical_id(force_channel_raw());
 }
 
 /**
- * تجزیهٔ ورودی مدیر → [ok, chat, username, why]
- * ورودی مجاز: `@name` · `name` · `https://t.me/name` · `-100…`
+ * مهاجرت بی‌خطر نصب‌های قدیمی: username ذخیره‌شده را فقط اگر Telegram همان لحظه
+ * با getChat و getChatMember تأیید کند به -100… تبدیل می‌کنیم. در خطای شبکه هیچ
+ * مقدار حدسی یا نامعتبر ذخیره/جایگزین نمی‌شود.
+ */
+function force_channel_upgrade_legacy(): void
+{
+    $legacy = force_channel_raw();
+    if (!set_bool('force_channel_on', false) || $legacy === '' || force_channel_canonical_id($legacy)) {
+        return;
+    }
+    [$ok, $canonical, $username, $join, $why] = force_channel_validate($legacy);
+    if (!$ok) {
+        log_line('warning', 'force-join legacy channel requires revalidation: ' . strip_tags($why));
+        return;
+    }
+    set_put('force_channel_id', $canonical);
+    set_put('force_channel_username', $username);
+    set_put('force_channel_join_link', $join);
+    log_line('info', 'force-join legacy channel migrated to canonical ID');
+}
+
+/**
+ * نرمال‌سازی ورودی مدیر → [ok, chat, username, why, meta]
+ *
+ * پشتیبانی‌شده:
+ *  - @channel / channel / t.me/channel
+ *  - -100…
+ *  - لینک پیام خصوصی t.me/c/<internal-id>/<message-id> → -100<internal-id>
+ *  - -100… همراه با لینک join خصوصی t.me/+hash (برای دکمهٔ عضویت)
+ *
+ * نکتهٔ فنی: Telegram Bot API امکان تبدیل «فقط» hash لینک t.me/+… به شناسهٔ
+ * کانال را ندارد. با حدس زدن چنین شناسه‌ای، قفل برای همهٔ کاربران خراب می‌شود؛
+ * پس در آن حالت راهنمای دقیق می‌دهیم، نه پیام اشتباه مدیر نبودن ربات.
  */
 function force_channel_parse(string $raw): array
 {
-    $raw = trim($raw);
-    $raw = trim($raw, "\"'<> \t\n\r");
+    $raw = trim(trim($raw), "\"'<> \t\n\r");
     if ($raw === '') {
-        return [false, '', '', 'آیدی یا لینک کانال را بفرستید.'];
+        return [false, '', '', 'آیدی یا لینک کانال را بفرستید.', []];
     }
-    if (preg_match('~^-100\d{6,}$~', $raw)) {
-        return [true, $raw, '', ''];
+
+    $meta = ['join_link' => ''];
+    if (preg_match('~(?:https?://)?(?:www\.)?t\.me/(?:\+|joinchat/)([A-Za-z0-9_-]{8,})/?~i', $raw, $m)) {
+        $meta['join_link'] = 'https://t.me/+' . $m[1];
+    }
+
+    /* لینکِ پیام یک کانال خصوصی، برخلاف لینک دعوت، internal id را آشکار می‌کند. */
+    if (preg_match('~(?:https?://)?(?:www\.)?t\.me/c/(\d{6,})(?:/\d+)?/?~i', $raw, $m)) {
+        return [true, '-100' . $m[1], '', '', $meta];
+    }
+    /* اجازهٔ «-100… + لینک خصوصی» برای کانال خصوصی و دکمهٔ join. */
+    if (preg_match('~(^|\s)(-100\d{6,})(?:\s|$)~', $raw, $m)) {
+        return [true, $m[2], '', '', $meta];
+    }
+    /* Bot API نمی‌تواند hash دعوت خصوصی را به chat_id تبدیل کند. */
+    if ($meta['join_link'] !== '') {
+        return [false, '', '', "لینک عضویت خصوصی به‌تنهایی شناسهٔ عددی کانال را نشان نمی‌دهد.\n"
+            . 'ربات را مدیر کنید و شناسهٔ <code>-100…</code> را بفرستید؛ یا هر دو را در یک پیام بفرستید:'
+            . "\n<code>-1001234567890 https://t.me/+...</code>", $meta];
     }
     if (preg_match('~^(?:https?://)?(?:www\.)?t\.me/(?:s/)?([A-Za-z][A-Za-z0-9_]{3,31})/?$~i', $raw, $m)) {
-        return [true, '@' . $m[1], $m[1], ''];
+        return [true, '@' . $m[1], $m[1], '', $meta];
     }
     if (preg_match('~^@?([A-Za-z][A-Za-z0-9_]{3,31})$~', $raw, $m)) {
-        return [true, '@' . $m[1], $m[1], ''];
+        return [true, '@' . $m[1], $m[1], '', $meta];
     }
-    return [false, '', '', 'این آیدی معتبر نیست. نمونهٔ درست: @my_channel یا https://t.me/my_channel'];
+    return [false, '', '', 'این آیدی معتبر نیست. نمونهٔ درست: <code>@my_channel</code> یا '
+        . '<code>https://t.me/my_channel</code> یا <code>-1001234567890</code>.', $meta];
 }
 
-/** لینک عمومی کانال برای دکمهٔ «📢 عضویت در کانال» */
+/**
+ * اعتبارسنجی کامل: parse → getChat(type) → getChatMember(bot administrator).
+ * خروجی: [ok, canonicalId, username, joinLink, why].
+ */
+function force_channel_validate(string $raw): array
+{
+    [$parsed, $chat, $username, $why, $meta] = force_channel_parse($raw);
+    if (!$parsed) {
+        return [false, '', '', '', $why];
+    }
+
+    /* مهم: پیش از getChatMember حتماً نوع چت را از تلگرام می‌گیریم. */
+    $info = Tg::getChat($chat);
+    if (Tg::$dry && $info === null) {
+        /* تست خشک باید همان مسیر اعتبارسنجی را بدون شبکه طی کند. */
+        $info = ['id' => '-1001234567890', 'type' => 'channel', 'username' => $username];
+    }
+    /* برخی تست‌های قدیمی فقط type را stub می‌کنند؛ برای آن‌ها شناسهٔ canonical
+       مصنوعی می‌گذاریم تا همان قاعدهٔ «فقط -100… ذخیره شود» حفظ شود. */
+    if (Tg::$dry && is_array($info) && empty($info['id'])
+        && in_array((string) ($info['type'] ?? ''), ['channel', 'supergroup'], true)) {
+        $info['id'] = '-1001234567890';
+    }
+    if (!is_array($info)) {
+        $own = trim(ltrim(bot_username(), '@'));
+        if ($username !== '' && $own !== '' && strcasecmp($username, $own) === 0) {
+            return [false, '', '', '', '⚠️ این شناسه مربوط به خودِ ربات است، نه کانال. '
+                . 'فقط کانال یا سوپرگروه را وارد کنید.'];
+        }
+        return [false, '', '', '', 'کانال با این شناسه پیدا نشد یا ربات هنوز به آن دسترسی ندارد. '
+            . 'اگر شناسهٔ کاربر یا ربات فرستاده‌اید، یک کانال/سوپرگروه بفرستید؛ سپس ربات را مدیر کنید.'];
+    }
+
+    $type = (string) ($info['type'] ?? '');
+    if (!in_array($type, ['channel', 'supergroup'], true)) {
+        $typeWhy = match ($type) {
+            'private' => '⚠️ این شناسه مربوط به یک کاربر یا ربات خصوصی است، نه کانال. '
+                . 'فقط کانال یا سوپرگروه پذیرفته می‌شود.',
+            'group' => '⚠️ این شناسه مربوط به گروه معمولی است، نه کانال یا سوپرگروه. '
+                . 'یک کانال یا سوپرگروه انتخاب کنید.',
+            default => '⚠️ این شناسه مربوط به کانال یا سوپرگروه معتبر نیست. '
+                . 'فقط کانال یا سوپرگروه پذیرفته می‌شود.',
+        };
+        return [false, '', '', '', $typeWhy];
+    }
+
+    $canonical = trim((string) ($info['id'] ?? $chat));
+    if (!force_channel_canonical_id($canonical)) {
+        return [false, '', '', '', 'شناسهٔ عددی معتبر کانال از تلگرام برنگشت؛ دوباره تلاش کنید.'];
+    }
+    $liveUsername = trim(ltrim((string) ($info['username'] ?? $username), '@'));
+    $join = trim((string) ($meta['join_link'] ?? ''));
+    if ($join === '' && $liveUsername !== '') {
+        $join = 'https://t.me/' . $liveUsername;
+    }
+    if ($join === '' && !empty($info['invite_link'])) {
+        $join = trim((string) $info['invite_link']);
+    }
+
+    [$admin, $adminWhy] = force_channel_bot_admin($canonical);
+    if (!$admin) {
+        return [false, '', '', '', $adminWhy];
+    }
+    return [true, $canonical, $liveUsername, $join, ''];
+}
+
+/** لینک عضویت ذخیره‌شده. برای کانال عمومی، بدون هیچ API دیگری ساخته می‌شود. */
 function force_channel_link(string $raw = ''): string
 {
-    $raw = $raw !== '' ? $raw : force_channel_raw();
+    if ($raw === '') {
+        $saved = force_channel_join_link();
+        if ($saved !== '') {
+            return $saved;
+        }
+        $username = trim(ltrim(set_get('force_channel_username', ''), '@'));
+        if ($username !== '') {
+            return 'https://t.me/' . $username;
+        }
+        $raw = force_channel_raw();
+    }
     if ($raw === '') {
         return '';
     }
-    [$ok, $chat, $username] = force_channel_parse($raw);
+    [$ok, $chat, $username, , $meta] = force_channel_parse($raw);
     if (!$ok) {
         return '';
     }
     if ($username !== '') {
         return 'https://t.me/' . $username;
     }
-    /* شناسهٔ عددی: نام کاربری عمومی را از خود تلگرام می‌پرسیم */
-    $info = Tg::getChat($chat);
-    if (is_array($info) && !empty($info['username'])) {
-        return 'https://t.me/' . (string) $info['username'];
-    }
-    if (is_array($info) && !empty($info['invite_link'])) {
-        return (string) $info['invite_link'];
+    if (!empty($meta['join_link'])) {
+        return (string) $meta['join_link'];
     }
     return '';
 }
 
 /**
- * آیا ربات در این کانال مدیر است؟ → [ok, why]
- * بدون این بررسی، قفل برای همهٔ کاربران بی‌اثر می‌شد.
+ * بررسی مدیر بودن ربات. این تابع عمداً getChat صدا نمی‌زند: caller باید اول
+ * force_channel_validate را انجام دهد تا نوع ورودی اعتبارسنجی شده باشد.
  */
 function force_channel_bot_admin(string $chat): array
 {
@@ -16776,21 +17795,16 @@ function force_channel_bot_admin(string $chat): array
 }
 
 /**
- * عضویت یک کاربر → true عضو است، false عضو نیست، null نامعلوم (تلگرام جواب نداد)
+ * عضویت یک کاربر → true عضو است، false عضو نیست، null نامعلوم (تلگرام جواب نداد).
  * در حالت نامعلوم قفل باز می‌ماند تا کسی بی‌دلیل بیرون نماند.
  */
 function force_channel_member(int $uid): ?bool
 {
-    $raw = force_channel_raw();
-    if ($raw === '' || $uid <= 0) {
-        return null;
-    }
-    [, $chat] = force_channel_parse($raw);
-    if ($chat === '') {
+    $chat = force_channel_raw();
+    if ($chat === '' || $uid <= 0) {
         return null;
     }
     if (Tg::$dry) {
-        /* در تست، پاسخ ساختگی getChatMember از Tg::$memberStub خوانده می‌شود */
         if (Tg::$memberStub !== null) {
             return Tg::$memberStub;
         }
@@ -16808,10 +17822,10 @@ function force_channel_member(int $uid): ?bool
     if ($status === 'restricted') {
         return !empty($member['is_member']);
     }
-    return false;   // left · kicked
+    return false;
 }
 
-/** آیا این کاربر باید پشت قفل بماند؟ مالک و ادمین‌ها هرگز */
+/** آیا این کاربر باید پشت قفل بماند؟ تمام نقش‌های ادمین هرگز قفل نمی‌شوند. */
 function force_join_blocked(int $uid): bool
 {
     if (!force_channel_ready()) {
@@ -16823,7 +17837,6 @@ function force_join_blocked(int $uid): bool
     return force_channel_member($uid) === false;
 }
 
-/** متن قفل — همان متنی که در همهٔ بخش‌ها نشان داده می‌شود */
 function force_join_text(): string
 {
     return "⚠️ <b>کاربر گرامی!</b>\n\n"
@@ -16832,7 +17845,6 @@ function force_join_text(): string
         . '<i>اگر عضو هستید و باز هم این پیام را می‌بینید، یک‌بار روی «تایید عضویت 🔄» بزنید.</i>';
 }
 
-/** دکمه‌های قفل: عضویت (شیشه‌ای) + تایید */
 function force_join_kb(): array
 {
     $rows = [];
@@ -16844,13 +17856,11 @@ function force_join_kb(): array
     return $rows;
 }
 
-/** نمایش صفحهٔ قفل (برای روترها) */
 function force_join_show(int|string $chat, ?int $messageId = null): void
 {
     Tg::show($chat, $messageId, force_join_text(), force_join_kb());
 }
 
-/** صفحهٔ مدیریت قفل — وضعیت + سه دکمه */
 function force_channel_admin_kb(): array
 {
     $on = force_channel_ready();
@@ -16867,20 +17877,21 @@ function force_channel_admin_text(): string
 {
     $raw = force_channel_raw();
     $linked = $raw !== '' ? '<code>' . e($raw) . '</code>' : '🔴 تنظیم نشده';
+    $link = force_channel_link();
     $state = force_channel_ready() ? '🟢 روشن' : '🔴 خاموش';
     return "📢 <b>قفل کانال اجباری</b>\n" . SEP . "\n"
         . 'وضعیت: ' . $state . "\n"
-        . 'کانال: ' . $linked . "\n"
-        . 'لینک عضویت: ' . (force_channel_link() !== ''
-            ? '<code>' . e(force_channel_link()) . '</code>' : '—') . "\n"
+        . 'شناسهٔ تأییدشده: ' . $linked . "\n"
+        . 'لینک عضویت: ' . ($link !== '' ? '<code>' . e($link) . '</code>' : '—') . "\n"
         . SEP . "\n"
         . "📋 <b>راهنمای مدیر</b>\n"
         . '۱) ربات را در کانال خود <b>مدیر</b> کنید (دسترسی دیدن پیام‌ها).' . "\n"
-        . '۲) دکمهٔ «🔗 تنظیم آیدی / لینک کانال» را بزنید و آیدی را بفرستید:' . "\n"
+        . '۲) دکمهٔ «🔗 تنظیم آیدی / لینک کانال» را بزنید و یکی از این‌ها را بفرستید:' . "\n"
         . '   · <code>@channel</code> یا <code>https://t.me/channel</code>' . "\n"
-        . '   · یا شناسهٔ عددی کانال، مثل <code>-1001234567890</code>' . "\n"
-        . '۳) ربات خودش بررسی می‌کند که مدیر کانال باشد؛ اگر نبود ذخیره نمی‌کند.' . "\n\n"
-        . '<i>مالک و ادمین‌های ربات هیچ‌وقت قفل نمی‌شوند.</i>';
+        . '   · شناسهٔ عددی <code>-1001234567890</code>' . "\n"
+        . '   · برای کانال خصوصی: <code>-100… https://t.me/+…</code>' . "\n"
+        . '۳) ربات اول نوع چت، بعد مدیر بودن خودش را بررسی می‌کند؛ اگر نبود ذخیره نمی‌کند.' . "\n\n"
+        . '<i>لینک خصوصیِ تنها قابل تبدیل به شناسهٔ کانال نیست؛ این محدودیت Telegram Bot API است.</i>';
 }
 /*
    21) PAYMENTS — درگاه‌های پرداخت: کارت‌به‌کارت · کیف پول · زرین‌پال ·
@@ -19235,6 +20246,7 @@ function product_set_role(int $productId, int $roleId, int $panelId): void
 
 function screen_users(int|string $chat, ?int $messageId, int $page = 1, string $query = ''): void
 {
+    $canFull = admin_can(console_actor_id(), 'full');
     purge_ghost_users();   // ردیف‌های ساختگی جستجو در فهرست نمی‌آیند
     $total = (int) DB::val('SELECT COUNT(*) FROM users WHERE 1=1' . bot_self_sql(), [], 0);
     $blocked = (int) DB::val('SELECT COUNT(*) FROM users WHERE is_blocked=1' . bot_self_sql(),
@@ -19245,9 +20257,11 @@ function screen_users(int|string $chat, ?int $messageId, int $page = 1, string $
     /* هیچ دکمهٔ شیشه‌ای و هیچ ردیف کاربری این‌جا نیست: فقط یک دکمهٔ جستجو،
        بعد از زدن آن ربات شناسه می‌خواهد و مستقیم کارت همان کاربر باز می‌شود. */
     $text = "👥 <b>مدیریت کاربران</b>\n" . SEP . "\n"
-        . '📊 کل کاربران: <b>' . fa_digits($total) . "</b>\n"
-        . '🟢 کیف پول دار: ' . fa_digits($rich) . "\n"
-        . '🚫 مسدود: ' . fa_digits($blocked) . "\n"
+        . '📊 کل کاربران: <b>' . fa_digits($total) . "</b>\n";
+    if ($canFull) {
+        $text .= '🟢 کیف پول دار: ' . fa_digits($rich) . "\n";
+    }
+    $text .= '🚫 مسدود: ' . fa_digits($blocked) . "\n"
         . '🆕 امروز: ' . fa_digits($today) . "\n"
         . SEP . "\n"
         . 'برای دیدن کارت یک کاربر، دکمهٔ «🔍 جستجوی کاربر» را بزنید و شناسهٔ عددی '
@@ -19275,63 +20289,86 @@ function screen_user_card(int|string $chat, ?int $messageId, int $tgId): void
              [btn('« کاربران', 'ad:users', null, 'danger')]]);
         return;
     }
+    $viewer = console_actor_id();
+    $canFull = admin_can($viewer, 'full');
+    $canOps = admin_can($viewer, 'ops') && !$canFull;
     $name = trim((string) ($user['name'] ?? ''));
-    $balance = (int) $user['balance'];
-    /* شارژها: هر واریزی که کیف پول را زیاد کرده (بدون پورسانت و بازگشت وجه) */
-    $deposits = (int) DB::val('SELECT COALESCE(SUM(amount),0) FROM wallet_tx '
-        . "WHERE tg_id=? AND amount>0 AND kind IN ('topup','admin')", [$tgId], 0);
     $activePanels = (int) DB::val("SELECT COUNT(*) FROM panels WHERE tg_id=? "
         . "AND status IN ('active','suspended')", [$tgId], 0);
-    $traffic = (int) DB::val('SELECT COALESCE(SUM(last_usage),0) FROM panels WHERE tg_id=?',
-        [$tgId], 0);
-    $subs = (int) DB::val('SELECT COUNT(*) FROM users WHERE referred_by=?', [$tgId], 0);
-    $level = kyc_level($tgId);
     $blocked = (int) ($user['is_blocked'] ?? 0) === 1;
-    $phone = trim((string) ($user['phone'] ?? ''));
     $uname = trim((string) ($user['uname'] ?? ''));
     $refBy = (int) ($user['referred_by'] ?? 0);
-    $refName = '';
-    if ($refBy > 0) {
-        $refUser = user_get($refBy);
-        $refName = $refUser !== null
-            ? mb_substr(trim((string) ($refUser['name'] ?: (string) $refBy)), 0, 20)
-            . ' · <code>' . $refBy . '</code>'
-            : '<code>' . $refBy . '</code>';
-    }
 
     $text = '👤 <b>اطلاعات کاربری: ' . e($name !== '' ? $name : 'بدون‌نام') . "</b>\n"
         . SEP . "\n"
         . '📌 وضعیت: ' . ($blocked ? '🚫 مسدود' : '🟢 فعال') . "\n"
         . '🔗 یوزرنیم: ' . ($uname !== '' ? '@' . e($uname) : '—') . "\n"
         . '🆔 شناسهٔ عددی: <code>' . $tgId . "</code>\n"
-        . '📱 شمارهٔ موبایل: ' . ($phone !== '' ? '<code>' . e($phone) . '</code>' : '—') . "\n"
-        . '🪪 سطح احراز هویت: ' . kyc_level_emoji($level) . ' سطح '
-            . fa_digits($level) . ' از ' . fa_digits(KYC_MAX_LEVEL) . "\n"
         . '📅 تاریخ عضویت: ' . fa_ts((int) ($user['created_at'] ?? 0)) . "\n"
-        . '🎁 معرف کاربر: ' . ($refBy > 0 ? $refName : 'ندارد (ثبت‌نام مستقیم)') . "\n"
-        . '👥 تعداد زیرمجموعه: ' . fa_digits($subs) . "\n"
-        . SEP . "\n"
-        . "💎 <b>وضعیت مالی و سرویس‌ها:</b>\n"
-        . '👛 موجودی کیف پول: <b>' . money($balance) . "</b>\n"
-        . '💵 مجموع واریزها: ' . money($deposits) . "\n"
-        . '📦 پنل‌های فعال: ' . fa_digits($activePanels) . "\n"
-        . '📊 مجموع ترافیک مصرف‌شده: ' . gb_step_text($traffic) . " گیگابایت\n"
-        . '🎁 تخفیف اختصاصی: ' . user_discount_text($user);
+        . '📦 پنل‌های فعال: ' . fa_digits($activePanels) . "\n";
+
+    if ($canFull) {
+        $balance = (int) $user['balance'];
+        $deposits = (int) DB::val('SELECT COALESCE(SUM(amount),0) FROM wallet_tx '
+            . "WHERE tg_id=? AND amount>0 AND kind IN ('topup','admin')", [$tgId], 0);
+        $traffic = (int) DB::val('SELECT COALESCE(SUM(last_usage),0) FROM panels WHERE tg_id=?',
+            [$tgId], 0);
+        $subs = (int) DB::val('SELECT COUNT(*) FROM users WHERE referred_by=?', [$tgId], 0);
+        $level = kyc_level($tgId);
+        $phone = trim((string) ($user['phone'] ?? ''));
+        $refName = '';
+        if ($refBy > 0) {
+            $refUser = user_get($refBy);
+            $refName = $refUser !== null
+                ? mb_substr(trim((string) ($refUser['name'] ?: (string) $refBy)), 0, 20)
+                . ' · <code>' . $refBy . '</code>' : '<code>' . $refBy . '</code>';
+        }
+        $text .= '📱 شمارهٔ موبایل: ' . ($phone !== '' ? '<code>' . e($phone) . '</code>' : '—') . "\n"
+            . '🪪 سطح احراز هویت: ' . kyc_level_emoji($level) . ' سطح '
+            . fa_digits($level) . ' از ' . fa_digits(KYC_MAX_LEVEL) . "\n"
+            . '🎁 معرف کاربر: ' . ($refBy > 0 ? $refName : 'ندارد (ثبت‌نام مستقیم)') . "\n"
+            . '👥 تعداد زیرمجموعه: ' . fa_digits($subs) . "\n"
+            . SEP . "\n"
+            . "💎 <b>وضعیت مالی و سرویس‌ها:</b>\n"
+            . '👛 موجودی کیف پول: <b>' . money($balance) . "</b>\n"
+            . '💵 مجموع واریزها: ' . money($deposits) . "\n"
+            . '📊 مجموع ترافیک مصرف‌شده: ' . gb_step_text($traffic) . " گیگابایت\n"
+            . '🎁 تخفیف اختصاصی: ' . user_discount_text($user);
+    } else {
+        $text .= SEP . "\n"
+            . '<i>اطلاعات مالی، شمارهٔ کارت و احراز هویت در سطح شما نمایش داده نمی‌شود.</i>';
+    }
 
     $id = $tgId;
-    $rows = [
-        [btn('➕ افزایش موجودی', 'ad:u:' . $id . ':add', null, 'success'),
-         btn('➖ کسر موجودی', 'ad:u:' . $id . ':sub', null, 'danger')],
-        [btn('📦 پنل‌ها و سرویس‌های کاربر', 'ad:u:' . $id . ':panels'),
-         btn('🧾 سوابق تراکنش‌ها', 'ad:u:' . $id . ':tx')],
-        [btn($blocked ? '🚫 رفع مسدودی' : '🚫 مسدودسازی', 'ad:u:' . $id . ':block', null,
-             $blocked ? 'success' : 'danger'),
-         btn('🎁 اعطای تخفیف اختصاصی', 'ad:u:' . $id . ':gift', null, 'success')],
-        [btn('🪪 تغییر دستی سطح احراز', 'ad:u:' . $id . ':kyc'),
-         btn('📩 ارسال پیام به کاربر', 'ad:u:' . $id . ':msg', null, 'success')],
-        [btn('🔄 همگام‌سازی و بروزرسانی', 'ad:u:' . $id . ':sync', null, 'primary'),
-         btn('🔙 بازگشت', 'ad:users', null, 'danger')],
-    ];
+    if ($canFull) {
+        $rows = [
+            [btn('➕ افزایش موجودی', 'ad:u:' . $id . ':add', null, 'success'),
+             btn('➖ کسر موجودی', 'ad:u:' . $id . ':sub', null, 'danger')],
+            [btn('📦 پنل‌ها و سرویس‌های کاربر', 'ad:u:' . $id . ':panels'),
+             btn('🧾 سوابق تراکنش‌ها', 'ad:u:' . $id . ':tx')],
+            [btn($blocked ? '🚫 رفع مسدودی' : '🚫 مسدودسازی', 'ad:u:' . $id . ':block', null,
+                 $blocked ? 'success' : 'danger'),
+             btn('🎁 اعطای تخفیف اختصاصی', 'ad:u:' . $id . ':gift', null, 'success')],
+            [btn('🪪 تغییر دستی سطح احراز', 'ad:u:' . $id . ':kyc'),
+             btn('📩 ارسال پیام به کاربر', 'ad:u:' . $id . ':msg', null, 'success')],
+            [btn('🔄 همگام‌سازی و بروزرسانی', 'ad:u:' . $id . ':sync', null, 'primary'),
+             btn('🔙 بازگشت', 'ad:users', null, 'danger')],
+        ];
+    } elseif ($canOps) {
+        $rows = [
+            [btn('📦 پنل‌ها و سرویس‌های کاربر', 'ad:u:' . $id . ':panels'),
+             btn('🔄 همگام‌سازی پنل‌ها', 'ad:u:' . $id . ':sync', null, 'primary')],
+            [btn('📩 پیام به کاربر', 'ad:u:' . $id . ':msg', null, 'success')],
+            [btn('🔙 بازگشت', 'ad:users', null, 'danger')],
+        ];
+    } else {
+        /* پشتیبانی: مشاهدهٔ کاربر و پاسخ‌گویی، بدون تغییر مالی/فنی. */
+        $rows = [
+            [btn('📦 پنل‌ها و سرویس‌های کاربر', 'ad:u:' . $id . ':panels')],
+            [btn('📩 پاسخ به کاربر', 'ad:u:' . $id . ':msg', null, 'success')],
+            [btn('🔙 بازگشت', 'ad:users', null, 'danger')],
+        ];
+    }
     Tg::show($chat, $messageId, $text, $rows);
 }
 
@@ -19340,25 +20377,31 @@ function screen_user_card(int|string $chat, ?int $messageId, int $tgId): void
 /** صفحهٔ اول: انتخاب نوع جستجو */
 function screen_find(int|string $chat, ?int $messageId): void
 {
+    $canFull = admin_can(console_actor_id(), 'full');
     $panels = (int) DB::val("SELECT COUNT(*) FROM panels WHERE status<>'deleted'", [], 0);
     $orders = (int) DB::val('SELECT COUNT(*) FROM orders', [], 0);
     $payments = (int) DB::val('SELECT COUNT(*) FROM payments', [], 0);
-    Tg::show($chat, $messageId,
-        "🔍 <b>جستجوی سفارشات</b>\n" . SEP . "\n"
-        . '📦 پنل‌های فروخته‌شده: ' . fa_digits($panels) . "\n"
-        . '🧾 فاکتورها: ' . fa_digits($orders) . ' · 💳 تراکنش‌ها: ' . fa_digits($payments)
-        . "\n" . SEP . "\n"
-        . 'یکی از دو نوع جستجو را انتخاب کنید:' . "\n"
-        . '<i>پنل مشتری با نام کاربری یا شناسه پیدا می‌شود؛ فاکتور با شناسه، کد پیگیری '
-        . 'یا کد سفارش.</i>',
-        [[btn('🔍 جستجوی پنل مشتری', 'ad:find:panel', null, 'success')],
-         [btn('🧾 جستجوی فاکتور و تراکنش مالی', 'ad:find:inv', null, 'success')],
-         [btn('« مدیریت', 'ad:home', null, 'danger')]]);
+    $text = "🔍 <b>جستجوی سفارشات</b>\n" . SEP . "\n"
+        . '📦 پنل‌های فروخته‌شده: ' . fa_digits($panels) . "\n";
+    $rows = [[btn('🔍 جستجوی پنل مشتری', 'ad:find:panel', null, 'success')]];
+    if ($canFull) {
+        $text .= '🧾 فاکتورها: ' . fa_digits($orders) . ' · 💳 تراکنش‌ها: '
+            . fa_digits($payments) . "\n"
+            . SEP . "\n" . 'یکی از دو نوع جستجو را انتخاب کنید:' . "\n"
+            . '<i>پنل مشتری با نام کاربری یا شناسه پیدا می‌شود؛ فاکتور با شناسه، '
+            . 'کد پیگیری یا کد سفارش.</i>';
+        $rows[] = [btn('🧾 جستجوی فاکتور و تراکنش مالی', 'ad:find:inv', null, 'success')];
+    } else {
+        $text .= SEP . "\n" . '<i>در سطح اپراتور، فقط جستجو و مدیریت پنل مشتری مجاز است.</i>';
+    }
+    $rows[] = [btn('« مدیریت', 'ad:home', null, 'danger')];
+    Tg::show($chat, $messageId, $text, $rows);
 }
 
 /** کارت کامل یک پنل فروخته‌شده برای مدیر */
 function screen_find_panel(int|string $chat, ?int $messageId, int $panelId): void
 {
+    $canFull = admin_can(console_actor_id(), 'full');
     $panel = DB::one('SELECT * FROM panels WHERE id=?', [$panelId]);
     if ($panel === null) {
         Tg::show($chat, $messageId,
@@ -19393,20 +20436,27 @@ function screen_find_panel(int|string $chat, ?int $messageId, int $panelId): voi
         . '📱 دستگاه مجاز: ' . fa_digits((int) ($panel['device_limit'] ?? 0)) . "\n"
         . '👥 سقف کاربر (User Limit): ' . fa_digits((int) ($panel['max_users'] ?? 0)) . "\n"
         . '🌐 سرور/نود: ' . $server . "\n"
-        . '👤 مالک در تلگرام: ' . $ownerLabel . "\n" . SEP . "\n"
-        . '💰 قیمت هر گیگ: ' . money((int) ($panel['per_gb_price'] ?? 0))
-        . ' · ⏱ ساعتی: ' . money((int) ($panel['hourly_price'] ?? 0)) . "\n";
+        . '👤 مالک در تلگرام: ' . $ownerLabel . "\n";
+    if ($canFull) {
+        $text .= SEP . "\n" . '💰 قیمت هر گیگ: ' . money((int) ($panel['per_gb_price'] ?? 0))
+            . ' · ⏱ ساعتی: ' . money((int) ($panel['hourly_price'] ?? 0)) . "\n";
+    } else {
+        $text .= SEP . "\n" . '<i>مبالغ و حذف دائمی پنل در سطح عملیات نمایش داده نمی‌شوند.</i>';
+    }
     $id = (int) $panel['id'];
     $suspended = (string) $panel['status'] === 'suspended';
-    Tg::show($chat, $messageId, $text, [
+    $rows = [
         [btn($suspended ? '🟢 فعال‌سازی پنل' : '⛔ تعلیق پنل', 'ad:find:pn:' . $id
             . ($suspended ? ':res' : ':sus'), null, $suspended ? 'success' : 'danger')],
         [btn('➕ افزایش سقف کاربر', 'ad:find:pn:' . $id . ':ulup', null, 'success'),
          btn('➖ کاهش سقف کاربر', 'ad:find:pn:' . $id . ':uldn', null, 'danger')],
         [btn('➕ تمدید حجم / تاریخ', 'ad:find:pn:' . $id . ':ext', null, 'success')],
-        [btn('🗑 حذف کامل پنل', 'ad:find:pn:' . $id . ':del', null, 'danger')],
-        [btn('« جستجوی سفارشات', 'ad:find', null, 'danger')],
-    ]);
+    ];
+    if ($canFull) {
+        $rows[] = [btn('🗑 حذف کامل پنل', 'ad:find:pn:' . $id . ':del', null, 'danger')];
+    }
+    $rows[] = [btn('« جستجوی سفارشات', 'ad:find', null, 'danger')];
+    Tg::show($chat, $messageId, $text, $rows);
 }
 
 /** کارت یک فاکتور/تراکنش برای مدیر */
@@ -19934,6 +20984,20 @@ function screen_broadcast(int|string $chat, ?int $messageId, string $notice = ''
 
 function screen_stats(int|string $chat, ?int $messageId): void
 {
+    if (!admin_can(console_actor_id(), 'full')) {
+        $users = (int) DB::val('SELECT COUNT(*) FROM users', [], 0);
+        $newUsers = (int) DB::val('SELECT COUNT(*) FROM users WHERE created_at>=?',
+            [period_start(1)], 0);
+        $panels = (int) DB::val('SELECT COUNT(*) FROM panels', [], 0);
+        $live = (int) DB::val("SELECT COUNT(*) FROM panels WHERE status='active'", [], 0);
+        Tg::show($chat, $messageId, "📊 <b>آمار ساده</b>\n" . SEP . "\n"
+            . '👥 کاربران: <b>' . fa_digits($users) . '</b> · امروز ' . fa_digits($newUsers) . "\n"
+            . '📦 پنل‌ها: ' . fa_digits($panels) . ' · فعال ' . fa_digits($live) . "\n\n"
+            . '<i>فروش، کیف پول و رسیدها در این سطح نمایش داده نمی‌شوند.</i>',
+            [[btn('🔄 به‌روزرسانی', 'ad:stats', null, 'primary')],
+             [btn('« مدیریت', 'ad:home', null, 'danger')]]);
+        return;
+    }
     $today = finance_stats(1);
     $week = finance_stats(7);
     $month = finance_stats(30);

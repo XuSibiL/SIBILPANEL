@@ -1002,6 +1002,7 @@ function receipt_find_card(int|string $chat, ?int $messageId, string $code, int 
 /** کارت یک پنل، پیدا شده با نام کاربری — برای بخش مدیریت */
 function panel_find_card(int|string $chat, ?int $messageId, string $username): void
 {
+    $canFull = admin_can(console_actor_id(), 'full');
     $username = ltrim(trim($username), '@');
     $panel = DB::one("SELECT * FROM panels WHERE panel_username=? AND status<>'deleted' "
         . 'ORDER BY id DESC LIMIT 1', [$username]);
@@ -1020,8 +1021,12 @@ function panel_find_card(int|string $chat, ?int $messageId, string $username): v
         . 'نوع: ' . ((int) $panel['is_trial'] === 1 ? '🧪 تست' : '🛒 خریداری‌شده') . "\n"
         . 'سقف کاربر: ' . ((int) $panel['max_users'] > 0
             ? (string) (int) $panel['max_users'] : 'نامحدود') . "\n"
-        . 'ساخته‌شده: ' . fa_ts((int) $panel['created_at']) . "\n"
-        . 'مصرف کل: ' . money((int) $panel['spent_total']);
+        . 'ساخته‌شده: ' . fa_ts((int) $panel['created_at']);
+    if ($canFull) {
+        $text .= "\n" . 'مصرف کل: ' . money((int) $panel['spent_total']);
+    } else {
+        $text .= "\n" . '<i>مبالغ مصرفی در سطح عملیات نمایش داده نمی‌شود.</i>';
+    }
     Tg::show($chat, $messageId, $text,
         [[btn('👤 کارت کاربر', 'ad:u:' . (int) $panel['tg_id'], null, 'success')],
          [btn('🔎 جستجوی دیگر', 'ad:psearch', null, 'primary')],

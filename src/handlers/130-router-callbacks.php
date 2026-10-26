@@ -282,7 +282,8 @@ function handle_callback_inner(array $cb): void
         return;
     }
     if ($head === 'help') {
-        $admin = is_owner($uid);
+        /* راهنمای حاوی اتصال/API و مالی فقط برای سطح کامل است. */
+        $admin = admin_can($uid, 'full');
         if ($data === 'help:home') {
             Tg::show($chatId, $messageId,
                 "🎓 <b>راهنما</b>\n\nیک بخش را انتخاب کنید یا جستجو کنید.",
@@ -784,8 +785,8 @@ function handle_callback_inner(array $cb): void
     /* ── مدیریت ───────────────────────────────────────────────────────── */
     /* ── 📢 قفل کانال اجباری (مسیر مستقیم پنل مدیریت) ─────────────────── */
     if ($head === 'fj') {
-        if (!is_owner($uid)) {
-            Tg::answer($cbId, '⛔️ این بخش فقط برای مالک ربات است.', true);
+        if (!admin_can($uid, 'full')) {
+            Tg::answer($cbId, '⛔️ تنظیم قفل کانال فقط برای مالک و هم‌مالک است.', true);
             return;
         }
         $op = (string) ($parts[1] ?? '');
@@ -807,12 +808,16 @@ function handle_callback_inner(array $cb): void
                 . 'آیدی یا لینک کانال را بفرستید:' . "\n"
                 . '· <code>@my_channel</code>' . "\n"
                 . '· <code>https://t.me/my_channel</code>' . "\n"
-                . '· یا شناسهٔ عددی <code>-1001234567890</code>' . "\n\n"
-                . '<i>ربات باید در آن کانال «مدیر» باشد؛ وگرنه ذخیره نمی‌شود.</i>',
+                . '· یا شناسهٔ عددی <code>-1001234567890</code>' . "\n"
+                . '· کانال خصوصی: <code>-100… https://t.me/+…</code>' . "\n\n"
+                . '<i>ربات ابتدا نوع چت را بررسی می‌کند، سپس باید در آن «مدیر» باشد. '
+                . 'لینک خصوصیِ تنها شناسهٔ کانال را آشکار نمی‌کند.</i>',
                 [[btn('🔙 انصراف / بازگشت', 'ad:fj', null, 'danger')]]);
             return;
         } elseif ($op === 'del') {
             set_put('force_channel_id', '');
+            set_put('force_channel_username', '');
+            set_put('force_channel_join_link', '');
             set_put('force_channel_on', '0');
             Tg::answer($cbId, '🗑 کانال اجباری حذف شد.');
         }
@@ -825,9 +830,18 @@ function handle_callback_inner(array $cb): void
         Tg::send($chatId, 'این دکمه دیگر معتبر نیست.', home_kb($uid));
         return;
     }
-    if (!is_owner($uid)) {
-        Tg::answer($cbId, '⛔️ پنل مدیریت فقط برای مالک ربات باز است.', true);
-        Tg::send($chatId, '⛔️ این بخش فقط برای مالک ربات است.', home_kb($uid));
+    if (!is_console_admin($uid)) {
+        Tg::answer($cbId, '⛔️ این بخش برای مدیران تعیین‌شده است.', true);
+        Tg::send($chatId, '⛔️ این بخش فقط برای مدیران تعیین‌شده باز است.', home_kb($uid));
+        return;
+    }
+    /* گارد مرکزی RBAC: حتی callback کپی‌شده هم از سطح دسترسی بالاتر عبور نمی‌کند. */
+    if (!admin_callback_allowed($uid, $data)) {
+        Tg::answer($cbId, '⛔️ سطح دسترسی شما برای این بخش کافی نیست.', true);
+        Tg::send($chatId, '⛔️ <b>دسترسی کافی نیست</b>
+
+'
+            . 'این بخش در سطح دسترسی شما فعال نشده است.', console_kb());
         return;
     }
     /* ⛔️ قفل اجباری: تا ثبت گروه گزارشات، فقط همان یک دکمه کار می‌کند */
@@ -1305,7 +1319,9 @@ function handle_callback_inner(array $cb): void
             $tgId = (int) ($parts[2] ?? 0);
             $user = user_get($tgId);
             if ($user === null) {
-                screen_wallets($chatId, $messageId);
+                Tg::show($chatId, $messageId,
+                    '🔎 کاربر موردنظر پیدا نشد یا دیگر در ربات ثبت نیست.',
+                    [[btn('« کاربران', 'ad:users', null, 'danger')]]);
                 return;
             }
             $sub = (string) ($parts[3] ?? '');
@@ -1917,6 +1933,12 @@ function handle_callback_inner(array $cb): void
             return;
         case 'setg':
             screen_settings($chatId, null, (string) ($parts[2] ?? 'home'));
+            return;
+        case 'staff':
+            admin_staff_callback($uid, $chatId, $messageId, $cbId, $parts);
+            return;
+        case 'ops':
+            screen_ops_logs($chatId, $messageId);
             return;
         case 'upd':
             /* بروزرسانی از مخزن گیت‌هاب: نمایش وضعیت، بررسی مجدد، اجرا */

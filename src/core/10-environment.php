@@ -108,20 +108,22 @@ function admin_ids(): array
     return $ids;
 }
 
-/** شناسهٔ حساب‌های مدیریتی: مالک و ادمین‌ها — این‌ها «کاربر» نیستند */
+/** شناسهٔ حساب‌های مدیریتیِ فعال — نقش‌ها از admin_roles خوانده می‌شوند.
+ *  PANEL_ADMINS فقط برای تعیین مالکِ قفل‌شده و مهاجرت یک‌بارهٔ نصب قدیمی است. */
 function staff_ids(): array
 {
-    $ids = [];
-    $owner = owner_id();
-    if ($owner > 0) {
-        $ids[] = $owner;
-    }
-    foreach (admin_ids() as $adminId) {
-        if (!in_array($adminId, $ids, true)) {
-            $ids[] = $adminId;
+    if (function_exists('admin_role_rows')) {
+        $ids = [];
+        foreach (admin_role_rows() as $row) {
+            $id = (int) ($row['tg_id'] ?? 0);
+            if ($id > 0 && !in_array($id, $ids, true)) {
+                $ids[] = $id;
+            }
         }
+        return $ids;
     }
-    return $ids;
+    $owner = primary_owner_env_id();
+    return $owner > 0 ? [$owner] : [];
 }
 
 function is_staff(int $uid): bool
@@ -163,30 +165,28 @@ function bot_self_sql(string $column = 'tg_id', string $prefix = ' AND '): strin
     return $self > 0 ? $prefix . $column . '<>' . $self : '';
 }
 
+/** مدیر فعال: مالک اصلی یا یکی از نقش‌های دیتابیسی. */
 function is_admin(int $uid): bool
 {
-    return in_array($uid, admin_ids(), true);
+    return function_exists('admin_is_console') ? admin_is_console($uid) : false;
 }
 
-/** مالک ربات: تنها کسی که پنل مدیریت برایش باز است */
+/** مالک ربات: فقط مالک اصلیِ قفل‌شده؛ هم‌مالک در این تعریف نیست. */
 function owner_id(): int
 {
-    $row = DB::one("SELECT value FROM settings WHERE key='owner_id'");
-    $id = $row === null ? 0 : (int) $row['value'];
-    if ($id > 0) {
-        return $id;
-    }
-    $first = admin_ids()[0] ?? 0;
-    if ($first > 0) {
-        set_put('owner_id', (string) $first);
-        return $first;
-    }
-    return 0;
+    return function_exists('primary_owner_id') ? primary_owner_id() : primary_owner_env_id();
 }
 
 function is_owner(int $uid): bool
 {
-    return $uid > 0 && $uid === owner_id();
+    return function_exists('admin_is_primary') ? admin_is_primary($uid)
+        : ($uid > 0 && $uid === owner_id());
+}
+
+/** آیا این کاربر برای ورود به کنسول مدیریت مجاز است؟ */
+function is_console_admin(int $uid): bool
+{
+    return function_exists('admin_is_console') ? admin_is_console($uid) : is_owner($uid);
 }
 
 /** آدرس داشبورد پنل کاربر (همان لینکی که خودتان باز می‌کنید) */
