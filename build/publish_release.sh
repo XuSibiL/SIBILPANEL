@@ -154,7 +154,7 @@ else
 import re, sys
 path, version = sys.argv[1], sys.argv[2]
 text = open(path, encoding='utf-8').read()
-m = re.search(r'^## ' + re.escape(version) + r'\n(.*?)(?=^## |\Z)', text, re.S | re.M)
+m = re.search(r'^## ' + re.escape(version) + r'(?:[ \t][^\r\n]*)?\r?\n(.*?)(?=^## |\Z)', text, re.S | re.M)
 print((m.group(1).strip() if m else '')[:5000])
 PY
 )"
