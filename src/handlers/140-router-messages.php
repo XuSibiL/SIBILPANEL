@@ -179,6 +179,12 @@ function handle_message_inner(array $message): void
             bc_job_dispatch();
             return;
 
+        case 'awaiting_support_reply':
+            [$replyOk, $replyNote] = support_reply_deliver($uid, $message, $state);
+            Tg::send($chatId, $replyNote, $replyOk ? home_kb($uid)
+                : [[btn('❌ لغو پاسخ', 'support_reply_cancel', null, 'danger')]]);
+            return;
+
         case 'wiz':
             wiz_advance($message);
             return;

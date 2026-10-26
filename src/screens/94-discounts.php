@@ -5123,7 +5123,7 @@ function kyc_admin_review(int $reqId, bool $approve, int $adminId, string $reaso
             $body .= '📝 دلیل: ' . e($reason) . "\n";
         }
         $body .= "\nمی‌توانید مدارک را درست کنید و از اول بفرستید.";
-        Tg::send($uid, $body, [
+        support_send_admin_message($adminId, $uid, $body, [
             [btn('🔁 تلاش دوباره', 'kyc:home', null, 'success')],
             [btn('☎️ پشتیبانی', 'menu:support', null, 'primary')],
         ]);
@@ -5139,7 +5139,8 @@ function kyc_admin_review(int $reqId, bool $approve, int $adminId, string $reaso
 
     $head = $mask !== '' ? '✅ کارت <code>' . e($mask) . '</code> تأیید شد.'
         : '✅ مدارکت تأیید شد.';
-    Tg::send($uid, $head . ' از این به بعد می‌توانید با آن واریز کنید.' . "\n"
+    support_send_admin_message($adminId, $uid,
+        $head . ' از این به بعد می‌توانید با آن واریز کنید.' . "\n"
         . '⬆️ سطحت هم رفت به ' . KYC_LEVEL_TITLES[$level] . ' – سقف واریزت بالا رفت.',
         [[btn('🪪 وضعیت احراز هویت', 'kyc:home', null, 'success')],
          [btn('« خانه', 'home', null, 'danger')]]);
@@ -5288,6 +5289,7 @@ const REPORT_KINDS = [
     'usage'   => '⚡️ مصرف و صورت‌حساب',
     'panel'   => '📦 پنل‌ها و تعلیق',
     'users'   => '👥 کاربران',
+    'support' => '💬 پشتیبانی',
     'error'   => '⚠️ خطاها',
     'daily'   => '📅 گزارش روزانه',
     'backup'  => '💾 بکاپ',

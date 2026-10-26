@@ -112,6 +112,23 @@ function handle_callback_inner(array $cb): void
         return;
     }
 
+    /* پاسخ به پیام پشتیبانی: ticket باید متعلق به همین کاربر باشد؛ دادهٔ callback
+       حتی اگر دستکاری/حدس زده شود مقصد گفتگو یا اطلاعات کاربر دیگری را فاش نمی‌کند. */
+    if (preg_match('/^reply_support_([1-9][0-9]*)$/D', $data, $replyMatch)) {
+        $ticketId = (int) $replyMatch[1];
+        [$replyOk, $replyNote] = support_reply_start($uid, $ticketId);
+        Tg::answer($cbId, $replyOk ? '✍️ پیام را بفرستید' : 'گفتگو در دسترس نیست', !$replyOk);
+        Tg::send($chatId, $replyNote, $replyOk
+            ? [[btn('❌ لغو پاسخ', 'support_reply_cancel', null, 'danger')]] : home_kb($uid));
+        return;
+    }
+    if ($data === 'support_reply_cancel') {
+        State::clear($uid);
+        Tg::answer($cbId, 'پاسخ لغو شد.');
+        show_home($chatId, $messageId, $uid);
+        return;
+    }
+
     if ($head === 'kyc') {
         Tg::answer($cbId);
         kyc_callback($uid, $chatId, $messageId, $parts);
@@ -1258,9 +1275,9 @@ function handle_callback_inner(array $cb): void
                 }
                 if ($act === 'sus' || $act === 'res') {
                     if ($act === 'sus') {
-                        suspend_panel($panel, 'تعلیق دستی توسط مدیر');
+                        suspend_panel($panel, 'تعلیق دستی توسط مدیر', $uid);
                     } else {
-                        resume_panel($panel);
+                        resume_panel($panel, $uid);
                     }
                     Tg::answer($cbId, $act === 'sus' ? 'پنل معلق شد' : 'پنل فعال شد', false);
                     screen_find_panel($chatId, $messageId, $panelId);
@@ -1339,7 +1356,7 @@ function handle_callback_inner(array $cb): void
                 $old = balance_of($tgId);
                 add_balance($tgId, -$old, 'admin', (string) $uid, 'صفر کردن موجودی توسط ادمین');
                 Tg::answer($cbId, 'موجودی صفر شد', false);
-                Tg::send($tgId, '👛 موجودی کیف پولتان توسط پشتیبانی صفر شد.');
+                support_send_admin_message($uid, $tgId, '👛 موجودی کیف پولتان توسط پشتیبانی صفر شد.');
                 screen_user_card($chatId, $messageId, $tgId);
                 return;
             }
@@ -1360,7 +1377,7 @@ function handle_callback_inner(array $cb): void
                 if ($sub === 'slotplus') {
                     DB::exec('INSERT INTO slots(tg_id, count, expires_at, created_at) '
                         . 'VALUES(?,?,?,?)', [$tgId, 1, now_ts() + 30 * DAY, now_ts()]);
-                    Tg::send($tgId, '🎁 یک اسلات هدیه گرفتی!');
+                    support_send_admin_message($uid, $tgId, '🎁 یک اسلات هدیه گرفتی!');
                 } else {
                     $row = DB::one('SELECT * FROM slots WHERE tg_id=? AND count>0 ORDER BY id DESC '
                         . 'LIMIT 1', [$tgId]);
@@ -1383,7 +1400,7 @@ function handle_callback_inner(array $cb): void
                 $blocked = (int) $user['is_blocked'] === 1 ? 0 : 1;
                 DB::exec('UPDATE users SET is_blocked=? WHERE tg_id=?', [$blocked, $tgId]);
                 if (!$blocked) {
-                    Tg::send($tgId, '✅ دسترسی حسابتان دوباره باز شد.');
+                    support_send_admin_message($uid, $tgId, '✅ دسترسی حسابتان دوباره باز شد.');
                 }
                 Tg::answer($cbId, $blocked ? 'مسدود شد' : 'رفع مسدودی شد', false);
                 screen_user_card($chatId, $messageId, $tgId);
@@ -1448,7 +1465,8 @@ function handle_callback_inner(array $cb): void
                 kyc_set_level($tgId, $level);
                 log_line('info', 'admin ' . $uid . ' set kyc level ' . $level . ' for ' . $tgId);
                 Tg::answer($cbId, 'سطح احراز شد: ' . $level, false);
-                Tg::send($tgId, '🪪 سطح احراز هویتت توسط پشتیبانی روی <b>'
+                support_send_admin_message($uid, $tgId,
+                    '🪪 سطح احراز هویتت توسط پشتیبانی روی <b>'
                     . e(KYC_LEVEL_TITLES[$level]) . '</b> تنظیم شد.');
                 screen_user_card($chatId, $messageId, $tgId);
                 return;

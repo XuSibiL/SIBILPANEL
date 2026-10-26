@@ -21,7 +21,7 @@
 
 declare(strict_types=1);
 
-const PANEL_VERSION = '3.17.0';
+const PANEL_VERSION = '3.17.1';
 const IRAN_OFFSET   = 3.5 * 3600;
 const DAY           = 86400;
 
@@ -931,6 +931,19 @@ CREATE TABLE IF NOT EXISTS nav_stack (
     data       TEXT,
     updated_at INTEGER NOT NULL
 );
+
+/* دکمه‌های پاسخ پشتیبانی به گیرندهٔ اصلی bind می‌شوند؛ شناسهٔ ticket به‌تنهایی
+   هرگز برای بازکردن گفتگو کافی نیست. */
+CREATE TABLE IF NOT EXISTS support_reply_tickets (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    tg_id       INTEGER NOT NULL,
+    admin_id    INTEGER NOT NULL,
+    created_at  INTEGER NOT NULL,
+    expires_at  INTEGER NOT NULL,
+    consumed_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS support_reply_tickets_user_idx
+    ON support_reply_tickets(tg_id, expires_at);
 SQL;
 
 function db_bootstrap(): void
@@ -2464,6 +2477,170 @@ function admin_callback_allowed(int $uid, string $data): bool
         return admin_can_manage_roles($uid);
     }
     return admin_can($uid, $cap);
+}
+/* 6.5) پاسخ پشتیبانی داخل ربات
+   ─────────────────────────────────────────────────────────────────────────
+   پیام‌های خروجیِ انسانی با ticket یک‌بارمصرفِ متعلق به همان کاربر جفت می‌شوند.
+   پس callback صرفاً «شناسهٔ یک ادمین» نیست: حدس‌زدن یا دستکاریِ آن نمی‌تواند
+   کاربر دیگری را به گفتگو وصل کند یا مقصد دریافت پاسخ را افشا کند.
+*/
+
+const SUPPORT_REPLY_TICKET_TTL = 2592000; // ۳۰ روز
+
+/** آیا این حساب اکنون اجازهٔ دریافت/ارسال پاسخ پشتیبانی دارد؟ */
+function support_reply_admin_active(int $adminId): bool
+{
+    return $adminId > 0 && admin_is_console($adminId) && admin_can($adminId, 'support');
+}
+
+/** اولین مسئول فعال در صورت حذف‌شدن نقش مسئول اصلی گفتگو. */
+function support_reply_fallback_admin(): int
+{
+    $primary = primary_owner_id();
+    if (support_reply_admin_active($primary)) {
+        return $primary;
+    }
+    foreach (admin_role_rows() as $row) {
+        $id = (int) ($row['tg_id'] ?? 0);
+        if (support_reply_admin_active($id)) {
+            return $id;
+        }
+    }
+    return 0;
+}
+
+/** مقصد پاسخ باید یک مسئول فعال باشد؛ ادمین عملیاتیِ غیرپشتیبان به fallback می‌رود. */
+function support_reply_recipient(int $requestedAdminId): int
+{
+    return support_reply_admin_active($requestedAdminId)
+        ? $requestedAdminId : support_reply_fallback_admin();
+}
+
+/** ticket جدید را فقط برای گیرندهٔ واقعی پیام ثبت می‌کند. */
+function support_reply_create_ticket(int $userId, int $requestedAdminId): int
+{
+    $adminId = support_reply_recipient($requestedAdminId);
+    if ($userId <= 0 || $adminId <= 0) {
+        return 0;
+    }
+    $now = now_ts();
+    return DB::exec('INSERT INTO support_reply_tickets(tg_id, admin_id, created_at, expires_at) '
+        . 'VALUES(?,?,?,?)', [$userId, $adminId, $now, $now + SUPPORT_REPLY_TICKET_TTL]);
+}
+
+/** callback کوتاه و قابل‌بررسی برای دکمهٔ زیر پیام ادمین. */
+function support_reply_callback_data(int $ticketId): string
+{
+    return 'reply_support_' . max(0, $ticketId);
+}
+
+/** ticket فقط برای صاحبش، تا پیش از انقضا و پیش از مصرف، معتبر است. */
+function support_reply_ticket_for_user(int $userId, int $ticketId): ?array
+{
+    if ($userId <= 0 || $ticketId <= 0) {
+        return null;
+    }
+    return DB::one('SELECT * FROM support_reply_tickets '
+        . 'WHERE id=? AND tg_id=? AND consumed_at IS NULL AND expires_at>?',
+        [$ticketId, $userId, now_ts()]);
+}
+
+/** کیبورد موجود را نگه می‌دارد و کنترل پاسخ را به ردیف آخر اضافه می‌کند. */
+function support_reply_keyboard(array $keyboard, int $ticketId): array
+{
+    if ($ticketId <= 0) {
+        return $keyboard;
+    }
+    $keyboard[] = [btn('✍️ پاسخ به پیام / پشتیبانی',
+        support_reply_callback_data($ticketId), null, 'success')];
+    return $keyboard;
+}
+
+/**
+ * مسیر استاندارد همهٔ پیام‌های مستقیمِ حاصل از اقدام ادمین/پشتیبانی.
+ * در نبود مسئول فعال، خود اطلاع‌رسانی از بین نمی‌رود؛ فقط امکان پاسخ امن ندارد.
+ */
+function support_send_admin_message(int $adminId, int $userId, string $text, array $keyboard = []): bool
+{
+    $text = trim($text);
+    if ($userId <= 0 || $text === '') {
+        return false;
+    }
+    $ticketId = support_reply_create_ticket($userId, $adminId);
+    $sent = (int) Tg::send($userId, $text, support_reply_keyboard($keyboard, $ticketId)) > 0;
+    if (!$sent && $ticketId > 0) {
+        DB::exec('DELETE FROM support_reply_tickets WHERE id=?', [$ticketId]);
+    }
+    return $sent;
+}
+
+/** شروع پاسخ از سمت کاربر؛ state فقط ticket را نگه می‌دارد، نه مقصد قابل جعل را. */
+function support_reply_start(int $userId, int $ticketId): array
+{
+    $ticket = support_reply_ticket_for_user($userId, $ticketId);
+    if ($ticket === null) {
+        return [false, 'این گفتگو دیگر در دسترس نیست. از بخش پشتیبانی دوباره اقدام کنید.'];
+    }
+    State::set($userId, 'awaiting_support_reply', [
+        'ticket_id' => $ticketId,
+        'opened_at' => now_ts(),
+    ]);
+    return [true, '✍️ <b>پاسخ به پشتیبانی</b>' . "\n\n"
+        . 'پیامتان را همین‌جا به‌صورت متن بفرستید؛ مستقیم برای مسئول پشتیبانی ارسال می‌شود.'];
+}
+
+/** متن بایگانی‌شده و خصوصیِ پاسخ کاربر برای مسئول پشتیبانی. */
+function support_reply_admin_text(int $userId, string $text, int $sentAt = 0, int $ticketId = 0): string
+{
+    $user = user_get($userId) ?? [];
+    $name = trim((string) ($user['name'] ?? ''));
+    if ($name === '') {
+        $name = 'کاربر تلگرام';
+    }
+    $username = trim(ltrim((string) ($user['uname'] ?? ''), '@'));
+    $when = $sentAt > 0 ? $sentAt : now_ts();
+    return '✉️ <b>پاسخ جدید کاربر به پشتیبانی</b>' . "\n" . SEP . "\n"
+        . 'وضعیت: <b>پاسخ جدید</b>' . "\n"
+        . 'زمینه: پاسخ به پیام مستقیم پشتیبانی' . ($ticketId > 0 ? ' #' . $ticketId : '') . "\n"
+        . '👤 نام: <b>' . e(mb_substr($name, 0, 80)) . "</b>\n"
+        . '🆔 شناسهٔ عددی: <code>' . $userId . "</code>\n"
+        . '🔗 نام کاربری: ' . ($username !== '' ? '<code>@' . e($username) . '</code>' : '—') . "\n"
+        . '🕒 زمان ارسال: ' . fa_ts($when) . "\n"
+        . SEP . "\n"
+        . '💬 پیام:' . "\n" . e($text);
+}
+
+/** تحویل متن کاربر به همان مسئول یا جایگزین امن؛ state جعل‌شده هم ticket را دور نمی‌زند. */
+function support_reply_deliver(int $userId, array $message, array $state): array
+{
+    $text = trim((string) ($message['text'] ?? ''));
+    if ($text === '') {
+        return [false, 'لطفاً پاسخ را به‌صورت <b>متن</b> بفرستید یا لغو کنید.'];
+    }
+    $ticketId = (int) ($state['data']['ticket_id'] ?? 0);
+    $ticket = support_reply_ticket_for_user($userId, $ticketId);
+    if ($ticket === null) {
+        State::clear($userId);
+        return [false, 'این گفتگو منقضی یا بسته شده است. از بخش پشتیبانی دوباره اقدام کنید.'];
+    }
+    $adminId = support_reply_recipient((int) $ticket['admin_id']);
+    if ($adminId <= 0) {
+        return [false, 'مسئول پشتیبانی فعالی پیدا نشد. کمی بعد دوباره تلاش کنید.'];
+    }
+    $sentAt = (int) ($message['date'] ?? 0);
+    $body = support_reply_admin_text($userId, $text, $sentAt, $ticketId);
+    $buttons = [[btn('✍️ پاسخ به کاربر', 'ad:u:' . $userId . ':msg', null, 'success')]];
+    $delivered = (int) Tg::send($adminId, $body, $buttons) > 0;
+    /* نسخهٔ بایگانی‌شده برای گروه/تاپیک گزارشات؛ نبودن گروه مانع پیوی ادمین نیست. */
+    post_report($body, 'support');
+    if (!$delivered) {
+        log_line('warning', 'support reply delivery failed', ['user' => $userId, 'admin' => $adminId]);
+        return [false, 'ارسال به پشتیبانی انجام نشد؛ لطفاً دوباره تلاش کنید.'];
+    }
+    DB::exec('UPDATE support_reply_tickets SET consumed_at=? WHERE id=? AND tg_id=? AND consumed_at IS NULL',
+        [now_ts(), $ticketId, $userId]);
+    State::clear($userId);
+    return [true, '✅ پاسختان برای پشتیبانی ارسال شد.'];
 }
 /* 7) Domain: users, wallet, orders, catalog */
 
@@ -11446,7 +11623,7 @@ function kyc_admin_review(int $reqId, bool $approve, int $adminId, string $reaso
             $body .= '📝 دلیل: ' . e($reason) . "\n";
         }
         $body .= "\nمی‌توانید مدارک را درست کنید و از اول بفرستید.";
-        Tg::send($uid, $body, [
+        support_send_admin_message($adminId, $uid, $body, [
             [btn('🔁 تلاش دوباره', 'kyc:home', null, 'success')],
             [btn('☎️ پشتیبانی', 'menu:support', null, 'primary')],
         ]);
@@ -11462,7 +11639,8 @@ function kyc_admin_review(int $reqId, bool $approve, int $adminId, string $reaso
 
     $head = $mask !== '' ? '✅ کارت <code>' . e($mask) . '</code> تأیید شد.'
         : '✅ مدارکت تأیید شد.';
-    Tg::send($uid, $head . ' از این به بعد می‌توانید با آن واریز کنید.' . "\n"
+    support_send_admin_message($adminId, $uid,
+        $head . ' از این به بعد می‌توانید با آن واریز کنید.' . "\n"
         . '⬆️ سطحت هم رفت به ' . KYC_LEVEL_TITLES[$level] . ' – سقف واریزت بالا رفت.',
         [[btn('🪪 وضعیت احراز هویت', 'kyc:home', null, 'success')],
          [btn('« خانه', 'home', null, 'danger')]]);
@@ -11611,6 +11789,7 @@ const REPORT_KINDS = [
     'usage'   => '⚡️ مصرف و صورت‌حساب',
     'panel'   => '📦 پنل‌ها و تعلیق',
     'users'   => '👥 کاربران',
+    'support' => '💬 پشتیبانی',
     'error'   => '⚠️ خطاها',
     'daily'   => '📅 گزارش روزانه',
     'backup'  => '💾 بکاپ',
@@ -12912,7 +13091,8 @@ function review_receipt(int $receiptId, bool $approve, int $adminId): array
     if (!$approve) {
         order_mark((int) $order['id'], 'rejected');
         receipt_close_card($receiptId, false, $adminId, $stamp);
-        Tg::send((int) $order['tg_id'], '❌ <b>رسید تأیید نشد</b>' . "\n\n"
+        support_send_admin_message($adminId, (int) $order['tg_id'],
+            '❌ <b>رسید تأیید نشد</b>' . "\n\n"
             . '🧾 سفارش: <code>' . e((string) $order['ref']) . '</code>' . "\n"
             . '💵 مبلغ: ' . money((int) $receipt['amount']) . "\n\n"
             . 'اگر مبلغ را واریز کرده‌ای، رسید را دوباره با پشتیبانی هماهنگ کنید.',
@@ -12923,7 +13103,7 @@ function review_receipt(int $receiptId, bool $approve, int $adminId): array
     $balanceBefore = balance_of((int) $order['tg_id']);
     [$ok, $text] = settle_payment($order, 'card', $adminId);
     $balanceAfter = balance_of((int) $order['tg_id']);
-    Tg::send((int) $order['tg_id'], $text, home_kb((int) $order['tg_id']));
+    support_send_admin_message($adminId, (int) $order['tg_id'], $text, home_kb((int) $order['tg_id']));
     $footer = $stamp;
     if ($ok) {
         $footer .= "\n👛 موجودی کاربر: " . money($balanceAfter)
@@ -13441,7 +13621,8 @@ function wiz_finish(int $uid, array $data): void
             add_balance((int) $order['tg_id'], $amount, 'refund', (string) $order['id'],
                 'بازگشت وجه سفارش #' . $order['id']);
             DB::exec("UPDATE orders SET status='refunded' WHERE id=?", [(int) $order['id']]);
-            Tg::send((int) $order['tg_id'], '↩️ مبلغ ' . money($amount) . ' بابت سفارش #'
+            support_send_admin_message($uid, (int) $order['tg_id'],
+                '↩️ مبلغ ' . money($amount) . ' بابت سفارش #'
                 . $order['id'] . ' به کیف پولتان برگشت.');
             Tg::send($uid, '✅ بازگشت وجه انجام شد.' . "\n" . 'سفارش #' . $order['id']
                 . ' · ' . money($amount) . "\n" . 'موجودی جدید کاربر: '
@@ -13462,7 +13643,8 @@ function wiz_finish(int $uid, array $data): void
             $newBalance = add_balance($tgId, $amount, 'admin', (string) $uid, 'تغییر دستی ادمین');
             post_report('💰 <b>تغییر موجودی توسط ادمین</b>' . "\n" . 'کاربر <code>' . $tgId
                 . '</code> · ' . money($amount) . "\n" . 'موجودی جدید: ' . money($newBalance));
-            Tg::send($tgId, '💰 موجودی کیف پولتان تغییر کرد: <b>' . money($amount) . '</b>' . "\n"
+            support_send_admin_message($uid, $tgId,
+                '💰 موجودی کیف پولتان تغییر کرد: <b>' . money($amount) . '</b>' . "\n"
                 . 'موجودی جدید: <b>' . money($newBalance) . '</b>');
             Tg::send($uid, '✅ انجام شد.' . "\n" . 'موجودی جدید: <b>' . money($newBalance) . '</b>',
                 [[btn('« کاربر', 'ad:u:' . $tgId, null, 'success')]]);
@@ -13500,15 +13682,16 @@ function wiz_finish(int $uid, array $data): void
             $panelId = (int) ($ctx['panel_id'] ?? 0);
             $gigs = max(0, (int) ($values['gigs'] ?? 0));
             $days = max(0, (int) ($values['days'] ?? 0));
-            [$okE, $msgE] = admin_panel_extend($panelId, $gigs, $days);
+            [$okE, $msgE] = admin_panel_extend($panelId, $gigs, $days, $uid);
             Tg::send($uid, $msgE);
             screen_find_panel($uid, null, $panelId);
             return;
 
         case 'usermsg':
             $tgId = (int) ($ctx['tg_id'] ?? 0);
-            $okSend = Tg::send($tgId, (string) $values['text']);
-            Tg::send($uid, $okSend ? '✅ پیام رسید.' : '❌ پیام نرسید (کاربر ربات را بلاک کرده).',
+            $okSend = support_send_admin_message($uid, $tgId, (string) $values['text']);
+            Tg::send($uid, $okSend ? '✅ پیام رسید؛ دکمهٔ پاسخ پشتیبانی هم زیر آن قرار گرفت.'
+                : '❌ پیام نرسید (کاربر ربات را بلاک کرده یا دسترسی شما تغییر کرده).',
                 [[btn('« کاربر', 'ad:u:' . $tgId, null, 'success')]]);
             return;
 
@@ -13518,7 +13701,8 @@ function wiz_finish(int $uid, array $data): void
             $days = max(0, (int) ($values['days'] ?? 0));
             [$okGift, $msgGift] = user_discount_grant($tgId, $percent, $days);
             if ($okGift && $percent > 0) {
-                Tg::send($tgId, '🎁 یک تخفیف اختصاصی <b>' . fa_digits($percent) . '</b>٪'
+                support_send_admin_message($uid, $tgId,
+                    '🎁 یک تخفیف اختصاصی <b>' . fa_digits($percent) . '</b>٪'
                     . ($days > 0 ? ' برای ' . fa_digits($days) . ' روز' : ' بی‌پایان')
                     . ' روی خریدهایت فعال شد.');
                 post_report('🎁 <b>تخفیف اختصاصی</b>' . "\n" . 'کاربر: <code>' . $tgId
@@ -13826,6 +14010,23 @@ function handle_callback_inner(array $cb): void
     if (force_join_blocked($uid)) {
         Tg::answer($cbId, '⚠️ اول در کانال عضو شوید', true);
         force_join_show($chatId, $messageId);
+        return;
+    }
+
+    /* پاسخ به پیام پشتیبانی: ticket باید متعلق به همین کاربر باشد؛ دادهٔ callback
+       حتی اگر دستکاری/حدس زده شود مقصد گفتگو یا اطلاعات کاربر دیگری را فاش نمی‌کند. */
+    if (preg_match('/^reply_support_([1-9][0-9]*)$/D', $data, $replyMatch)) {
+        $ticketId = (int) $replyMatch[1];
+        [$replyOk, $replyNote] = support_reply_start($uid, $ticketId);
+        Tg::answer($cbId, $replyOk ? '✍️ پیام را بفرستید' : 'گفتگو در دسترس نیست', !$replyOk);
+        Tg::send($chatId, $replyNote, $replyOk
+            ? [[btn('❌ لغو پاسخ', 'support_reply_cancel', null, 'danger')]] : home_kb($uid));
+        return;
+    }
+    if ($data === 'support_reply_cancel') {
+        State::clear($uid);
+        Tg::answer($cbId, 'پاسخ لغو شد.');
+        show_home($chatId, $messageId, $uid);
         return;
     }
 
@@ -14975,9 +15176,9 @@ function handle_callback_inner(array $cb): void
                 }
                 if ($act === 'sus' || $act === 'res') {
                     if ($act === 'sus') {
-                        suspend_panel($panel, 'تعلیق دستی توسط مدیر');
+                        suspend_panel($panel, 'تعلیق دستی توسط مدیر', $uid);
                     } else {
-                        resume_panel($panel);
+                        resume_panel($panel, $uid);
                     }
                     Tg::answer($cbId, $act === 'sus' ? 'پنل معلق شد' : 'پنل فعال شد', false);
                     screen_find_panel($chatId, $messageId, $panelId);
@@ -15056,7 +15257,7 @@ function handle_callback_inner(array $cb): void
                 $old = balance_of($tgId);
                 add_balance($tgId, -$old, 'admin', (string) $uid, 'صفر کردن موجودی توسط ادمین');
                 Tg::answer($cbId, 'موجودی صفر شد', false);
-                Tg::send($tgId, '👛 موجودی کیف پولتان توسط پشتیبانی صفر شد.');
+                support_send_admin_message($uid, $tgId, '👛 موجودی کیف پولتان توسط پشتیبانی صفر شد.');
                 screen_user_card($chatId, $messageId, $tgId);
                 return;
             }
@@ -15077,7 +15278,7 @@ function handle_callback_inner(array $cb): void
                 if ($sub === 'slotplus') {
                     DB::exec('INSERT INTO slots(tg_id, count, expires_at, created_at) '
                         . 'VALUES(?,?,?,?)', [$tgId, 1, now_ts() + 30 * DAY, now_ts()]);
-                    Tg::send($tgId, '🎁 یک اسلات هدیه گرفتی!');
+                    support_send_admin_message($uid, $tgId, '🎁 یک اسلات هدیه گرفتی!');
                 } else {
                     $row = DB::one('SELECT * FROM slots WHERE tg_id=? AND count>0 ORDER BY id DESC '
                         . 'LIMIT 1', [$tgId]);
@@ -15100,7 +15301,7 @@ function handle_callback_inner(array $cb): void
                 $blocked = (int) $user['is_blocked'] === 1 ? 0 : 1;
                 DB::exec('UPDATE users SET is_blocked=? WHERE tg_id=?', [$blocked, $tgId]);
                 if (!$blocked) {
-                    Tg::send($tgId, '✅ دسترسی حسابتان دوباره باز شد.');
+                    support_send_admin_message($uid, $tgId, '✅ دسترسی حسابتان دوباره باز شد.');
                 }
                 Tg::answer($cbId, $blocked ? 'مسدود شد' : 'رفع مسدودی شد', false);
                 screen_user_card($chatId, $messageId, $tgId);
@@ -15165,7 +15366,8 @@ function handle_callback_inner(array $cb): void
                 kyc_set_level($tgId, $level);
                 log_line('info', 'admin ' . $uid . ' set kyc level ' . $level . ' for ' . $tgId);
                 Tg::answer($cbId, 'سطح احراز شد: ' . $level, false);
-                Tg::send($tgId, '🪪 سطح احراز هویتت توسط پشتیبانی روی <b>'
+                support_send_admin_message($uid, $tgId,
+                    '🪪 سطح احراز هویتت توسط پشتیبانی روی <b>'
                     . e(KYC_LEVEL_TITLES[$level]) . '</b> تنظیم شد.');
                 screen_user_card($chatId, $messageId, $tgId);
                 return;
@@ -15922,6 +16124,12 @@ function handle_message_inner(array $message): void
             bc_job_dispatch();
             return;
 
+        case 'awaiting_support_reply':
+            [$replyOk, $replyNote] = support_reply_deliver($uid, $message, $state);
+            Tg::send($chatId, $replyNote, $replyOk ? home_kb($uid)
+                : [[btn('❌ لغو پاسخ', 'support_reply_cancel', null, 'danger')]]);
+            return;
+
         case 'wiz':
             wiz_advance($message);
             return;
@@ -16271,6 +16479,41 @@ function usage_blocks(int $bytes): int
     return intdiv(max(0, $bytes), USAGE_BLOCK_BYTES);
 }
 
+/**
+ * آیا پنل از پنجرهٔ پیش‌پرداخت گذشته است؟
+ * billing_start_at=0 برای پنل‌های قدیمی/بدون پیش‌پرداخت است و فوراً قابل
+ * بررسی موجودی است. در لحظهٔ دقیق پایان هم هنوز تعلیق صفر-موجودی مجاز نیست؛
+ * شرط صریح مطابق قرارداد: time() > billing_start_at.
+ */
+function panel_balance_suspension_allowed(array $panel, ?int $at = null): bool
+{
+    $billingStart = (int) ($panel['billing_start_at'] ?? 0);
+    $at = $at ?? time();
+    return $billingStart <= 0 || $at > $billingStart;
+}
+
+/** تنها تعلیق مجازِ پنجرهٔ پیش‌پرداخت: تمام‌شدن سقف ترافیک واقعی. */
+function panel_traffic_limit_reached(array $panel, array $usage): bool
+{
+    $limit = (int) ($usage['limit'] ?? 0);
+    if ($limit <= 0) {
+        $limit = (int) ($panel['data_cap'] ?? 0);
+    }
+    return $limit > 0 && (int) ($usage['used'] ?? 0) >= $limit;
+}
+
+/** هیچ تعلیقِ مانده از موجودی نباید سقف ترافیک/تاریخ انقضا را دور بزند. */
+function panel_balance_hold_can_resume(array $panel): bool
+{
+    if (!empty($panel['expires_at']) && (int) $panel['expires_at'] <= now_ts()) {
+        return false;
+    }
+    return !panel_traffic_limit_reached($panel, [
+        'used' => (int) ($panel['last_usage'] ?? 0),
+        'limit' => (int) ($panel['data_cap'] ?? 0),
+    ]);
+}
+
 /** تعداد گیگ‌های کاملِ حساب‌شده */
 function billed_gigs(int $bytes): int
 {
@@ -16394,8 +16637,8 @@ function panel_charge_once(array $panel, int $usedBytes, bool $hourlyEnabled,
             . "\n" . '👛 موجودی: ' . money($balance - $paid), 'usage');
         $out['charged'] = $paid;
     }
-    if ($paid < $charge) {
-        /* کمبود موجودی: گیگ‌ها همین حالا ثبت شدند، پس دوباره کسر نمی‌شوند */
+    if ($paid < $charge && panel_balance_suspension_allowed($panel)) {
+        /* کمبود موجودی بعد از پایان پیش‌پرداخت: گیگ‌ها همین حالا ثبت شدند، پس دوباره کسر نمی‌شوند */
         $graceUntil = (int) ($panel['suspended_at'] ?? 0) + $grace;
         if ($grace === 0 || ($panel['suspended_at'] && now_ts() >= $graceUntil)) {
             if (suspend_panel($panel, 'کمبود موجودی')) {
@@ -16407,6 +16650,10 @@ function panel_charge_once(array $panel, int $usedBytes, bool $hourlyEnabled,
                 . 'پنل <code>' . e((string) $panel['panel_username']) . '</code> تا '
                 . $grace . " ثانیه بعد تعلیق می‌شود.");
         }
+    } elseif ($paid < $charge) {
+        /* در ۲۴ ساعت تسویه‌شده، صفر بودن کیف پول هرگز پنل را معلق نمی‌کند. */
+        log_line('info', 'prepaid window: balance suspension skipped', ['panel' => $panelId,
+            'billing_start_at' => (int) ($panel['billing_start_at'] ?? 0)]);
     }
     return $out;
 }
@@ -16428,7 +16675,8 @@ function panels_meter(bool $verbose = false): array
         DB::exec('UPDATE panels SET last_meter_at=? WHERE id=?', [now_ts(), (int) $held['id']]);
         $heldBalance = balance_of((int) $held['tg_id']);
         $heldExpired = !empty($held['expires_at']) && (int) $held['expires_at'] <= now_ts();
-        if ($heldBalance > 0 && $heldBalance >= (int) $held['min_balance'] && !$heldExpired) {
+        if ($heldBalance > 0 && $heldBalance >= (int) $held['min_balance'] && !$heldExpired
+            && panel_balance_hold_can_resume($held)) {
             if (resume_panel($held)) {
                 $stats['resumed']++;
             }
@@ -16460,6 +16708,16 @@ function panels_meter(bool $verbose = false): array
         }
         $tgId = (int) $panel['tg_id'];
         $panelId = (int) $panel['id'];
+
+        /* سقف ترافیک یک محدودیت واقعی سرویس است و حتی در ۲۴ ساعت پیش‌پرداخت
+           هم مجاز است پنل را متوقف کند؛ صفر بودن کیف پول چنین مجوزی ندارد. */
+        if (panel_traffic_limit_reached($panel, $usage)) {
+            DB::exec('UPDATE panels SET last_usage=? WHERE id=?', [(int) $usage['used'], $panelId]);
+            if (suspend_panel($panel, 'پایان حجم ترافیک')) {
+                $stats['suspended']++;
+            }
+            continue;
+        }
 
         $result = panel_charge_once($panel, (int) $usage['used'], $hourlyEnabled,
             $perGbEnabled, $grace);
@@ -16562,6 +16820,21 @@ function panels_balance_enforce(bool $verbose = false): array
             continue; // پنل تست رایگان است و به موجودی کاری ندارد
         }
         $balance = balance_of((int) $panel['tg_id']);
+        /* پول ۲۴ ساعت اول در فاکتور اولیه تسویه شده است؛ تا عبور صریح زمان
+           billing_start_at هیچ تعلیق یا هشدارِ «موجودی صفر» مجاز نیست. */
+        if (!panel_balance_suspension_allowed($panel)) {
+            if ($panel['status'] === 'suspended' && ($panel['suspended_reason'] ?? '') === 'balance'
+                && panel_balance_hold_can_resume($panel)) {
+                DB::exec('UPDATE panels SET suspended_reason=NULL WHERE id=?', [(int) $panel['id']]);
+                if (resume_panel($panel)) {
+                    $out['resumed']++;
+                }
+            }
+            if ($verbose) {
+                echo '· prepaid window: balance ignored for ' . $panel['panel_username'] . "\n";
+            }
+            continue;
+        }
         if ($panel['status'] === 'active' && $balance <= 0) {
             suspend_panel($panel, 'موجودی کیف پول صفر است');
             DB::exec('UPDATE panels SET suspended_reason=? WHERE id=?',
@@ -16573,7 +16846,7 @@ function panels_balance_enforce(bool $verbose = false): array
             continue;
         }
         if ($panel['status'] === 'suspended' && ($panel['suspended_reason'] ?? '') === 'balance'
-            && $balance > 0) {
+            && $balance > 0 && panel_balance_hold_can_resume($panel)) {
             DB::exec('UPDATE panels SET suspended_reason=NULL WHERE id=?', [(int) $panel['id']]);
             if (resume_panel($panel)) {
                 $out['resumed']++;
@@ -17011,7 +17284,7 @@ function panel_api_status(array $panelRow, int $adminId, string $status, string 
     }
 }
 
-function suspend_panel(array $panel, string $reason): bool
+function suspend_panel(array $panel, string $reason, int $adminId = 0): bool
 {
     $fresh = DB::one('SELECT * FROM panels WHERE id=?', [(int) $panel['id']]);
     if ($fresh === null) {
@@ -17037,14 +17310,19 @@ function suspend_panel(array $panel, string $reason): bool
         delete_trial_panel($panel, $reason);
         return true;
     }
-    Tg::send((int) $panel['tg_id'], '⛔️ پنل <code>' . e((string) $panel['panel_username'])
+    $notice = '⛔️ پنل <code>' . e((string) $panel['panel_username'])
         . "</code> تعلیق شد.\n" . 'دلیل: ' . e($reason) . "\n"
-        . 'با شارژ کیف پول، پنل خودکار فعال می‌شود.',
-        [[btn('💳 شارژ کیف پول', 'menu:wallet', null, 'success')]]);
+        . 'با شارژ کیف پول، پنل خودکار فعال می‌شود.';
+    $noticeKb = [[btn('💳 شارژ کیف پول', 'menu:wallet', null, 'success')]];
+    if ($adminId > 0) {
+        support_send_admin_message($adminId, (int) $panel['tg_id'], $notice, $noticeKb);
+    } else {
+        Tg::send((int) $panel['tg_id'], $notice, $noticeKb);
+    }
     return true;
 }
 
-function resume_panel(array $panel): bool
+function resume_panel(array $panel, int $adminId = 0): bool
 {
     $fresh = DB::one('SELECT * FROM panels WHERE id=?', [(int) $panel['id']]);
     if ($fresh === null) {
@@ -17065,9 +17343,14 @@ function resume_panel(array $panel): bool
     post_report('✅ <b>پنل دوباره فعال شد</b>' . "\n"
         . '👤 کاربر <code>' . (int) $panel['tg_id'] . "</code>\n"
         . '📦 پنل <code>' . e((string) $panel['panel_username']) . '</code>', 'panel');
-    Tg::send((int) $panel['tg_id'], '✅ پنل <code>' . e((string) $panel['panel_username'])
-        . '</code> دوباره فعال شد.',
-        [[btn('📦 پنل‌های من', 'menu:panels', null, 'primary')]]);
+    $notice = '✅ پنل <code>' . e((string) $panel['panel_username'])
+        . '</code> دوباره فعال شد.';
+    $noticeKb = [[btn('📦 پنل‌های من', 'menu:panels', null, 'primary')]];
+    if ($adminId > 0) {
+        support_send_admin_message($adminId, (int) $panel['tg_id'], $notice, $noticeKb);
+    } else {
+        Tg::send((int) $panel['tg_id'], $notice, $noticeKb);
+    }
     return true;
 }
 
@@ -20566,7 +20849,7 @@ function admin_panel_user_limit(int $panelId, int $delta): array
 }
 
 /** تمدید حجم و تاریخ یک پنل فروخته‌شده */
-function admin_panel_extend(int $panelId, int $gigs, int $days): array
+function admin_panel_extend(int $panelId, int $gigs, int $days, int $adminId = 0): array
 {
     $panel = DB::one('SELECT * FROM panels WHERE id=?', [$panelId]);
     if ($panel === null) {
@@ -20614,7 +20897,8 @@ function admin_panel_extend(int $panelId, int $gigs, int $days): array
     post_report('➕ <b>تمدید پنل</b>' . "\n" . '📦 <code>'
         . e((string) $panel['panel_username']) . '</code>' . "\n"
         . 'مقدار: ' . $summary, 'panel');
-    Tg::send((int) $panel['tg_id'], '🎁 پنل <code>' . e((string) $panel['panel_username'])
+    support_send_admin_message($adminId, (int) $panel['tg_id'],
+        '🎁 پنل <code>' . e((string) $panel['panel_username'])
         . '</code> توسط پشتیبانی تمدید شد: <b>' . $summary . '</b>'
         . "\n" . 'انقضای جدید: ' . fa_ts($expires),
         [[btn('📦 پنل‌های من', 'menu:panels', null, 'primary')]]);
@@ -20648,7 +20932,8 @@ function admin_panel_delete(int $panelId, int $adminId = 0): array
     log_line('info', 'admin deleted panel', ['panel' => $panelId, 'by' => $adminId]);
     post_report('🗑 <b>حذف پنل توسط مدیر</b>' . "\n" . '👤 کاربر <code>' . $tgId . '</code>'
         . "\n" . '📦 <code>' . e($username) . '</code>', 'panel');
-    Tg::send($tgId, '🗑 پنل <code>' . e($username) . '</code> توسط پشتیبانی حذف شد.');
+    support_send_admin_message($adminId, $tgId,
+        '🗑 پنل <code>' . e($username) . '</code> توسط پشتیبانی حذف شد.');
     return [true, '🗑 پنل <code>' . e($username) . '</code> حذف شد.'
         . ($apiOk ? '' : "\n⚠️ روی سرور پنل حذف نشد: " . e($note))];
 }
@@ -20710,13 +20995,22 @@ function bc_targets(string $segment, bool $onlyAllowed = true): array
  *  خروجی: [موفق؟، مسدود؟، message_id]
  */
 function bc_send_one(int $tgId, string $mode, string $text, int $fromChat, int $messageId,
-                     int $tries = 3): array
+                     int $tries = 3, int $adminId = 0): array
 {
+    /* کار همگانی هم اقدام مستقیم یک ادمین است. ticket فقط یک‌بار ساخته و در
+       retry دوباره مصرف نمی‌شود؛ در فراخوانی قدیمی/داخلیِ بدون actor، رفتار
+       سازگار گذشته حفظ می‌شود. */
+    $ticketId = $adminId > 0 ? support_reply_create_ticket($tgId, $adminId) : 0;
+    $replyMarkup = $ticketId > 0 ? ['inline_keyboard' => support_reply_keyboard([], $ticketId)] : null;
     for ($attempt = 1; $attempt <= $tries; $attempt++) {
         $params = $mode === 'copy'
             ? ['chat_id' => $tgId, 'from_chat_id' => $fromChat, 'message_id' => $messageId]
             : ['chat_id' => $tgId, 'text' => $text, 'parse_mode' => 'HTML',
                'disable_web_page_preview' => true];
+        if ($replyMarkup !== null) {
+            /* copyMessage هم reply_markup می‌پذیرد؛ دکمه روی خود پیام کپی‌شده است. */
+            $params['reply_markup'] = $replyMarkup;
+        }
         $method = $mode === 'copy' ? 'copyMessage' : 'sendMessage';
         $res = Tg::call($method, $params);
         if (Tg::$dry) {
@@ -20729,6 +21023,9 @@ function bc_send_one(int $tgId, string $mode, string $text, int $fromChat, int $
         }
         $description = is_array($res) ? (string) ($res['description'] ?? '') : '';
         if (bc_blocked_error($description)) {
+            if ($ticketId > 0) {
+                DB::exec('DELETE FROM support_reply_tickets WHERE id=?', [$ticketId]);
+            }
             return [false, true, 0];
         }
         $retryAfter = (int) ($res['parameters']['retry_after'] ?? 0);
@@ -20738,7 +21035,13 @@ function bc_send_one(int $tgId, string $mode, string $text, int $fromChat, int $
             usleep(50000);
             continue;
         }
+        if ($ticketId > 0) {
+            DB::exec('DELETE FROM support_reply_tickets WHERE id=?', [$ticketId]);
+        }
         return [false, false, 0];
+    }
+    if ($ticketId > 0) {
+        DB::exec('DELETE FROM support_reply_tickets WHERE id=?', [$ticketId]);
     }
     return [false, false, 0];
 }
@@ -20763,7 +21066,7 @@ function bc_blocked_error(string $description): bool
  *  · متن نهایی: «تعداد کل: X | موفق: Y | مسدود شده توسط کاربر: Z»
  */
 function bc_run(array $targets, string $mode, string $text = '', int $fromChat = 0,
-                int $messageId = 0, bool $pin = false): array
+                int $messageId = 0, bool $pin = false, int $adminId = 0): array
 {
     $sent = 0;
     $failed = 0;
@@ -20771,7 +21074,7 @@ function bc_run(array $targets, string $mode, string $text = '', int $fromChat =
     $jobId = (string) set_get('bc_job_id', '');
     foreach ($targets as $index => $tgId) {
         [$okSend, $isBlocked, $lastId] = bc_send_one((int) $tgId, $mode, $text, $fromChat,
-            $messageId);
+            $messageId, 3, $adminId);
         if ($okSend) {
             $sent++;
             if ($pin && $lastId > 0) {
@@ -20881,7 +21184,7 @@ function bc_job_tick(int $budgetSeconds = 45): bool
     while ($cursor < $count && (microtime(true) - $started) < $budgetSeconds) {
         [$okSend, $isBlocked, $lastId] = bc_send_one($targets[$cursor], $mode,
             (string) ($job['text'] ?? ''), (int) ($job['from_chat'] ?? 0),
-            (int) ($job['message_id'] ?? 0));
+            (int) ($job['message_id'] ?? 0), 3, (int) ($job['admin'] ?? 0));
         if ($okSend) {
             $sent++;
             if (!empty($job['pin']) && $lastId > 0) {

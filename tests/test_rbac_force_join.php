@@ -189,6 +189,111 @@ $masked = ops_log_safe_line('token=secret-value api_key=pg_key_abcdef sqlite:/se
 check317(!str_contains($masked, 'secret-value') && !str_contains($masked, 'pg_key_abcdef')
     && !str_contains($masked, 'app.sqlite3'), 'operator log scrubber hides tokens, API keys and DB DSNs');
 
+echo "\n== Admin-message reply workflow ==\n";
+Tg::$outbox = [];
+$adminMessageSent = support_send_admin_message(301, 900, 'سلام؛ وضعیت سرویس را بررسی کنید.');
+$adminMessageButtons = [];
+foreach (Tg::$outbox as $entry) {
+    foreach ((array) ($entry[1]['reply_markup']['inline_keyboard'] ?? []) as $row) {
+        foreach ((array) $row as $button) {
+            $adminMessageButtons[] = (string) ($button['callback_data'] ?? '');
+        }
+    }
+}
+$replyTicket317 = 0;
+foreach ($adminMessageButtons as $callback317) {
+    if (preg_match('/^reply_support_([1-9][0-9]*)$/D', $callback317, $ticketMatch317)) {
+        $replyTicket317 = (int) $ticketMatch317[1];
+        break;
+    }
+}
+check317($adminMessageSent && $replyTicket317 > 0,
+    'manual support messages carry the user reply button with a bound ticket');
+check317(support_reply_start(901, $replyTicket317)[0] === false,
+    'a guessed reply-support callback cannot be opened by a different user');
+$financeMessageSent = support_send_admin_message(300, 900, 'پیام اقدام مالی');
+$financeTicket317 = (int) DB::val('SELECT id FROM support_reply_tickets WHERE tg_id=? ORDER BY id DESC LIMIT 1', [900], 0);
+$financeDestination317 = (int) DB::val('SELECT admin_id FROM support_reply_tickets WHERE id=?', [$financeTicket317], 0);
+check317($financeMessageSent && $financeDestination317 !== 300
+    && support_reply_admin_active($financeDestination317),
+    'a non-support admin message safely binds replies to a valid support fallback');
+Tg::$outbox = [];
+handle_callback([
+    'id' => 'support-reply-open', 'from' => ['id' => 900, 'first_name' => 'خریدار', 'username' => 'buyer'],
+    'message' => ['message_id' => 20, 'chat' => ['id' => 900, 'type' => 'private']],
+    'data' => 'reply_support_' . $replyTicket317,
+]);
+$replyState = State::get(900);
+check317($replyState['state'] === 'awaiting_support_reply'
+    && (int) ($replyState['data']['ticket_id'] ?? 0) === $replyTicket317,
+    'reply button places the user in an awaiting-support-reply state bound to its ticket');
+Tg::$outbox = [];
+handle_message([
+    'from' => ['id' => 900, 'first_name' => 'خریدار', 'username' => 'buyer'],
+    'chat' => ['id' => 900, 'type' => 'private'], 'message_id' => 21,
+    'date' => now_ts(), 'text' => 'لطفاً وضعیت پنل من را بررسی کنید.',
+]);
+$supportInbound = '';
+$supportReplyButtons = [];
+foreach (Tg::$outbox as $entry) {
+    if (($entry[0] ?? '') === 'sendMessage' && (int) ($entry[1]['chat_id'] ?? 0) === 301) {
+        $supportInbound .= (string) ($entry[1]['text'] ?? '');
+        foreach ((array) ($entry[1]['reply_markup']['inline_keyboard'] ?? []) as $row) {
+            foreach ((array) $row as $button) {
+                $supportReplyButtons[] = (string) ($button['callback_data'] ?? '');
+            }
+        }
+    }
+}
+check317(str_contains($supportInbound, '<code>900</code>') && str_contains($supportInbound, '@buyer')
+    && str_contains($supportInbound, 'وضعیت پنل') && in_array('ad:u:900:msg', $supportReplyButtons, true),
+    'user reply reaches the originating support admin with identity, time and reply-again control');
+check317(State::get(900)['state'] === '', 'a delivered support reply clears its waiting state');
+
+echo "\n== Prepaid suspension guard ==\n";
+user_ensure(901, 'پیش‌پرداخت', 'prepaid_user');
+user_ensure(902, 'بعد از پیش‌پرداخت', 'after_prepaid');
+user_ensure(903, 'تعلیق قدیمی', 'wrongly_suspended');
+$futureStart317 = time() + 3600;
+$pastStart317 = time() - 3600;
+$prepaidPanel317 = DB::exec('INSERT INTO panels(tg_id, product_id, panel_username, status, created_at, '
+    . 'billing_start_at, last_meter_at, per_gb_price) VALUES(?,?,?,?,?,?,?,?)',
+    [901, 1, 'prepaid-zero', 'active', now_ts(), $futureStart317, $futureStart317, 100]);
+$pastPanel317 = DB::exec('INSERT INTO panels(tg_id, product_id, panel_username, status, created_at, '
+    . 'billing_start_at, last_meter_at) VALUES(?,?,?,?,?,?,?)',
+    [902, 1, 'postpaid-zero', 'active', now_ts(), $pastStart317, $pastStart317]);
+$wrongPanel317 = DB::exec('INSERT INTO panels(tg_id, product_id, panel_username, status, created_at, '
+    . 'billing_start_at, last_meter_at, suspended_at, suspended_reason) VALUES(?,?,?,?,?,?,?,?,?)',
+    [903, 1, 'prepaid-wrong-suspend', 'suspended', now_ts(), $futureStart317, $futureStart317,
+     now_ts(), 'balance']);
+set_put('suspend_on_zero', '1');
+panels_balance_enforce();
+$prepaidRow317 = DB::one('SELECT * FROM panels WHERE id=?', [$prepaidPanel317]);
+$pastRow317 = DB::one('SELECT * FROM panels WHERE id=?', [$pastPanel317]);
+$wrongRow317 = DB::one('SELECT * FROM panels WHERE id=?', [$wrongPanel317]);
+check317(!panel_balance_suspension_allowed($prepaidRow317, $futureStart317)
+    && panel_balance_suspension_allowed($prepaidRow317, $futureStart317 + 1)
+    && (string) $prepaidRow317['status'] === 'active',
+    'zero balance cannot suspend a panel until time is strictly past billing_start_at');
+check317(panel_traffic_limit_reached($prepaidRow317, ['used' => 1000, 'limit' => 1000])
+    && !panel_traffic_limit_reached($prepaidRow317, ['used' => 999, 'limit' => 1000]),
+    'traffic_used at or over traffic_limit remains the explicit prepaid-window suspension condition');
+check317((string) $pastRow317['status'] === 'suspended'
+    && (string) ($pastRow317['suspended_reason'] ?? '') === 'balance',
+    'zero balance is enforced after the prepaid boundary passes');
+check317((string) $wrongRow317['status'] === 'active'
+    && (string) ($wrongRow317['suspended_reason'] ?? '') === '',
+    'a legacy balance suspension inside the prepaid window is automatically restored');
+$trafficHeld317 = $prepaidRow317;
+$trafficHeld317['last_usage'] = 1000;
+$trafficHeld317['data_cap'] = 1000;
+check317(!panel_balance_hold_can_resume($trafficHeld317),
+    'a balance-marked panel is not resumed over an exhausted traffic cap');
+$prepaidChargeRow317 = DB::one('SELECT * FROM panels WHERE id=?', [$prepaidPanel317]);
+panel_charge_once($prepaidChargeRow317, USAGE_BILL_BYTES, false, true);
+check317((string) DB::val('SELECT status FROM panels WHERE id=?', [$prepaidPanel317], '') === 'active',
+    'a usage charge shortfall cannot suspend a zero-balance panel during its prepaid window');
+
 echo "\n== Force-join normalisation and validation order ==\n";
 [$parseOk1, $parseChat1, $parseUser1] = force_channel_parse('@public_channel');
 [$parseOk2, $parseChat2, $parseUser2] = force_channel_parse('https://t.me/public_channel');

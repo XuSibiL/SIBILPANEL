@@ -325,7 +325,7 @@ function admin_panel_user_limit(int $panelId, int $delta): array
 }
 
 /** تمدید حجم و تاریخ یک پنل فروخته‌شده */
-function admin_panel_extend(int $panelId, int $gigs, int $days): array
+function admin_panel_extend(int $panelId, int $gigs, int $days, int $adminId = 0): array
 {
     $panel = DB::one('SELECT * FROM panels WHERE id=?', [$panelId]);
     if ($panel === null) {
@@ -373,7 +373,8 @@ function admin_panel_extend(int $panelId, int $gigs, int $days): array
     post_report('➕ <b>تمدید پنل</b>' . "\n" . '📦 <code>'
         . e((string) $panel['panel_username']) . '</code>' . "\n"
         . 'مقدار: ' . $summary, 'panel');
-    Tg::send((int) $panel['tg_id'], '🎁 پنل <code>' . e((string) $panel['panel_username'])
+    support_send_admin_message($adminId, (int) $panel['tg_id'],
+        '🎁 پنل <code>' . e((string) $panel['panel_username'])
         . '</code> توسط پشتیبانی تمدید شد: <b>' . $summary . '</b>'
         . "\n" . 'انقضای جدید: ' . fa_ts($expires),
         [[btn('📦 پنل‌های من', 'menu:panels', null, 'primary')]]);
@@ -407,7 +408,8 @@ function admin_panel_delete(int $panelId, int $adminId = 0): array
     log_line('info', 'admin deleted panel', ['panel' => $panelId, 'by' => $adminId]);
     post_report('🗑 <b>حذف پنل توسط مدیر</b>' . "\n" . '👤 کاربر <code>' . $tgId . '</code>'
         . "\n" . '📦 <code>' . e($username) . '</code>', 'panel');
-    Tg::send($tgId, '🗑 پنل <code>' . e($username) . '</code> توسط پشتیبانی حذف شد.');
+    support_send_admin_message($adminId, $tgId,
+        '🗑 پنل <code>' . e($username) . '</code> توسط پشتیبانی حذف شد.');
     return [true, '🗑 پنل <code>' . e($username) . '</code> حذف شد.'
         . ($apiOk ? '' : "\n⚠️ روی سرور پنل حذف نشد: " . e($note))];
 }
@@ -469,13 +471,22 @@ function bc_targets(string $segment, bool $onlyAllowed = true): array
  *  خروجی: [موفق؟، مسدود؟، message_id]
  */
 function bc_send_one(int $tgId, string $mode, string $text, int $fromChat, int $messageId,
-                     int $tries = 3): array
+                     int $tries = 3, int $adminId = 0): array
 {
+    /* کار همگانی هم اقدام مستقیم یک ادمین است. ticket فقط یک‌بار ساخته و در
+       retry دوباره مصرف نمی‌شود؛ در فراخوانی قدیمی/داخلیِ بدون actor، رفتار
+       سازگار گذشته حفظ می‌شود. */
+    $ticketId = $adminId > 0 ? support_reply_create_ticket($tgId, $adminId) : 0;
+    $replyMarkup = $ticketId > 0 ? ['inline_keyboard' => support_reply_keyboard([], $ticketId)] : null;
     for ($attempt = 1; $attempt <= $tries; $attempt++) {
         $params = $mode === 'copy'
             ? ['chat_id' => $tgId, 'from_chat_id' => $fromChat, 'message_id' => $messageId]
             : ['chat_id' => $tgId, 'text' => $text, 'parse_mode' => 'HTML',
                'disable_web_page_preview' => true];
+        if ($replyMarkup !== null) {
+            /* copyMessage هم reply_markup می‌پذیرد؛ دکمه روی خود پیام کپی‌شده است. */
+            $params['reply_markup'] = $replyMarkup;
+        }
         $method = $mode === 'copy' ? 'copyMessage' : 'sendMessage';
         $res = Tg::call($method, $params);
         if (Tg::$dry) {
@@ -488,6 +499,9 @@ function bc_send_one(int $tgId, string $mode, string $text, int $fromChat, int $
         }
         $description = is_array($res) ? (string) ($res['description'] ?? '') : '';
         if (bc_blocked_error($description)) {
+            if ($ticketId > 0) {
+                DB::exec('DELETE FROM support_reply_tickets WHERE id=?', [$ticketId]);
+            }
             return [false, true, 0];
         }
         $retryAfter = (int) ($res['parameters']['retry_after'] ?? 0);
@@ -497,7 +511,13 @@ function bc_send_one(int $tgId, string $mode, string $text, int $fromChat, int $
             usleep(50000);
             continue;
         }
+        if ($ticketId > 0) {
+            DB::exec('DELETE FROM support_reply_tickets WHERE id=?', [$ticketId]);
+        }
         return [false, false, 0];
+    }
+    if ($ticketId > 0) {
+        DB::exec('DELETE FROM support_reply_tickets WHERE id=?', [$ticketId]);
     }
     return [false, false, 0];
 }
@@ -522,7 +542,7 @@ function bc_blocked_error(string $description): bool
  *  · متن نهایی: «تعداد کل: X | موفق: Y | مسدود شده توسط کاربر: Z»
  */
 function bc_run(array $targets, string $mode, string $text = '', int $fromChat = 0,
-                int $messageId = 0, bool $pin = false): array
+                int $messageId = 0, bool $pin = false, int $adminId = 0): array
 {
     $sent = 0;
     $failed = 0;
@@ -530,7 +550,7 @@ function bc_run(array $targets, string $mode, string $text = '', int $fromChat =
     $jobId = (string) set_get('bc_job_id', '');
     foreach ($targets as $index => $tgId) {
         [$okSend, $isBlocked, $lastId] = bc_send_one((int) $tgId, $mode, $text, $fromChat,
-            $messageId);
+            $messageId, 3, $adminId);
         if ($okSend) {
             $sent++;
             if ($pin && $lastId > 0) {
@@ -640,7 +660,7 @@ function bc_job_tick(int $budgetSeconds = 45): bool
     while ($cursor < $count && (microtime(true) - $started) < $budgetSeconds) {
         [$okSend, $isBlocked, $lastId] = bc_send_one($targets[$cursor], $mode,
             (string) ($job['text'] ?? ''), (int) ($job['from_chat'] ?? 0),
-            (int) ($job['message_id'] ?? 0));
+            (int) ($job['message_id'] ?? 0), 3, (int) ($job['admin'] ?? 0));
         if ($okSend) {
             $sent++;
             if (!empty($job['pin']) && $lastId > 0) {

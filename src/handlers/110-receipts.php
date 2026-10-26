@@ -259,7 +259,8 @@ function review_receipt(int $receiptId, bool $approve, int $adminId): array
     if (!$approve) {
         order_mark((int) $order['id'], 'rejected');
         receipt_close_card($receiptId, false, $adminId, $stamp);
-        Tg::send((int) $order['tg_id'], '❌ <b>رسید تأیید نشد</b>' . "\n\n"
+        support_send_admin_message($adminId, (int) $order['tg_id'],
+            '❌ <b>رسید تأیید نشد</b>' . "\n\n"
             . '🧾 سفارش: <code>' . e((string) $order['ref']) . '</code>' . "\n"
             . '💵 مبلغ: ' . money((int) $receipt['amount']) . "\n\n"
             . 'اگر مبلغ را واریز کرده‌ای، رسید را دوباره با پشتیبانی هماهنگ کنید.',
@@ -270,7 +271,7 @@ function review_receipt(int $receiptId, bool $approve, int $adminId): array
     $balanceBefore = balance_of((int) $order['tg_id']);
     [$ok, $text] = settle_payment($order, 'card', $adminId);
     $balanceAfter = balance_of((int) $order['tg_id']);
-    Tg::send((int) $order['tg_id'], $text, home_kb((int) $order['tg_id']));
+    support_send_admin_message($adminId, (int) $order['tg_id'], $text, home_kb((int) $order['tg_id']));
     $footer = $stamp;
     if ($ok) {
         $footer .= "\n👛 موجودی کاربر: " . money($balanceAfter)

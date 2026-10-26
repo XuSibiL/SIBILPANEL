@@ -399,6 +399,19 @@ CREATE TABLE IF NOT EXISTS nav_stack (
     data       TEXT,
     updated_at INTEGER NOT NULL
 );
+
+/* دکمه‌های پاسخ پشتیبانی به گیرندهٔ اصلی bind می‌شوند؛ شناسهٔ ticket به‌تنهایی
+   هرگز برای بازکردن گفتگو کافی نیست. */
+CREATE TABLE IF NOT EXISTS support_reply_tickets (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    tg_id       INTEGER NOT NULL,
+    admin_id    INTEGER NOT NULL,
+    created_at  INTEGER NOT NULL,
+    expires_at  INTEGER NOT NULL,
+    consumed_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS support_reply_tickets_user_idx
+    ON support_reply_tickets(tg_id, expires_at);
 SQL;
 
 function db_bootstrap(): void

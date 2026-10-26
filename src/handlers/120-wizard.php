@@ -475,7 +475,8 @@ function wiz_finish(int $uid, array $data): void
             add_balance((int) $order['tg_id'], $amount, 'refund', (string) $order['id'],
                 'بازگشت وجه سفارش #' . $order['id']);
             DB::exec("UPDATE orders SET status='refunded' WHERE id=?", [(int) $order['id']]);
-            Tg::send((int) $order['tg_id'], '↩️ مبلغ ' . money($amount) . ' بابت سفارش #'
+            support_send_admin_message($uid, (int) $order['tg_id'],
+                '↩️ مبلغ ' . money($amount) . ' بابت سفارش #'
                 . $order['id'] . ' به کیف پولتان برگشت.');
             Tg::send($uid, '✅ بازگشت وجه انجام شد.' . "\n" . 'سفارش #' . $order['id']
                 . ' · ' . money($amount) . "\n" . 'موجودی جدید کاربر: '
@@ -496,7 +497,8 @@ function wiz_finish(int $uid, array $data): void
             $newBalance = add_balance($tgId, $amount, 'admin', (string) $uid, 'تغییر دستی ادمین');
             post_report('💰 <b>تغییر موجودی توسط ادمین</b>' . "\n" . 'کاربر <code>' . $tgId
                 . '</code> · ' . money($amount) . "\n" . 'موجودی جدید: ' . money($newBalance));
-            Tg::send($tgId, '💰 موجودی کیف پولتان تغییر کرد: <b>' . money($amount) . '</b>' . "\n"
+            support_send_admin_message($uid, $tgId,
+                '💰 موجودی کیف پولتان تغییر کرد: <b>' . money($amount) . '</b>' . "\n"
                 . 'موجودی جدید: <b>' . money($newBalance) . '</b>');
             Tg::send($uid, '✅ انجام شد.' . "\n" . 'موجودی جدید: <b>' . money($newBalance) . '</b>',
                 [[btn('« کاربر', 'ad:u:' . $tgId, null, 'success')]]);
@@ -534,15 +536,16 @@ function wiz_finish(int $uid, array $data): void
             $panelId = (int) ($ctx['panel_id'] ?? 0);
             $gigs = max(0, (int) ($values['gigs'] ?? 0));
             $days = max(0, (int) ($values['days'] ?? 0));
-            [$okE, $msgE] = admin_panel_extend($panelId, $gigs, $days);
+            [$okE, $msgE] = admin_panel_extend($panelId, $gigs, $days, $uid);
             Tg::send($uid, $msgE);
             screen_find_panel($uid, null, $panelId);
             return;
 
         case 'usermsg':
             $tgId = (int) ($ctx['tg_id'] ?? 0);
-            $okSend = Tg::send($tgId, (string) $values['text']);
-            Tg::send($uid, $okSend ? '✅ پیام رسید.' : '❌ پیام نرسید (کاربر ربات را بلاک کرده).',
+            $okSend = support_send_admin_message($uid, $tgId, (string) $values['text']);
+            Tg::send($uid, $okSend ? '✅ پیام رسید؛ دکمهٔ پاسخ پشتیبانی هم زیر آن قرار گرفت.'
+                : '❌ پیام نرسید (کاربر ربات را بلاک کرده یا دسترسی شما تغییر کرده).',
                 [[btn('« کاربر', 'ad:u:' . $tgId, null, 'success')]]);
             return;
 
@@ -552,7 +555,8 @@ function wiz_finish(int $uid, array $data): void
             $days = max(0, (int) ($values['days'] ?? 0));
             [$okGift, $msgGift] = user_discount_grant($tgId, $percent, $days);
             if ($okGift && $percent > 0) {
-                Tg::send($tgId, '🎁 یک تخفیف اختصاصی <b>' . fa_digits($percent) . '</b>٪'
+                support_send_admin_message($uid, $tgId,
+                    '🎁 یک تخفیف اختصاصی <b>' . fa_digits($percent) . '</b>٪'
                     . ($days > 0 ? ' برای ' . fa_digits($days) . ' روز' : ' بی‌پایان')
                     . ' روی خریدهایت فعال شد.');
                 post_report('🎁 <b>تخفیف اختصاصی</b>' . "\n" . 'کاربر: <code>' . $tgId

@@ -49,6 +49,41 @@ function usage_blocks(int $bytes): int
     return intdiv(max(0, $bytes), USAGE_BLOCK_BYTES);
 }
 
+/**
+ * آیا پنل از پنجرهٔ پیش‌پرداخت گذشته است؟
+ * billing_start_at=0 برای پنل‌های قدیمی/بدون پیش‌پرداخت است و فوراً قابل
+ * بررسی موجودی است. در لحظهٔ دقیق پایان هم هنوز تعلیق صفر-موجودی مجاز نیست؛
+ * شرط صریح مطابق قرارداد: time() > billing_start_at.
+ */
+function panel_balance_suspension_allowed(array $panel, ?int $at = null): bool
+{
+    $billingStart = (int) ($panel['billing_start_at'] ?? 0);
+    $at = $at ?? time();
+    return $billingStart <= 0 || $at > $billingStart;
+}
+
+/** تنها تعلیق مجازِ پنجرهٔ پیش‌پرداخت: تمام‌شدن سقف ترافیک واقعی. */
+function panel_traffic_limit_reached(array $panel, array $usage): bool
+{
+    $limit = (int) ($usage['limit'] ?? 0);
+    if ($limit <= 0) {
+        $limit = (int) ($panel['data_cap'] ?? 0);
+    }
+    return $limit > 0 && (int) ($usage['used'] ?? 0) >= $limit;
+}
+
+/** هیچ تعلیقِ مانده از موجودی نباید سقف ترافیک/تاریخ انقضا را دور بزند. */
+function panel_balance_hold_can_resume(array $panel): bool
+{
+    if (!empty($panel['expires_at']) && (int) $panel['expires_at'] <= now_ts()) {
+        return false;
+    }
+    return !panel_traffic_limit_reached($panel, [
+        'used' => (int) ($panel['last_usage'] ?? 0),
+        'limit' => (int) ($panel['data_cap'] ?? 0),
+    ]);
+}
+
 /** تعداد گیگ‌های کاملِ حساب‌شده */
 function billed_gigs(int $bytes): int
 {
@@ -172,8 +207,8 @@ function panel_charge_once(array $panel, int $usedBytes, bool $hourlyEnabled,
             . "\n" . '👛 موجودی: ' . money($balance - $paid), 'usage');
         $out['charged'] = $paid;
     }
-    if ($paid < $charge) {
-        /* کمبود موجودی: گیگ‌ها همین حالا ثبت شدند، پس دوباره کسر نمی‌شوند */
+    if ($paid < $charge && panel_balance_suspension_allowed($panel)) {
+        /* کمبود موجودی بعد از پایان پیش‌پرداخت: گیگ‌ها همین حالا ثبت شدند، پس دوباره کسر نمی‌شوند */
         $graceUntil = (int) ($panel['suspended_at'] ?? 0) + $grace;
         if ($grace === 0 || ($panel['suspended_at'] && now_ts() >= $graceUntil)) {
             if (suspend_panel($panel, 'کمبود موجودی')) {
@@ -185,6 +220,10 @@ function panel_charge_once(array $panel, int $usedBytes, bool $hourlyEnabled,
                 . 'پنل <code>' . e((string) $panel['panel_username']) . '</code> تا '
                 . $grace . " ثانیه بعد تعلیق می‌شود.");
         }
+    } elseif ($paid < $charge) {
+        /* در ۲۴ ساعت تسویه‌شده، صفر بودن کیف پول هرگز پنل را معلق نمی‌کند. */
+        log_line('info', 'prepaid window: balance suspension skipped', ['panel' => $panelId,
+            'billing_start_at' => (int) ($panel['billing_start_at'] ?? 0)]);
     }
     return $out;
 }
@@ -206,7 +245,8 @@ function panels_meter(bool $verbose = false): array
         DB::exec('UPDATE panels SET last_meter_at=? WHERE id=?', [now_ts(), (int) $held['id']]);
         $heldBalance = balance_of((int) $held['tg_id']);
         $heldExpired = !empty($held['expires_at']) && (int) $held['expires_at'] <= now_ts();
-        if ($heldBalance > 0 && $heldBalance >= (int) $held['min_balance'] && !$heldExpired) {
+        if ($heldBalance > 0 && $heldBalance >= (int) $held['min_balance'] && !$heldExpired
+            && panel_balance_hold_can_resume($held)) {
             if (resume_panel($held)) {
                 $stats['resumed']++;
             }
@@ -238,6 +278,16 @@ function panels_meter(bool $verbose = false): array
         }
         $tgId = (int) $panel['tg_id'];
         $panelId = (int) $panel['id'];
+
+        /* سقف ترافیک یک محدودیت واقعی سرویس است و حتی در ۲۴ ساعت پیش‌پرداخت
+           هم مجاز است پنل را متوقف کند؛ صفر بودن کیف پول چنین مجوزی ندارد. */
+        if (panel_traffic_limit_reached($panel, $usage)) {
+            DB::exec('UPDATE panels SET last_usage=? WHERE id=?', [(int) $usage['used'], $panelId]);
+            if (suspend_panel($panel, 'پایان حجم ترافیک')) {
+                $stats['suspended']++;
+            }
+            continue;
+        }
 
         $result = panel_charge_once($panel, (int) $usage['used'], $hourlyEnabled,
             $perGbEnabled, $grace);
@@ -340,6 +390,21 @@ function panels_balance_enforce(bool $verbose = false): array
             continue; // پنل تست رایگان است و به موجودی کاری ندارد
         }
         $balance = balance_of((int) $panel['tg_id']);
+        /* پول ۲۴ ساعت اول در فاکتور اولیه تسویه شده است؛ تا عبور صریح زمان
+           billing_start_at هیچ تعلیق یا هشدارِ «موجودی صفر» مجاز نیست. */
+        if (!panel_balance_suspension_allowed($panel)) {
+            if ($panel['status'] === 'suspended' && ($panel['suspended_reason'] ?? '') === 'balance'
+                && panel_balance_hold_can_resume($panel)) {
+                DB::exec('UPDATE panels SET suspended_reason=NULL WHERE id=?', [(int) $panel['id']]);
+                if (resume_panel($panel)) {
+                    $out['resumed']++;
+                }
+            }
+            if ($verbose) {
+                echo '· prepaid window: balance ignored for ' . $panel['panel_username'] . "\n";
+            }
+            continue;
+        }
         if ($panel['status'] === 'active' && $balance <= 0) {
             suspend_panel($panel, 'موجودی کیف پول صفر است');
             DB::exec('UPDATE panels SET suspended_reason=? WHERE id=?',
@@ -351,7 +416,7 @@ function panels_balance_enforce(bool $verbose = false): array
             continue;
         }
         if ($panel['status'] === 'suspended' && ($panel['suspended_reason'] ?? '') === 'balance'
-            && $balance > 0) {
+            && $balance > 0 && panel_balance_hold_can_resume($panel)) {
             DB::exec('UPDATE panels SET suspended_reason=NULL WHERE id=?', [(int) $panel['id']]);
             if (resume_panel($panel)) {
                 $out['resumed']++;
@@ -789,7 +854,7 @@ function panel_api_status(array $panelRow, int $adminId, string $status, string 
     }
 }
 
-function suspend_panel(array $panel, string $reason): bool
+function suspend_panel(array $panel, string $reason, int $adminId = 0): bool
 {
     $fresh = DB::one('SELECT * FROM panels WHERE id=?', [(int) $panel['id']]);
     if ($fresh === null) {
@@ -815,14 +880,19 @@ function suspend_panel(array $panel, string $reason): bool
         delete_trial_panel($panel, $reason);
         return true;
     }
-    Tg::send((int) $panel['tg_id'], '⛔️ پنل <code>' . e((string) $panel['panel_username'])
+    $notice = '⛔️ پنل <code>' . e((string) $panel['panel_username'])
         . "</code> تعلیق شد.\n" . 'دلیل: ' . e($reason) . "\n"
-        . 'با شارژ کیف پول، پنل خودکار فعال می‌شود.',
-        [[btn('💳 شارژ کیف پول', 'menu:wallet', null, 'success')]]);
+        . 'با شارژ کیف پول، پنل خودکار فعال می‌شود.';
+    $noticeKb = [[btn('💳 شارژ کیف پول', 'menu:wallet', null, 'success')]];
+    if ($adminId > 0) {
+        support_send_admin_message($adminId, (int) $panel['tg_id'], $notice, $noticeKb);
+    } else {
+        Tg::send((int) $panel['tg_id'], $notice, $noticeKb);
+    }
     return true;
 }
 
-function resume_panel(array $panel): bool
+function resume_panel(array $panel, int $adminId = 0): bool
 {
     $fresh = DB::one('SELECT * FROM panels WHERE id=?', [(int) $panel['id']]);
     if ($fresh === null) {
@@ -843,9 +913,14 @@ function resume_panel(array $panel): bool
     post_report('✅ <b>پنل دوباره فعال شد</b>' . "\n"
         . '👤 کاربر <code>' . (int) $panel['tg_id'] . "</code>\n"
         . '📦 پنل <code>' . e((string) $panel['panel_username']) . '</code>', 'panel');
-    Tg::send((int) $panel['tg_id'], '✅ پنل <code>' . e((string) $panel['panel_username'])
-        . '</code> دوباره فعال شد.',
-        [[btn('📦 پنل‌های من', 'menu:panels', null, 'primary')]]);
+    $notice = '✅ پنل <code>' . e((string) $panel['panel_username'])
+        . '</code> دوباره فعال شد.';
+    $noticeKb = [[btn('📦 پنل‌های من', 'menu:panels', null, 'primary')]];
+    if ($adminId > 0) {
+        support_send_admin_message($adminId, (int) $panel['tg_id'], $notice, $noticeKb);
+    } else {
+        Tg::send((int) $panel['tg_id'], $notice, $noticeKb);
+    }
     return true;
 }
 
