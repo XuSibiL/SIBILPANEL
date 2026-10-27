@@ -740,8 +740,8 @@ function handle_callback_inner(array $cb): void
     if (str_starts_with($data, 'trial:go:')) {
         $productId = (int) substr($data, 9);
         $product = product_get($productId);
-        if ($product === null || (int) $product['active'] !== 1) {
-            Tg::answer($cbId, 'این محصول فعال نیست.', true);
+        if (!trial_product_allowed($product)) {
+            Tg::answer($cbId, 'این محصول برای سرویس تست در دسترس نیست.', true);
             screen_trial($chatId, $messageId, $uid);
             return;
         }
@@ -763,6 +763,11 @@ function handle_callback_inner(array $cb): void
         if ($product === null || (int) $product['active'] !== 1) {
             Tg::answer($cbId, 'این محصول فعال نیست.', true);
             show_home($chatId, $messageId, $uid);
+            return;
+        }
+        if ($mode === 'trial' && !trial_product_allowed($product)) {
+            Tg::answer($cbId, 'این محصول برای سرویس تست در دسترس نیست.', true);
+            screen_trial($chatId, $messageId, $uid);
             return;
         }
         if ($mode === 'buyu') {

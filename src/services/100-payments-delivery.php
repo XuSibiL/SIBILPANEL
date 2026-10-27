@@ -110,6 +110,10 @@ function deliver_panel_order(array $order): array
     }
     $payloadOrder = json_decode((string) ($order['payload'] ?? ''), true) ?: [];
     $isTrial = (string) $order['kind'] === 'trial';
+    /* سد نهایی: حتی سفارش قدیمی/دستیِ تست هم نباید پنل نامحدود بسازد. */
+    if ($isTrial && product_is_unlimited($product)) {
+        return [false, 'پنل نامحدود در سرویس تست قابل ساخت نیست.'];
+    }
     $isUnlimited = !$isTrial && ((string) ($payloadOrder['sale_type'] ?? '') === PRODUCT_SALE_UNLIMITED_USERS
         || !empty($payloadOrder['unlimited_users']));
     $unlimitedUsers = (int) ($payloadOrder['user_count'] ?? 0);

@@ -65,12 +65,14 @@ ok318(!array_diff(['is_unlimited', 'unlimited_user_price', 'unlimited_min_users'
 $uid = 318001;
 user_ensure($uid, 'آزمایش', 'v318test');
 $catId = cat_create('آزمایش', '🧪');
-$meteredId = DB::exec('INSERT INTO products(name, emoji, category_id, active, created_at, '
-    . 'hourly_price, per_gb_price, max_users) VALUES(?,?,?,?,?,?,?,?)',
-    ['محصول متری', '📦', $catId, 1, now_ts(), 1234, 5678, 10]);
-$unlimitedId = DB::exec('INSERT INTO products(name, emoji, category_id, active, created_at, '
-    . 'sale_type, per_user_price, min_users, slots_needed) VALUES(?,?,?,?,?,?,?,?,?)',
-    ['نامحدود هلند', '♾️', $catId, 1, now_ts(), PRODUCT_SALE_UNLIMITED_USERS, 100000, 3, 1]);
+$meteredId = DB::exec('INSERT INTO products(name, emoji, category_id, active, trial, created_at, '
+    . 'hourly_price, per_gb_price, max_users) VALUES(?,?,?,?,?,?,?,?,?)',
+    ['محصول متری', '📦', $catId, 1, 1, now_ts(), 1234, 5678, 10]);
+$unlimitedId = DB::exec('INSERT INTO products(name, emoji, category_id, active, trial, created_at, '
+    . 'sale_type, per_user_price, min_users, slots_needed) VALUES(?,?,?,?,?,?,?,?,?,?)',
+    ['نامحدود هلند', '♾️', $catId, 1, 1, now_ts(), PRODUCT_SALE_UNLIMITED_USERS, 100000, 3, 1]);
+DB::exec('INSERT INTO pg_panels(name, url, api_key, active, is_default, created_at) VALUES(?,?,?,?,?,?)',
+    ['آزمایش', 'https://panel.test', 'test-key', 1, 1, now_ts()]);
 
 echo "\n== labels and purchase state ==\n";
 $expectedGuide = 'ℹ️ راهنما: تعداد روز (مدت اعتبار) و محدودیت تعداد دستگاه در پنل‌های نامحدود، مستقیماً از روی تنظیمات نقش (Role) در پنل پاسارگاد اعمال می‌شود. ربات فقط وظیفه ساخت تعداد یوزر/کلاینت درخواستی را بر عهده دارد.';
@@ -96,6 +98,38 @@ screen_product_admin($uid, null, $unlimitedId);
 $adminProduct = Tg::$outbox[array_key_last(Tg::$outbox)] ?? [];
 ok318(str_contains((string) ($adminProduct[1]['text'] ?? ''), $expectedGuide),
     'unlimited product administration displays the required Role guidance');
+
+echo "\n== test-service restriction ==\n";
+Tg::$outbox = [];
+screen_trial($uid, null, $uid);
+$trialMenu = Tg::$outbox[array_key_last(Tg::$outbox)] ?? [];
+$trialButtons = flat318($trialMenu[1]['reply_markup']['inline_keyboard'] ?? []);
+ok318(isset($trialButtons['trial:p:' . $meteredId]),
+    'test-service menu keeps an eligible metered product');
+ok318(!isset($trialButtons['trial:p:' . $unlimitedId]),
+    'test-service menu never displays an unlimited product, even when marked trial');
+
+Tg::$outbox = [];
+screen_trial_product($uid, null, $uid, $unlimitedId);
+$trialBlocked = Tg::$outbox[array_key_last(Tg::$outbox)] ?? [];
+ok318(str_contains((string) ($trialBlocked[1]['text'] ?? ''), 'برای سرویس تست در دسترس نیست'),
+    'direct unlimited test-product screen is blocked');
+
+State::clear($uid);
+callback318($uid, 'trial:go:' . $unlimitedId);
+ok318(State::get($uid)['state'] === '', 'forged unlimited test callback cannot start username selection');
+callback318($uid, 'uname:trial:' . $unlimitedId . ':custom');
+ok318(State::get($uid)['state'] === '', 'forged unlimited trial username callback cannot create a pending state');
+$trialOrdersBefore = (int) DB::val("SELECT COUNT(*) FROM orders WHERE kind='trial'", [], 0);
+start_trial_order($uid, $uid, null, $unlimitedId, 'blockedtrial');
+$trialOrdersAfter = (int) DB::val("SELECT COUNT(*) FROM orders WHERE kind='trial'", [], 0);
+ok318($trialOrdersAfter === $trialOrdersBefore, 'unlimited product cannot create a trial order');
+$blockedTrialOrder = create_order($uid, 'trial', 0, $unlimitedId, ['panel_username' => 'blockedtrial']);
+[$blockedDelivery, $blockedWhy] = deliver_panel_order($blockedTrialOrder);
+ok318(!$blockedDelivery && str_contains($blockedWhy, 'نامحدود'),
+    'delivery refuses a manually created unlimited trial order before panel provisioning');
+ok318((int) DB::val('SELECT COUNT(*) FROM panels WHERE is_trial=1 AND is_unlimited=1', [], 0) === 0,
+    'no unlimited panel is ever stored as a test panel');
 
 callback318($uid, 'buy:users:' . $unlimitedId);
 ok318(State::get($uid)['state'] === 'unlimited_initial_users', 'initial requested-user state is saved');

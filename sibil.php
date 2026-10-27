@@ -21,7 +21,7 @@
 
 declare(strict_types=1);
 
-const PANEL_VERSION = '3.18.0';
+const PANEL_VERSION = '3.18.1';
 const IRAN_OFFSET   = 3.5 * 3600;
 const DAY           = 86400;
 
@@ -2796,6 +2796,16 @@ function product_is_unlimited(array $product): bool
     return product_sale_type($product) === PRODUCT_SALE_UNLIMITED_USERS;
 }
 
+/**
+ * سرویس تست فقط برای محصولات متری است. این کنترل مرکزی، ورودی‌های دستی و
+ * سفارش‌هایی را که محصولشان پس از ثبت تغییر کرده نیز از ساخت پنل نامحدود بازمی‌دارد.
+ */
+function trial_product_allowed(?array $product): bool
+{
+    return $product !== null && (int) ($product['active'] ?? 0) === 1
+        && !product_is_unlimited($product);
+}
+
 /** پنل نامحدود هرگز از تغییر بعدی محصول یا حذف محصول استنتاج نمی‌شود. */
 function panel_is_unlimited(array $panel): bool
 {
@@ -4405,8 +4415,8 @@ function start_trial_order(int $uid, int|string $chat, ?int $messageId, int $pro
                            string $username): void
 {
     $product = product_get($productId);
-    if ($product === null || (int) $product['active'] !== 1) {
-        Tg::show($chat, $messageId, 'این محصول فعال نیست.',
+    if (!trial_product_allowed($product)) {
+        Tg::show($chat, $messageId, 'این محصول برای سرویس تست در دسترس نیست.',
             [[btn('« تست پنل', 'menu:trial', null, 'danger')]]);
         return;
     }
@@ -4789,6 +4799,17 @@ function trial_used(int $uid): int
         . "AND status='delivered'", [$uid], 0);
 }
 
+/** فهرست سرویس تست: فقط محصولات متری؛ پنل نامحدود هرگز گزینهٔ تست نیست. */
+function trial_products_list(): array
+{
+    $trialOnly = DB::all('SELECT * FROM products WHERE active=1 AND trial=1 ORDER BY id LIMIT 12');
+    $trialOnly = array_values(array_filter($trialOnly, 'trial_product_allowed'));
+    if ($trialOnly) {
+        return $trialOnly;
+    }
+    return array_values(array_filter(products_list(true), 'trial_product_allowed'));
+}
+
 function screen_trial(int|string $chat, ?int $messageId, int $uid): void
 {
     if (!set_bool('trial_on', true)) {
@@ -4827,11 +4848,9 @@ function screen_trial(int|string $chat, ?int $messageId, int $uid): void
              [btn('« بازگشت', 'home', null, 'danger')]]);
         return;
     }
-    $text .= 'یک محصول را انتخاب کنید تا پنل تست روی همان ساخته شود:';
+    $text .= 'یک محصول حجمی را انتخاب کنید تا پنل تست روی همان ساخته شود:';
     $rows = [];
-    $trialOnly = DB::all('SELECT * FROM products WHERE active=1 AND trial=1 ORDER BY id LIMIT 12');
-    $list = $trialOnly ?: products_list(true);
-    foreach ($list as $product) {
+    foreach (trial_products_list() as $product) {
         $rows[] = [btn((string) $product['emoji'] . ' ' . (string) $product['name'],
             'trial:p:' . $product['id'], null, 'success')];
     }
@@ -4846,8 +4865,8 @@ function screen_trial(int|string $chat, ?int $messageId, int $uid): void
 function screen_trial_product(int|string $chat, ?int $messageId, int $uid, int $productId): void
 {
     $product = product_get($productId);
-    if ($product === null || (int) $product['active'] !== 1) {
-        Tg::show($chat, $messageId, 'این محصول فعال نیست.',
+    if (!trial_product_allowed($product)) {
+        Tg::show($chat, $messageId, 'این محصول برای سرویس تست در دسترس نیست.',
             [[btn('« تست پنل', 'menu:trial', null, 'danger')]]);
         return;
     }
@@ -4872,6 +4891,11 @@ function screen_username_choice(int|string $chat, ?int $messageId, int $productI
                                 string $mode, int $unlimitedUsers = 0): void
 {
     $product = product_get($productId);
+    if ($mode === 'trial' && !trial_product_allowed($product)) {
+        Tg::show($chat, $messageId, 'این محصول برای سرویس تست در دسترس نیست.',
+            [[btn('« تست پنل', 'menu:trial', null, 'danger')]]);
+        return;
+    }
     $title = $mode === 'trial' ? '🧪 پنل تست' : '🛒 خرید پنل';
     $countLine = $mode === 'buyu'
         ? '👥 تعداد کاربر: <b>' . fa_digits($unlimitedUsers) . "</b>\n\n" : '';
@@ -12781,6 +12805,10 @@ function deliver_panel_order(array $order): array
     }
     $payloadOrder = json_decode((string) ($order['payload'] ?? ''), true) ?: [];
     $isTrial = (string) $order['kind'] === 'trial';
+    /* سد نهایی: حتی سفارش قدیمی/دستیِ تست هم نباید پنل نامحدود بسازد. */
+    if ($isTrial && product_is_unlimited($product)) {
+        return [false, 'پنل نامحدود در سرویس تست قابل ساخت نیست.'];
+    }
     $isUnlimited = !$isTrial && ((string) ($payloadOrder['sale_type'] ?? '') === PRODUCT_SALE_UNLIMITED_USERS
         || !empty($payloadOrder['unlimited_users']));
     $unlimitedUsers = (int) ($payloadOrder['user_count'] ?? 0);
@@ -15042,8 +15070,8 @@ function handle_callback_inner(array $cb): void
     if (str_starts_with($data, 'trial:go:')) {
         $productId = (int) substr($data, 9);
         $product = product_get($productId);
-        if ($product === null || (int) $product['active'] !== 1) {
-            Tg::answer($cbId, 'این محصول فعال نیست.', true);
+        if (!trial_product_allowed($product)) {
+            Tg::answer($cbId, 'این محصول برای سرویس تست در دسترس نیست.', true);
             screen_trial($chatId, $messageId, $uid);
             return;
         }
@@ -15065,6 +15093,11 @@ function handle_callback_inner(array $cb): void
         if ($product === null || (int) $product['active'] !== 1) {
             Tg::answer($cbId, 'این محصول فعال نیست.', true);
             show_home($chatId, $messageId, $uid);
+            return;
+        }
+        if ($mode === 'trial' && !trial_product_allowed($product)) {
+            Tg::answer($cbId, 'این محصول برای سرویس تست در دسترس نیست.', true);
+            screen_trial($chatId, $messageId, $uid);
             return;
         }
         if ($mode === 'buyu') {

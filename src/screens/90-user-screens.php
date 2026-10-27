@@ -501,8 +501,8 @@ function start_trial_order(int $uid, int|string $chat, ?int $messageId, int $pro
                            string $username): void
 {
     $product = product_get($productId);
-    if ($product === null || (int) $product['active'] !== 1) {
-        Tg::show($chat, $messageId, 'این محصول فعال نیست.',
+    if (!trial_product_allowed($product)) {
+        Tg::show($chat, $messageId, 'این محصول برای سرویس تست در دسترس نیست.',
             [[btn('« تست پنل', 'menu:trial', null, 'danger')]]);
         return;
     }
@@ -885,6 +885,17 @@ function trial_used(int $uid): int
         . "AND status='delivered'", [$uid], 0);
 }
 
+/** فهرست سرویس تست: فقط محصولات متری؛ پنل نامحدود هرگز گزینهٔ تست نیست. */
+function trial_products_list(): array
+{
+    $trialOnly = DB::all('SELECT * FROM products WHERE active=1 AND trial=1 ORDER BY id LIMIT 12');
+    $trialOnly = array_values(array_filter($trialOnly, 'trial_product_allowed'));
+    if ($trialOnly) {
+        return $trialOnly;
+    }
+    return array_values(array_filter(products_list(true), 'trial_product_allowed'));
+}
+
 function screen_trial(int|string $chat, ?int $messageId, int $uid): void
 {
     if (!set_bool('trial_on', true)) {
@@ -923,11 +934,9 @@ function screen_trial(int|string $chat, ?int $messageId, int $uid): void
              [btn('« بازگشت', 'home', null, 'danger')]]);
         return;
     }
-    $text .= 'یک محصول را انتخاب کنید تا پنل تست روی همان ساخته شود:';
+    $text .= 'یک محصول حجمی را انتخاب کنید تا پنل تست روی همان ساخته شود:';
     $rows = [];
-    $trialOnly = DB::all('SELECT * FROM products WHERE active=1 AND trial=1 ORDER BY id LIMIT 12');
-    $list = $trialOnly ?: products_list(true);
-    foreach ($list as $product) {
+    foreach (trial_products_list() as $product) {
         $rows[] = [btn((string) $product['emoji'] . ' ' . (string) $product['name'],
             'trial:p:' . $product['id'], null, 'success')];
     }
@@ -942,8 +951,8 @@ function screen_trial(int|string $chat, ?int $messageId, int $uid): void
 function screen_trial_product(int|string $chat, ?int $messageId, int $uid, int $productId): void
 {
     $product = product_get($productId);
-    if ($product === null || (int) $product['active'] !== 1) {
-        Tg::show($chat, $messageId, 'این محصول فعال نیست.',
+    if (!trial_product_allowed($product)) {
+        Tg::show($chat, $messageId, 'این محصول برای سرویس تست در دسترس نیست.',
             [[btn('« تست پنل', 'menu:trial', null, 'danger')]]);
         return;
     }
@@ -968,6 +977,11 @@ function screen_username_choice(int|string $chat, ?int $messageId, int $productI
                                 string $mode, int $unlimitedUsers = 0): void
 {
     $product = product_get($productId);
+    if ($mode === 'trial' && !trial_product_allowed($product)) {
+        Tg::show($chat, $messageId, 'این محصول برای سرویس تست در دسترس نیست.',
+            [[btn('« تست پنل', 'menu:trial', null, 'danger')]]);
+        return;
+    }
     $title = $mode === 'trial' ? '🧪 پنل تست' : '🛒 خرید پنل';
     $countLine = $mode === 'buyu'
         ? '👥 تعداد کاربر: <b>' . fa_digits($unlimitedUsers) . "</b>\n\n" : '';

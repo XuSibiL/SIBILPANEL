@@ -143,6 +143,16 @@ function product_is_unlimited(array $product): bool
     return product_sale_type($product) === PRODUCT_SALE_UNLIMITED_USERS;
 }
 
+/**
+ * سرویس تست فقط برای محصولات متری است. این کنترل مرکزی، ورودی‌های دستی و
+ * سفارش‌هایی را که محصولشان پس از ثبت تغییر کرده نیز از ساخت پنل نامحدود بازمی‌دارد.
+ */
+function trial_product_allowed(?array $product): bool
+{
+    return $product !== null && (int) ($product['active'] ?? 0) === 1
+        && !product_is_unlimited($product);
+}
+
 /** پنل نامحدود هرگز از تغییر بعدی محصول یا حذف محصول استنتاج نمی‌شود. */
 function panel_is_unlimited(array $panel): bool
 {
