@@ -126,10 +126,97 @@ function product_get(int $id): ?array
     return DB::one('SELECT * FROM products WHERE id=?', [$id]);
 }
 
+const PRODUCT_SALE_METERED = 'metered';
+const PRODUCT_SALE_UNLIMITED_USERS = 'unlimited_users';
+const UNLIMITED_USERS_MAX = 1000000;
+const UNLIMITED_ROLE_GUIDE = 'ℹ️ راهنما: تعداد روز (مدت اعتبار) و محدودیت تعداد دستگاه در پنل‌های نامحدود، مستقیماً از روی تنظیمات نقش (Role) در پنل پاسارگاد اعمال می‌شود. ربات فقط وظیفه ساخت تعداد یوزر/کلاینت درخواستی را بر عهده دارد.';
+
+/** نوع فروش فقط روی محصول تازه اثر دارد؛ پنل فروخته‌شده snapshot خودش را دارد. */
+function product_sale_type(array $product): string
+{
+    return (string) ($product['sale_type'] ?? '') === PRODUCT_SALE_UNLIMITED_USERS
+        ? PRODUCT_SALE_UNLIMITED_USERS : PRODUCT_SALE_METERED;
+}
+
+function product_is_unlimited(array $product): bool
+{
+    return product_sale_type($product) === PRODUCT_SALE_UNLIMITED_USERS;
+}
+
+/** پنل نامحدود هرگز از تغییر بعدی محصول یا حذف محصول استنتاج نمی‌شود. */
+function panel_is_unlimited(array $panel): bool
+{
+    return (int) ($panel['is_unlimited'] ?? 0) === 1;
+}
+
+/** قیمت و حداقلِ پنل فروخته‌شده snapshot هستند، نه تنظیمات قابل‌تغییر محصول امروز. */
+function panel_unlimited_user_price(array $panel): int
+{
+    return max(0, (int) ($panel['unlimited_user_price'] ?? 0));
+}
+
+function panel_unlimited_min_users(array $panel): int
+{
+    return max(1, (int) ($panel['unlimited_min_users'] ?? 1));
+}
+
+function panel_unlimited_user_count_check(array $panel, int $count): array
+{
+    if (!panel_is_unlimited($panel)) {
+        return [false, 'این پنل از نوع نامحدود نیست.'];
+    }
+    $min = panel_unlimited_min_users($panel);
+    if ($count < $min) {
+        return [false, 'حداقل تعداد قابل افزودن <b>' . fa_digits($min) . '</b> کاربر است.'];
+    }
+    $price = panel_unlimited_user_price($panel);
+    if ($count > UNLIMITED_USERS_MAX || $price <= 0 || $count > intdiv(PHP_INT_MAX, $price)) {
+        return [false, 'تعداد کاربر یا قیمت ذخیره‌شدهٔ این پنل معتبر نیست؛ با پشتیبانی تماس بگیرید.'];
+    }
+    return [true, ''];
+}
+
+function unlimited_user_price(array $product): int
+{
+    return max(0, (int) ($product['per_user_price'] ?? 0));
+}
+
+function unlimited_min_users(array $product): int
+{
+    return max(1, (int) ($product['min_users'] ?? 1));
+}
+
+/** اعتبارسنجی واحد برای خرید نخست و شارژ کاربر؛ شمارش فارسی هم با to_int پشتیبانی می‌شود. */
+function unlimited_user_count_check(array $product, int $count): array
+{
+    if (!product_is_unlimited($product)) {
+        return [false, 'این محصول از نوع پنل نامحدود نیست.'];
+    }
+    $min = unlimited_min_users($product);
+    if ($count < $min) {
+        return [false, 'حداقل تعداد قابل سفارش برای این پنل <b>' . fa_digits($min)
+            . '</b> کاربر است.'];
+    }
+    if ($count > UNLIMITED_USERS_MAX) {
+        return [false, 'تعداد کاربر بسیار بزرگ است؛ حداکثر مجاز <b>'
+            . fa_digits(UNLIMITED_USERS_MAX) . '</b> است.'];
+    }
+    $price = unlimited_user_price($product);
+    if ($price <= 0 || $count > intdiv(PHP_INT_MAX, $price)) {
+        return [false, 'قیمت هر کاربر این محصول معتبر نیست؛ با پشتیبانی تماس بگیرید.'];
+    }
+    return [true, ''];
+}
+
+function unlimited_user_order_total(array $product, int $count): int
+{
+    return $count * unlimited_user_price($product);
+}
+
 function product_update(int $id, string $column, mixed $value): void
 {
-    $allowed = ['name', 'emoji', 'hourly_price', 'per_gb_price', 'min_balance', 'max_users',
-                'extra_block_size', 'extra_block_price',
+    $allowed = ['name', 'emoji', 'hourly_price', 'per_gb_price', 'per_user_price', 'min_users',
+                'min_balance', 'max_users', 'extra_block_size', 'extra_block_price',
                 'device_limit', 'days', 'data_cap_gb', 'slots_needed', 'renew_price',
                 'panel_prefix', 'role_id', 'panel_id', 'active', 'trial'];
     if (!in_array($column, $allowed, true)) {

@@ -456,15 +456,20 @@ function screen_category(int|string $chat, ?int $messageId, int $catId): void
     $text = cat_label($cat) . ' · <b>' . e((string) $cat['name']) . "</b>\n\n";
     $rows = [];
     foreach ($products as $product) {
-        $cap = (float) $product['data_cap_gb'] > 0
-            ? fa_digits((float) $product['data_cap_gb']) . 'GB' : 'نامحدود';
         $text .= ((int) $product['active'] === 1 ? '✅' : '⛔️') . ' ' . $product['emoji'] . ' <b>'
-            . e($product['name']) . "</b>\n"
-            . '   ⏱ ' . money((int) $product['hourly_price']) . ' /ساعت · 💵 '
-            . money((int) $product['per_gb_price']) . " /گیگ\n"
-            . '   👤 ' . fa_digits((int) $product['max_users']) . ' کاربر · 📱 '
-            . fa_digits((int) $product['device_limit']) . ' دستگاه · 📦 ' . $cap
-            . ' · ⏳ ' . fa_digits((int) $product['days']) . " روز\n\n";
+            . e($product['name']) . "</b>\n";
+        if (product_is_unlimited($product)) {
+            $text .= '   ♾️ نامحدود · 💵 هر کاربر ' . money(unlimited_user_price($product))
+                . ' · 👥 حداقل ' . fa_digits(unlimited_min_users($product)) . "\n\n";
+        } else {
+            $cap = (float) $product['data_cap_gb'] > 0
+                ? fa_digits((float) $product['data_cap_gb']) . 'GB' : 'نامحدود';
+            $text .= '   ⏱ ' . money((int) $product['hourly_price']) . ' /ساعت · 💵 '
+                . money((int) $product['per_gb_price']) . " /گیگ\n"
+                . '   👤 ' . fa_digits((int) $product['max_users']) . ' کاربر · 📱 '
+                . fa_digits((int) $product['device_limit']) . ' دستگاه · 📦 ' . $cap
+                . ' · ⏳ ' . fa_digits((int) $product['days']) . " روز\n\n";
+        }
         $rows[] = [btn($product['emoji'] . ' ' . $product['name'], 'ad:prod:' . $product['id'],
             null, (int) $product['active'] === 1 ? 'primary' : 'danger')];
     }
@@ -491,12 +496,36 @@ function screen_product_admin(int|string $chat, ?int $messageId, int $productId)
     $panel = $product['panel_id']
         ? DB::one('SELECT * FROM pg_panels WHERE id=?', [(int) $product['panel_id']]) : null;
     $cat = $product['category_id'] ? cat_get((int) $product['category_id']) : null;
-    $cap = (float) $product['data_cap_gb'] > 0
-        ? fa_digits((float) $product['data_cap_gb']) . ' گیگ' : 'نامحدود';
-    $text = $product['emoji'] . ' <b>' . e($product['name']) . '</b> '
+    $base = $product['emoji'] . ' <b>' . e((string) $product['name']) . '</b> '
         . ((int) $product['active'] === 1 ? '✅' : '⛔️') . "\n"
         . '🗂 دسته: ' . cat_label($cat) . ' · 🔌 پنل: '
-        . e($panel['name'] ?? 'پیش‌فرض') . "\n\n"
+        . e($panel['name'] ?? 'پیش‌فرض') . "\n\n";
+    if (product_is_unlimited($product)) {
+        $text = $base
+            . '♾️ <b>نوع فروش: پنل نامحدود بر پایهٔ تعداد کاربر</b>' . "\n"
+            . '💵 قیمت هر کاربر: <b>' . money(unlimited_user_price($product)) . "</b>\n"
+            . '👥 حداقل تعداد کاربر در هر خرید/شارژ: <b>'
+                . fa_digits(unlimited_min_users($product)) . "</b>\n"
+            . '🎭 نقش پنل: '
+            . role_title((int) $product['panel_id'], (int) $product['role_id']) . "\n\n"
+            . UNLIMITED_ROLE_GUIDE;
+        $rows = [
+            [btn('💵 قیمت هر کاربر', "ad:pf:$productId:peruser"),
+             btn('👥 حداقل تعداد کاربر', "ad:pf:$productId:minusers")],
+            [btn('✏️ نام', "ad:pf:$productId:name"), btn('🎨 ایموجی', "ad:pf:$productId:emoji")],
+            [btn('🔌 پنل مقصد', "ad:prod:$productId:sp"),
+             btn('🎭 نقش پنل', 'ad:rolep:' . $productId)],
+            [btn((int) $product['active'] === 1 ? '🔴 خاموش کنید' : '🟢 روشن کنید',
+                "ad:prod:$productId:toggle", null, (int) $product['active'] === 1 ? 'danger' : 'success')],
+            [btn('🗑 حذف محصول', "ad:prod:$productId:del", null, 'danger')],
+            [btn('« بازگشت به دسته', 'ad:cat:' . (int) ($product['category_id'] ?? 0), null, 'danger')],
+        ];
+        Tg::show($chat, $messageId, $text, $rows);
+        return;
+    }
+    $cap = (float) $product['data_cap_gb'] > 0
+        ? fa_digits((float) $product['data_cap_gb']) . ' گیگ' : 'نامحدود';
+    $text = $base
         . '⏱ اجارهٔ ساعتی: <b>' . money((int) $product['hourly_price']) . "</b>\n"
         . '💵 قیمت هر گیگ: <b>' . money((int) $product['per_gb_price']) . "</b>\n"
         . '💰 حداقل موجودی: ' . money((int) $product['min_balance']) . "\n"
@@ -534,6 +563,8 @@ const PRODUCT_FIELDS = [
     'emoji'     => ['ایموجی', 'text', 'emoji'],
     'hourly'    => ['اجارهٔ ساعتی پنل (تومان) — 0 = بدون اجاره', 'int', 'hourly_price'],
     'pergb'     => ['قیمت هر گیگ مصرف (تومان)', 'int', 'per_gb_price'],
+    'peruser'   => ['قیمت هر کاربر پنل نامحدود (تومان)', 'int', 'per_user_price'],
+    'minusers'  => ['حداقل تعداد کاربر پنل نامحدود', 'int', 'min_users'],
     'minbal'    => ['حداقل موجودی کیف پول (تومان)', 'int', 'min_balance'],
     'users'     => ['سقف کاربر پنل', 'int', 'max_users'],
     'devices'   => ['تعداد دستگاه برای هر کاربر', 'int', 'device_limit'],

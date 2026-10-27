@@ -311,8 +311,7 @@ function admin_panel_user_limit(int $panelId, int $delta): array
     $panelRow = panel_pg_row($panel);
     if ($panelRow !== null) {
         try {
-            (new PgPanel($panelRow))->update_admin((string) $panel['panel_username'],
-                ['users_limit' => $next]);
+            (new PgPanel($panelRow))->set_admin_users_limit((string) $panel['panel_username'], $next);
         } catch (Throwable $ex) {
             $note = "\n⚠️ روی سرور پنل اعمال نشد: " . mb_substr($ex->getMessage(), 0, 120);
         }

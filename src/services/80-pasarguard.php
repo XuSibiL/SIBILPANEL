@@ -148,11 +148,32 @@ final class PgPanel
         return $this->request('GET', '/api/admin');
     }
 
+    /** همهٔ نقش‌ها را همان لحظه از API می‌خواند؛ نسخه‌های مختلف API wrapper متفاوت دارند. */
     public function roles(): array
     {
         $this->login();
         $data = $this->request('GET', '/api/admin-roles/simple');
-        return $data['roles'] ?? $data;
+        foreach (['roles', 'items', 'results', 'data'] as $key) {
+            if (!isset($data[$key]) || !is_array($data[$key])) {
+                continue;
+            }
+            $candidate = $data[$key];
+            if (array_is_list($candidate)) {
+                return $candidate;
+            }
+            /* بعضی wrapperها پاسخ را به شکل {data:{roles:[…]}} می‌پیچند. */
+            foreach (['roles', 'items', 'results'] as $nested) {
+                if (isset($candidate[$nested]) && is_array($candidate[$nested])
+                    && array_is_list($candidate[$nested])) {
+                    return $candidate[$nested];
+                }
+            }
+        }
+        if (array_is_list($data)) {
+            return $data;
+        }
+        /* پاسخ نامفهوم «فهرست خالی» تلقی نمی‌شود؛ cache سالم را نابود نکن. */
+        throw new PanelError('unexpected admin roles response');
     }
 
     public function groups(): array
@@ -310,6 +331,18 @@ final class PgPanel
     {
         $this->login();
         return $this->request('PUT', '/api/admin/by-username/' . rawurlencode($username), $fields);
+    }
+
+    /**
+     * سقف کاربران در PasarGuard v5 یک permission override است، نه فیلد قدیمی users_limit.
+     * این روش برای فروش/شارژ پنل استفاده می‌شود تا افزایش محلی بدون افزایش زنده رخ ندهد.
+     */
+    public function set_admin_users_limit(string $username, int $limit): array
+    {
+        $limit = max(1, $limit);
+        return $this->update_admin($username, [
+            'permission_overrides' => ['max_users' => $limit],
+        ]);
     }
 
     /** تغییر رمز ورود پنل کاربر */

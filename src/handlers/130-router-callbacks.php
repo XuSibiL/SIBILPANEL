@@ -338,10 +338,26 @@ function handle_callback_inner(array $cb): void
             screen_product($chatId, $messageId, (int) ($parts[2] ?? 0));
             return;
         }
+        if ($what === 'users') {
+            $productId = (int) ($parts[2] ?? 0);
+            $product = product_get($productId);
+            if ($product === null || (int) $product['active'] !== 1 || !product_is_unlimited($product)) {
+                Tg::show($chatId, $messageId, 'این پنل نامحدود فعال نیست.',
+                    [[btn('« بازگشت', 'menu:buy', null, 'danger')]]);
+                return;
+            }
+            screen_unlimited_initial_users($chatId, $messageId, $uid, $productId);
+            return;
+        }
         if ($what === 'confirm') {
             $product = product_get((int) ($parts[2] ?? 0));
-            if ($product === null) {
+            if ($product === null || (int) $product['active'] !== 1) {
                 Tg::show($chatId, $messageId, 'محصول پیدا نشد.', home_kb($uid));
+                return;
+            }
+            /* callback قدیمی یا دستی نباید پنل نامحدود را بدون تعداد کاربر بسازد. */
+            if (product_is_unlimited($product)) {
+                screen_unlimited_initial_users($chatId, $messageId, $uid, (int) $product['id']);
                 return;
             }
             if (slots_available($uid) < (int) $product['slots_needed']) {
@@ -368,6 +384,10 @@ function handle_callback_inner(array $cb): void
         if ($what === 'exact') {
             $product = product_get((int) ($parts[2] ?? 0));
             if ($product === null) {
+                return;
+            }
+            if (product_is_unlimited($product)) {
+                screen_product($chatId, $messageId, (int) $product['id']);
                 return;
             }
             $perGb = (int) $product['per_gb_price'];
@@ -579,7 +599,28 @@ function handle_callback_inner(array $cb): void
         $product = $panel['product_id'] ? product_get((int) $panel['product_id']) : null;
         $blockSize = (int) ($product['extra_block_size'] ?? 1000) ?: 1000;
         $blockPrice = (int) ($product['extra_block_price'] ?? 0);
+        if ($op === 'users') {
+            if (!panel_is_unlimited($panel)) {
+                Tg::answer($cbId, 'این پنل شارژ دلخواهِ کاربر ندارد.', true);
+                screen_panel_detail($chatId, $messageId, $panelId);
+                return;
+            }
+            State::set($uid, 'unlimited_add_users', ['panel_id' => $panelId]);
+            Tg::show($chatId, $messageId,
+                '➕ <b>شارژ / افزودن کاربر</b>' . "\n\n"
+                . 'تعداد کاربری را که می‌خواهید اضافه شود فقط به‌صورت عدد بفرستید.' . "\n"
+                . 'حداقل: <b>' . fa_digits(panel_unlimited_min_users($panel)) . "</b> کاربر\n"
+                . 'قیمت هر کاربر: <b>' . money(panel_unlimited_user_price($panel)) . "</b>\n\n"
+                . 'برای لغو: <code>لغو</code>',
+                [[btn('« بازگشت', 'pn:' . $panelId, null, 'danger')]]);
+            return;
+        }
         if ($op === 'extra') {
+            if (panel_is_unlimited($panel)) {
+                Tg::answer($cbId, 'برای این پنل تعداد دلخواه را وارد کنید.', true);
+                screen_panel_detail($chatId, $messageId, $panelId);
+                return;
+            }
             if ($blockPrice <= 0) {
                 Tg::answer($cbId, 'برای این محصول بلاک اضافه تعریف نشده.', true);
                 return;
@@ -717,23 +758,34 @@ function handle_callback_inner(array $cb): void
         $mode = (string) ($parts[1] ?? '');
         $productId = (int) ($parts[2] ?? 0);
         $how = (string) ($parts[3] ?? '');
+        $unlimitedUsers = $mode === 'buyu' ? (int) ($parts[4] ?? 0) : 0;
         $product = product_get($productId);
         if ($product === null || (int) $product['active'] !== 1) {
             Tg::answer($cbId, 'این محصول فعال نیست.', true);
             show_home($chatId, $messageId, $uid);
             return;
         }
+        if ($mode === 'buyu') {
+            [$countOk, $countWhy] = unlimited_user_count_check($product, $unlimitedUsers);
+            if (!$countOk) {
+                Tg::answer($cbId, strip_tags($countWhy), true);
+                screen_unlimited_initial_users($chatId, $messageId, $uid, $productId);
+                return;
+            }
+        }
         if ($how === 'rand') {
             $name = random_panel_username();
             if ($mode === 'trial') {
                 start_trial_order($uid, $chatId, $messageId, $productId, $name);
             } else {
-                start_panel_order($uid, $chatId, $messageId, $productId, $name);
+                start_panel_order($uid, $chatId, $messageId, $productId, $name, $unlimitedUsers);
             }
             return;
         }
         if ($how === 'custom') {
-            State::set($uid, 'panel_username', ['mode' => $mode, 'product' => $productId]);
+            State::set($uid, 'panel_username', [
+                'mode' => $mode, 'product' => $productId, 'unlimited_users' => $unlimitedUsers,
+            ]);
             Tg::show($chatId, $messageId,
                 '✍️ <b>نام کاربری دلخواه</b>' . "\n\n"
                 . 'نام کاربری پنل را بفرستید.' . "\n"
@@ -743,7 +795,8 @@ function handle_callback_inner(array $cb): void
                 [[btn('« بازگشت', 'nav:back', null, 'danger')]]);
             return;
         }
-        screen_username_choice($chatId, $messageId, $productId, $mode === 'trial' ? 'trial' : 'buy');
+        screen_username_choice($chatId, $messageId, $productId,
+            $mode === 'trial' ? 'trial' : ($mode === 'buyu' ? 'buyu' : 'buy'), $unlimitedUsers);
         return;
     }
     if ($data === 'cancel') {
@@ -941,8 +994,13 @@ function handle_callback_inner(array $cb): void
                 return;
             }
             if ($productId > 0) {
-                product_set_role($productId, $roleId, $panelId);
-                Tg::answer($cbId, '✅ نقش تنظیم شد', false);
+                [$roleOk, $roleWhy] = product_set_role($productId, $roleId, $panelId);
+                Tg::answer($cbId, $roleOk ? '✅ نقش تنظیم شد' : 'نقش قابل انتخاب نیست', !$roleOk);
+                if (!$roleOk) {
+                    Tg::send($chatId, '❌ ' . $roleWhy);
+                    screen_roles($chatId, $messageId, $panelId, $productId);
+                    return;
+                }
                 screen_product_admin($chatId, $messageId, $productId);
                 return;
             }
@@ -1533,6 +1591,17 @@ function handle_callback_inner(array $cb): void
             $catId = (int) $catId;
             $op = $parts[3] ?? '';
             if ($op === 'new') {
+                $saleType = (string) ($parts[4] ?? '');
+                if (!in_array($saleType, ['metered', 'unlimited'], true)) {
+                    Tg::show($chatId, $messageId,
+                        "➕ <b>نوع محصول جدید</b>\n\n"
+                        . 'نوع فروش را انتخاب کنید. محصولات حجمی/ساعتی قبلی بدون تغییر می‌مانند.'
+                        . "\n\n" . UNLIMITED_ROLE_GUIDE,
+                        [[btn('📊 محصول حجمی / ساعتی', 'ad:cat:' . $catId . ':new:metered', null, 'primary')],
+                         [btn('♾️ پنل نامحدود', 'ad:cat:' . $catId . ':new:unlimited', null, 'success')],
+                         [btn('« بازگشت', 'ad:cat:' . $catId, null, 'danger')]]);
+                    return;
+                }
                 $panels = DB::all('SELECT * FROM pg_panels WHERE active=1 ORDER BY is_default DESC, id');
                 $rowsPanel = [];
                 foreach ($panels as $panelRow) {
@@ -1544,6 +1613,24 @@ function handle_callback_inner(array $cb): void
                         'اول باید یک پنل پاسارگارد وصل شود.',
                         [[btn('🔌 افزودن پنل', 'ad:panel:new', null, 'success')],
                          [btn('« بازگشت', 'ad:cat:' . $catId, null, 'danger')]]);
+                    return;
+                }
+                if ($saleType === 'unlimited') {
+                    wiz_start($uid, 'prod_new_unlimited', [
+                        step_def('name', 'نام محصول نامحدود را بفرستید — مثلاً: پنل نامحدود هلند'
+                            . "\n\n" . UNLIMITED_ROLE_GUIDE,
+                            'text', null, '♾️ پنل نامحدود جدید'),
+                        step_def('emoji', 'ایموجی محصول — یا - برای ♾️', 'text', '♾️'),
+                        step_def('panel_id', 'پنل این محصول را انتخاب کنید:', 'pick', 0,
+                            '🔌 انتخاب پنل', 'panels'),
+                        step_def('role_id', 'نقش این محصول روی همین پنل را انتخاب کنید '
+                            . "(فقط نقش‌های همان پنل):\n<i>اگر نقشی نمی‌بینی، «🔄 خواندن نقش‌های این پنل» را بزنید.</i>",
+                            'pick', 0, '🎭 انتخاب نقش', 'roles'),
+                        step_def('per_user_price', 'قیمت هر کاربر (تومان) را بفرستید.', 'int', 0,
+                            '💵 قیمت هر کاربر'),
+                        step_def('min_users', 'حداقل تعداد کاربر در هر خرید یا شارژ را بفرستید.',
+                            'int', 1, '👥 حداقل تعداد کاربر'),
+                    ], ['cat_id' => $catId, 'role_page' => 1]);
                     return;
                 }
                 wiz_start($uid, 'prod_new', [
@@ -1664,6 +1751,16 @@ function handle_callback_inner(array $cb): void
                 return;
             }
             $product = product_get($productId);
+            if ($product === null) {
+                Tg::send($chatId, 'محصول پیدا نشد.', [[btn('« دسته‌ها', 'ad:cats', null, 'danger')]]);
+                return;
+            }
+            if (product_is_unlimited($product)
+                && !in_array($field, ['name', 'emoji', 'peruser', 'minusers'], true)) {
+                Tg::answer($cbId, 'این تنظیم برای پنل نامحدود با نقش پاسارگارد مدیریت می‌شود.', true);
+                screen_product_admin($chatId, $messageId, $productId);
+                return;
+            }
             wiz_start($uid, 'prod_field', [
                 step_def('value', $meta[0] . "\nمقدار فعلی: " . ($product[$meta[2]] ?? '—'),
                     $meta[1] === 'text' ? 'text' : $meta[1], null, '✏️ ' . $meta[0]),

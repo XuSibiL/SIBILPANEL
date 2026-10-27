@@ -108,7 +108,21 @@ function deliver_panel_order(array $order): array
     if ($product === null) {
         return [false, 'محصول این سفارش پیدا نشد.'];
     }
+    $payloadOrder = json_decode((string) ($order['payload'] ?? ''), true) ?: [];
     $isTrial = (string) $order['kind'] === 'trial';
+    $isUnlimited = !$isTrial && ((string) ($payloadOrder['sale_type'] ?? '') === PRODUCT_SALE_UNLIMITED_USERS
+        || !empty($payloadOrder['unlimited_users']));
+    $unlimitedUsers = (int) ($payloadOrder['user_count'] ?? 0);
+    $unlimitedUnit = (int) ($payloadOrder['per_user_price'] ?? 0);
+    $unlimitedMin = max(1, (int) ($payloadOrder['min_users'] ?? 1));
+    /* قیمت و تعداد در payload سفارش snapshot هستند تا تغییر محصول پس از پرداخت
+       به مبلغ/سقف فروخته‌شده اثر نگذارد. */
+    if ($isUnlimited && ($unlimitedUsers < $unlimitedMin || $unlimitedUsers > UNLIMITED_USERS_MAX
+        || $unlimitedUnit <= 0 || $unlimitedUsers > intdiv(PHP_INT_MAX, $unlimitedUnit)
+        || $unlimitedUsers * $unlimitedUnit !== (int) $order['price'])) {
+        return [false, 'اطلاعات تعداد کاربر این سفارش نامعتبر است؛ با پشتیبانی تماس بگیرید.'];
+    }
+
     $panelRow = null;
     if (!empty($product['panel_id'])) {
         $panelRow = DB::one('SELECT * FROM pg_panels WHERE id=? AND active=1', [(int) $product['panel_id']]);
@@ -125,19 +139,19 @@ function deliver_panel_order(array $order): array
         return [false, "کلید API این پنل ثبت نشده است.\n"
             . 'در «🔌 پنل‌ها» روی پنل بزنید و «🔑 تغییر کلید API» را انجام بدهید.'];
     }
-    $payloadOrder = json_decode((string) ($order['payload'] ?? ''), true) ?: [];
+
     $unlimitedTrial = $isTrial && !empty($payloadOrder['trial_unlimited']);
-    $dataCapGb = $unlimitedTrial ? 0.0
+    $dataCapGb = ($isUnlimited || $unlimitedTrial) ? 0.0
         : ($isTrial ? (float) ($payloadOrder['trial_gb'] ?? set_int('trial_gb', 1))
             : (float) $product['data_cap_gb']);
-    $expireAt = $unlimitedTrial ? 0
+    $expireAt = ($isUnlimited || $unlimitedTrial) ? 0
         : ($isTrial
             ? time() + max(1, (int) ($payloadOrder['trial_hours'] ?? set_int('trial_hours', 24))) * 3600
             : time() + (int) $product['days'] * DAY);
-    /* سقف کاربرانِ داخلِ پنل: برای تست از تنظیم مستقل trial_user_limit خوانده می‌شود
-       (قبلاً اشتباهاً ۱ بود و ظرفیت پنل پاسارگاد را قفل می‌کرد) */
-    $userCap = $unlimitedTrial ? 0
-        : ($isTrial ? max(1, set_int('trial_user_limit', 10)) : (int) $product['max_users']);
+    /* برای پنل نامحدود فقط سقف تعداد کاربر override می‌شود؛ نقش، اعتبار و دستگاه را تعیین می‌کند. */
+    $userCap = $isUnlimited ? $unlimitedUsers
+        : ($unlimitedTrial ? 0
+            : ($isTrial ? max(1, set_int('trial_user_limit', 10)) : (int) $product['max_users']));
     $roleId = (int) $product['role_id'];
     if ($roleId <= 0) {
         $roleId = auto_role_id($panelRow);
@@ -162,14 +176,13 @@ function deliver_panel_order(array $order): array
         if ($attempt === 1 && $wantedName !== '') {
             $username = $wantedName;
         } else {
-            /* نام رندوم را قبل از ساخت روی خود پنل چک می‌کنیم */
             $username = panel_free_username($client, $attempt >= 3 ? 10 : 8);
         }
-        /* رمز باید قوانین خود پنل را رعایت کند و نام کاربری داخلش نباشد */
         $password = panel_password(set_int('panel_pass_len', 12), $username);
         try {
             $created = $client->create_admin($username, $password, $roleId, [
                 'users_limit' => $userCap,
+                /* مقدار صفر عمداً ارسال نمی‌شود؛ نقش پاسارگارد limit/expire را مالک است. */
                 'data_limit'  => (int) round($dataCapGb * 1024 ** 3),
                 'expire'      => $expireAt,
                 'note'        => (string) $product['name'],
@@ -180,11 +193,8 @@ function deliver_panel_order(array $order): array
         } catch (Throwable $ex) {
             $lastError = $ex->getMessage();
             log_line('warning', 'create_admin failed (' . $username . '): ' . $lastError);
-            /* 422 یعنی داده پذیرفته نشد (نام یا رمز). یک‌بار با نام و رمز تازه
-               دوباره تلاش می‌کنیم؛ 401/403/500 دوباره‌تلاش بی‌فایده است. */
             $status = $ex instanceof PanelError ? (int) $ex->status : 0;
-            $retryable = panel_error_is_duplicate($ex) || $status === 422;
-            if (!$retryable) {
+            if (!(panel_error_is_duplicate($ex) || $status === 422)) {
                 break;
             }
         }
@@ -196,66 +206,68 @@ function deliver_panel_order(array $order): array
         }
         return [false, 'ساخت پنل روی سرور انجام نشد: ' . $note];
     }
-    /* ⏱ ساعت‌های اول پیش‌پرداخت شده‌اند: کسر ساعتی فقط بعد از آن‌ها شروع می‌شود */
-    $prepaidHours = $isTrial ? 0 : prepaid_hours();
+
+    /* پنل نامحدود نه پیش‌پرداخت دارد و نه هیچ شارژ مصرفی محلی. */
+    $prepaidHours = ($isTrial || $isUnlimited) ? 0 : prepaid_hours();
     $billingStartAt = $prepaidHours > 0 ? now_ts() + $prepaidHours * 3600 : 0;
-    /* اگر سفارش از مسیر عادی ساخته نشده باشد (پرداخت مستقیم/ادمین)، پیش‌پرداخت
-       از خود محصول محاسبه می‌شود تا هیچ پنلی بدون پیش‌پرداخت ساخته نشود */
-    $prepaidAmount = $isTrial ? 0
+    $prepaidAmount = ($isTrial || $isUnlimited) ? 0
         : max(0, (int) ($payloadOrder['prepaid'] ?? panel_prepaid_amount($product)));
+    $labelSuffix = $isTrial ? ' (تست)' : ($isUnlimited ? ' (نامحدود)' : '');
     $panelId = DB::exec('INSERT INTO panels(tg_id, product_id, panel_admin_id, panel_username, '
         . 'panel_password, label, max_users, device_limit, data_cap, expires_at, per_gb_price, '
         . 'hourly_price, min_balance, status, created_at, pg_panel_id, order_id, user_cap, is_trial, '
-        . 'billing_start_at, prepaid_amount, last_meter_at) '
-        . 'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+        . 'is_unlimited, unlimited_user_price, unlimited_min_users, billing_start_at, prepaid_amount, last_meter_at) '
+        . 'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
         [$order['tg_id'], $product['id'], (int) ($created['id'] ?? 0), $username, $password,
-         $product['name'] . ($isTrial ? ' (تست)' : ''), $userCap, (int) $product['device_limit'],
-         (int) round($dataCapGb * 1024 ** 3),
-         $expireAt, $isTrial ? 0 : (int) $product['per_gb_price'],
-         $isTrial ? 0 : (int) $product['hourly_price'],
-         (int) $product['min_balance'], 'active',
+         $product['name'] . $labelSuffix, $userCap,
+         $isUnlimited ? 0 : (int) $product['device_limit'],
+         (int) round($dataCapGb * 1024 ** 3), $expireAt,
+         ($isTrial || $isUnlimited) ? 0 : (int) $product['per_gb_price'],
+         ($isTrial || $isUnlimited) ? 0 : (int) $product['hourly_price'],
+         $isUnlimited ? 0 : (int) $product['min_balance'], 'active',
          now_ts(), (int) $panelRow['id'], (int) $order['id'], $userCap, $isTrial ? 1 : 0,
-         $billingStartAt, $prepaidAmount,
+         $isUnlimited ? 1 : 0, $isUnlimited ? $unlimitedUnit : 0,
+         $isUnlimited ? $unlimitedMin : 1, $billingStartAt, $prepaidAmount,
          $billingStartAt > 0 ? $billingStartAt : now_ts()]);
-    if (!$isTrial) {
-        /* این‌ها نباید تحویل پنل را خراب کنند؛ پنل ساخته شده و باید به کاربر برسد */
+    if (!$isTrial && !$isUnlimited) {
         try {
             grant_order_discount($order, $panelId);
         } catch (Throwable $ex) {
             log_line('warning', 'grant_order_discount failed: ' . $ex->getMessage());
         }
-        /* ⚠️ اینجا دیگر پولی کسر نمی‌شود: پیش‌پرداخت هنگام پرداخت فاکتور
-           از کیف پول رفته است؛ فقط ثبت دفتری می‌شود */
         if ($prepaidAmount > 0) {
             try {
-                panel_record_prepaid($panelId, (int) $order['tg_id'], $prepaidAmount,
-                    $prepaidHours);
+                panel_record_prepaid($panelId, (int) $order['tg_id'], $prepaidAmount, $prepaidHours);
             } catch (Throwable $ex) {
                 log_line('warning', 'prepaid ledger failed: ' . $ex->getMessage());
             }
         }
     }
+
     $user = user_get((int) $order['tg_id']);
     $who = e(mb_substr((string) ($user['name'] ?? $order['tg_id']), 0, 22));
     try {
-        post_report(($isTrial ? '🧪 <b>پنل تست ساخته شد</b>' : '🛒 <b>پنل فروخته شد</b>') . "\n"
-        . '👤 کاربر: ' . $who . ' <code>' . (int) $order['tg_id'] . "</code>\n"
-        . '🆔 نام کاربری: <code>' . e($username) . "</code>\n"
-        . '📦 محصول: ' . e((string) $product['name']) . "\n"
-        . '🔌 پنل: ' . e((string) $panelRow['name']) . "\n"
-        . '📊 حجم: ' . fa_digits($dataCapGb) . ' گیگ'
-        . ($isTrial ? ' · ⏳ ' . fa_digits((int) (($expireAt - time()) / 3600)) . ' ساعت'
-            : ' · ⏳ ' . fa_digits((int) $product['days']) . ' روز')
-        . "\n" . '💵 مبلغ: ' . money((int) $order['payable']),
-        $isTrial ? 'panel' : 'sales');
+        $kindTitle = $isTrial ? '🧪 <b>پنل تست ساخته شد</b>'
+            : ($isUnlimited ? '♾️ <b>پنل نامحدود فروخته شد</b>' : '🛒 <b>پنل فروخته شد</b>');
+        $spec = $isUnlimited
+            ? '👥 سقف کاربر: ' . fa_digits($userCap) . ' · 💵 هر کاربر: ' . money($unlimitedUnit)
+            : ('📊 حجم: ' . fa_digits($dataCapGb) . ' گیگ'
+                . ($isTrial ? ' · ⏳ ' . fa_digits((int) (($expireAt - time()) / 3600)) . ' ساعت'
+                    : ' · ⏳ ' . fa_digits((int) $product['days']) . ' روز'));
+        post_report($kindTitle . "\n"
+            . '👤 کاربر: ' . $who . ' <code>' . (int) $order['tg_id'] . "</code>\n"
+            . '🆔 نام کاربری: <code>' . e($username) . "</code>\n"
+            . '📦 محصول: ' . e((string) $product['name']) . "\n"
+            . '🔌 پنل: ' . e((string) $panelRow['name']) . "\n"
+            . $spec . "\n" . '💵 مبلغ: ' . money((int) $order['payable']),
+            $isTrial ? 'panel' : 'sales');
     } catch (Throwable $ex) {
         log_line('warning', 'sale report failed: ' . $ex->getMessage());
     }
     $dashboard = panel_dashboard_url($base);
     $nameNote = ($wantedName !== '' && $wantedName !== $username)
         ? '⚠️ نام دلخواه <code>' . e($wantedName) . "</code> روی پنل موجود بود؛ "
-            . 'نام تازه صادر شد.' . "\n\n"
-        : '';
+            . 'نام تازه صادر شد.' . "\n\n" : '';
     if ($isTrial) {
         return [true, "🧪 <b>پنل تست شما آماده است</b>\n\n" . $nameNote
             . '🌐 آدرس پنل: ' . e($dashboard) . "\n"
@@ -265,8 +277,17 @@ function deliver_panel_order(array $order): array
             . '⏳ مدت: ' . fa_digits((int) (($expireAt - time()) / 3600)) . " ساعت\n\n"
             . 'همین حالا در «📦 پنل‌های من» هم می‌بینی‌اش. برای پنل اصلی «🛒 خرید پنل» را بزنید.'];
     }
+    if ($isUnlimited) {
+        return [true, "✅ <b>پنل نامحدود شما آماده است</b>\n\n" . $nameNote
+            . '🌐 آدرس پنل: ' . e($dashboard) . "\n"
+            . '👤 نام کاربری: <code>' . e($username) . "</code>\n"
+            . '🔑 رمز: <code>' . e($password) . "</code>\n"
+            . '👥 سقف کاربر: <b>' . fa_digits($userCap) . "</b>\n"
+            . '♾️ اعتبار و محدودیت دستگاه‌ها طبق نقش پاسارگارد اعمال می‌شود.' . "\n\n"
+            . 'برای افزودن کاربر از «📦 پنل‌های من» استفاده کنید.'];
+    }
     return [true, "✅ <b>پنل شما آماده است</b>\n\n" . $nameNote
-        . '🌐 آدرس پنل: ' . e(panel_dashboard_url($base)) . "\n"
+        . '🌐 آدرس پنل: ' . e($dashboard) . "\n"
         . '👤 نام کاربری: <code>' . e($username) . "</code>\n"
         . '🔑 رمز: <code>' . e($password) . "</code>\n"
         . '⏳ اعتبار: ' . fa_digits((int) $product['days']) . " روز\n"
@@ -329,30 +350,58 @@ function settle_payment(array $order, string $source = 'wallet', int $adminId = 
     if ($kind === 'users') {
         $payload = json_decode((string) $order['payload'], true) ?: [];
         $panelId = (int) ($payload['panel_id'] ?? 0);
-        $block = max(1, (int) ($payload['block'] ?? 1000));
+        $isUnlimitedRecharge = !empty($payload['unlimited_users'])
+            || (string) ($payload['sale_type'] ?? '') === PRODUCT_SALE_UNLIMITED_USERS;
         $panel = DB::one('SELECT * FROM panels WHERE id=? AND tg_id=?', [$panelId, $tgId]);
         if ($panel === null) {
             order_mark((int) $order['id'], 'failed');
             return [false, 'این پنل پیدا نشد.'];
         }
+        if ($isUnlimitedRecharge) {
+            $block = (int) ($payload['user_count'] ?? 0);
+            $unit = (int) ($payload['per_user_price'] ?? 0);
+            $min = max(1, (int) ($payload['min_users'] ?? 1));
+            if (!panel_is_unlimited($panel) || $block < $min || $block > UNLIMITED_USERS_MAX
+                || $unit <= 0 || $block > intdiv(PHP_INT_MAX, $unit)
+                || $block * $unit !== (int) $order['price']
+                || $unit !== panel_unlimited_user_price($panel)
+                || $min !== panel_unlimited_min_users($panel)) {
+                order_mark((int) $order['id'], 'failed');
+                return [false, 'اطلاعات شارژ کاربر این پنل معتبر نیست؛ با پشتیبانی تماس بگیرید.'];
+            }
+        } else {
+            /* مسیر قدیمیِ بلاک ثابت دقیقاً همان رفتار پیشین را حفظ می‌کند. */
+            if (panel_is_unlimited($panel)) {
+                order_mark((int) $order['id'], 'failed');
+                return [false, 'برای پنل نامحدود باید تعداد کاربر دلخواه وارد شود.'];
+            }
+            $block = max(1, (int) ($payload['block'] ?? 1000));
+        }
         $cap = ((int) ($panel['user_cap'] ?? 0) ?: (int) $panel['max_users']) + $block;
         $panelRow = $panel['pg_panel_id']
-            ? DB::one('SELECT * FROM pg_panels WHERE id=?', [(int) $panel['pg_panel_id']]) : null;
+            ? DB::one('SELECT * FROM pg_panels WHERE id=? AND active=1', [(int) $panel['pg_panel_id']]) : null;
+        if ($panelRow === null && $isUnlimitedRecharge) {
+            order_mark((int) $order['id'], 'failed');
+            return [false, 'پنل پاسارگارد این سرویس در دسترس نیست؛ سقف کاربر تغییر نکرد. '
+                . 'با پشتیبانی تماس بگیرید.'];
+        }
         if ($panelRow !== null) {
             try {
-                (new PgPanel($panelRow))->update_admin((string) $panel['panel_username'],
-                    ['users_limit' => $cap]);
+                (new PgPanel($panelRow))->set_admin_users_limit((string) $panel['panel_username'], $cap);
             } catch (Throwable $ex) {
                 order_mark((int) $order['id'], 'failed');
                 return [false, 'افزایش سقف روی پنل انجام نشد: ' . $ex->getMessage()
                     . "\n(پرداخت انجام شده؛ با پشتیبانی تماس بگیرید)"];
             }
         }
+        /* فقط پس از پاسخ موفق PasarGuard مقدار محلی تغییر می‌کند. */
         DB::exec('UPDATE panels SET user_cap=?, max_users=? WHERE id=?', [$cap, $cap, $panelId]);
         order_mark((int) $order['id'], 'delivered');
-        post_report('➕ <b>افزایش سقف کاربر</b>' . "\n"
+        post_report(($isUnlimitedRecharge ? '♾️ <b>افزودن کاربر پنل نامحدود</b>'
+                : '➕ <b>افزایش سقف کاربر</b>') . "\n"
             . '👤 کاربر <code>' . $tgId . "</code>\n"
             . '📦 پنل <code>' . e((string) $panel['panel_username']) . "</code>\n"
+            . '➕ کاربر افزوده‌شده: ' . fa_digits($block) . "\n"
             . '👥 سقف جدید: ' . fa_digits($cap) . "\n"
             . '💵 مبلغ: ' . money((int) $order['payable']), 'sales');
         return [true, '✅ سقف کاربر پنل <code>' . e((string) $panel['panel_username'])

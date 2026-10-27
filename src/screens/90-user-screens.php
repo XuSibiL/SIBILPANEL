@@ -48,12 +48,9 @@ function home_kb(int $uid): array
     $rows = [[btn(menu_label('text_sell'), 'menu:buy', null, 'primary')]];
     $rows[] = [btn(menu_label('text_Purchased_services'), 'menu:panels', null, 'primary'),
                btn(menu_label('text_Add_Balance'), 'menu:wallet', null, 'primary')];
-    $row = [];
     if (set_bool('trial_on', true)) {
-        $row[] = btn(menu_label('text_usertest'), 'menu:trial', null, 'primary');
+        $rows[] = [btn(menu_label('text_usertest'), 'menu:trial', null, 'primary')];
     }
-    $row[] = btn('🔎 پیگیری با کد', 'menu:track', null, 'primary');
-    $rows[] = $row;
     $rows[] = [btn(menu_label('text_affiliates'), 'menu:ref', null, 'primary'),
                btn(menu_label('text_support'), 'menu:support', null, 'primary')];
     $rows[] = [btn(menu_label('text_help'), 'help:home', null, 'primary')];
@@ -130,9 +127,9 @@ function screen_buy_category(int|string $chat, ?int $messageId, int $categoryId)
     }
     $rows = [];
     foreach ($products as $product) {
-        $rows[] = [btn($product['emoji'] . ' ' . $product['name'] . ' · '
-            . money((int) $product['hourly_price']) . '/ساعت · '
-            . money((int) $product['per_gb_price']) . '/گیگ', 'buy:p:' . $product['id'])];
+        /* فقط ایموجی و نام اصلی تنظیم‌شده؛ هیچ قیمت/نرخ محاسبه‌شده‌ای روی دکمه نیست. */
+        $rows[] = [btn((string) $product['emoji'] . ' ' . (string) $product['name'],
+            'buy:p:' . $product['id'])];
     }
     if (!$rows) {
         Tg::show($chat, $messageId,
@@ -149,6 +146,17 @@ function screen_buy_category(int|string $chat, ?int $messageId, int $categoryId)
 
 function product_detail_text(array $product): string
 {
+    if (product_is_unlimited($product)) {
+        return $product['emoji'] . ' <b>' . e((string) $product['name']) . "</b>\n\n"
+            . '♾️ <b>پنل نامحدود</b>' . "\n"
+            . '💵 قیمت هر کاربر: <b>' . money(unlimited_user_price($product)) . "</b>\n"
+            . '👥 حداقل تعداد کاربر در هر سفارش: <b>'
+                . fa_digits(unlimited_min_users($product)) . "</b>\n"
+            . '🧩 اسلات لازم: ' . fa_digits((int) $product['slots_needed']) . "\n\n"
+            . 'تعداد کاربر دلخواهتان را وارد می‌کنید و مبلغ فاکتور برابر است با تعداد کاربر × قیمت هر کاربر.'
+            . "\n\n"
+            . '<i>مدت اعتبار و محدودیت دستگاه‌ها مستقیماً از تنظیمات نقش در پنل پاسارگارد اعمال می‌شود.</i>';
+    }
     $cap = (float) $product['data_cap_gb'] > 0
         ? fa_digits((float) $product['data_cap_gb']) . ' گیگ' : 'نامحدود';
     $hours = prepaid_hours();
@@ -183,11 +191,15 @@ function screen_product(int|string $chat, ?int $messageId, int $productId): void
             [[btn('« بازگشت', 'menu:buy', null, 'danger')]]);
         return;
     }
-    Tg::show($chat, $messageId, product_detail_text($product), [
-        [btn('🟧 خرید این پنل', 'buy:confirm:' . $productId, null, 'success')],
-        [btn('🔢 قیمت دقیق', 'buy:exact:' . $productId)],
-        [btn('« بازگشت', 'buy:cat:' . (int) ($product['category_id'] ?? 0), null, 'danger')],
-    ]);
+    $rows = [];
+    if (product_is_unlimited($product)) {
+        $rows[] = [btn('👥 تعداد کاربر دلخواه', 'buy:users:' . $productId, null, 'success')];
+    } else {
+        $rows[] = [btn('🟧 خرید این پنل', 'buy:confirm:' . $productId, null, 'success')];
+        $rows[] = [btn('🔢 قیمت دقیق', 'buy:exact:' . $productId)];
+    }
+    $rows[] = [btn('« بازگشت', 'buy:cat:' . (int) ($product['category_id'] ?? 0), null, 'danger')];
+    Tg::show($chat, $messageId, product_detail_text($product), $rows);
 }
 
 /** ثانیه‌های باقی‌مانده تا بسته‌شدن فاکتور (۰ = بسته شده) */
@@ -392,9 +404,30 @@ function screen_card_payment(int|string $chat, ?int $messageId, int $uid, array 
          [btn('« لغو', 'home', null, 'danger')]]);
 }
 
+/** ورود تعداد کاربر برای خرید نخست پنل نامحدود. */
+function screen_unlimited_initial_users(int|string $chat, ?int $messageId, int $uid,
+                                        int $productId): void
+{
+    $product = product_get($productId);
+    if ($product === null || (int) $product['active'] !== 1 || !product_is_unlimited($product)) {
+        Tg::show($chat, $messageId, 'این محصول نامحدود و فعال نیست.',
+            [[btn('« بازگشت', 'menu:buy', null, 'danger')]]);
+        return;
+    }
+    State::set($uid, 'unlimited_initial_users', ['product' => $productId]);
+    Tg::show($chat, $messageId,
+        '👥 <b>تعداد کاربر دلخواه</b>' . "\n\n"
+        . 'تعداد کاربر موردنیاز را فقط به‌صورت عدد بفرستید.' . "\n"
+        . 'حداقل مجاز: <b>' . fa_digits(unlimited_min_users($product)) . '</b> کاربر' . "\n"
+        . 'قیمت هر کاربر: <b>' . money(unlimited_user_price($product)) . '</b>' . "\n\n"
+        . '<i>مثال: ' . fa_digits(unlimited_min_users($product)) . '</i>' . "\n"
+        . 'برای لغو: <code>لغو</code>',
+        [[btn('« بازگشت', 'buy:p:' . $productId, null, 'danger')]]);
+}
+
 /** شروع سفارش خرید پنل با نام کاربری انتخاب‌شده */
 function start_panel_order(int $uid, int|string $chat, ?int $messageId, int $productId,
-                           string $username): void
+                           string $username, int $unlimitedUsers = 0): void
 {
     $product = product_get($productId);
     if ($product === null || (int) $product['active'] !== 1) {
@@ -418,6 +451,35 @@ function start_panel_order(int $uid, int|string $chat, ?int $messageId, int $pro
             . 'کیف پولتان را شارژ کنید و دوباره بیا.',
             [[btn('💳 شارژ کیف پول', 'menu:wallet', null, 'success')],
              [btn('« بازگشت', 'menu:buy', null, 'danger')]]);
+        return;
+    }
+    if (product_is_unlimited($product)) {
+        [$valid, $why] = unlimited_user_count_check($product, $unlimitedUsers);
+        if (!$valid) {
+            Tg::show($chat, $messageId, '❌ ' . $why,
+                [[btn('👥 ورود تعداد کاربر', 'buy:users:' . $productId, null, 'success')],
+                 [btn('« بازگشت', 'buy:p:' . $productId, null, 'danger')]]);
+            return;
+        }
+        $price = unlimited_user_order_total($product, $unlimitedUsers);
+        $payload = [
+            'product' => $productId,
+            'panel_username' => $username,
+            'sale_type' => PRODUCT_SALE_UNLIMITED_USERS,
+            'unlimited_users' => true,
+            'user_count' => $unlimitedUsers,
+            'per_user_price' => unlimited_user_price($product),
+            'min_users' => unlimited_min_users($product),
+        ];
+        $order = create_order($uid, 'panel', $price, $productId, $payload);
+        Tg::show($chat, $messageId,
+            invoice_text($order, 'خرید پنل نامحدود',
+                '♾️ ' . e((string) $product['name']) . "\n"
+                . '👥 تعداد کاربر: <b>' . fa_digits($unlimitedUsers) . "</b>\n"
+                . '💵 ' . fa_digits($unlimitedUsers) . ' × '
+                    . money(unlimited_user_price($product)) . ' = <b>' . money($price) . "</b>\n"
+                . '👤 نام کاربری پنل: <code>' . e($username) . '</code>'),
+            invoice_kb($order, $uid));
         return;
     }
     [$price, $setupFee, $prepaid] = panel_order_price($product);
@@ -707,8 +769,7 @@ function screen_wallet(int|string $chat, ?int $messageId, int $uid): void
          btn('+ ' . money($p[3]), 'wallet:amt:' . $p[3], null, 'success')],
         [btn('✍️ مبلغ دلخواه', 'wallet:charge', null, 'success')],
         [btn('🪪 احراز هویت و کارت‌ها', 'kyc:home', null, 'primary')],
-        [btn('🎁 دعوت دوستان', 'menu:ref', null, 'primary'),
-         btn('🔎 پیگیری با کد', 'menu:track', null, 'primary')],
+        [btn('🎁 دعوت دوستان', 'menu:ref', null, 'primary')],
         [btn('« بازگشت', 'home', null, 'danger')],
     ]);
 }
@@ -867,7 +928,7 @@ function screen_trial(int|string $chat, ?int $messageId, int $uid): void
     $trialOnly = DB::all('SELECT * FROM products WHERE active=1 AND trial=1 ORDER BY id LIMIT 12');
     $list = $trialOnly ?: products_list(true);
     foreach ($list as $product) {
-        $rows[] = [btn($product['emoji'] . ' ' . mb_substr((string) $product['name'], 0, 30),
+        $rows[] = [btn((string) $product['emoji'] . ' ' . (string) $product['name'],
             'trial:p:' . $product['id'], null, 'success')];
     }
     if (!$rows) {
@@ -902,21 +963,28 @@ function screen_trial_product(int|string $chat, ?int $messageId, int $uid, int $
     ]);
 }
 
-/** انتخاب نوع نام کاربری — برای خرید و تست */
+/** انتخاب نوع نام کاربری — برای خرید، خرید نامحدود و تست */
 function screen_username_choice(int|string $chat, ?int $messageId, int $productId,
-                                string $mode): void
+                                string $mode, int $unlimitedUsers = 0): void
 {
     $product = product_get($productId);
     $title = $mode === 'trial' ? '🧪 پنل تست' : '🛒 خرید پنل';
+    $countLine = $mode === 'buyu'
+        ? '👥 تعداد کاربر: <b>' . fa_digits($unlimitedUsers) . "</b>\n\n" : '';
+    $suffix = $mode === 'buyu' ? ':' . $unlimitedUsers : '';
+    $back = $mode === 'trial' ? 'menu:trial'
+        : ($mode === 'buyu' ? 'buy:users:' . $productId : 'buy:p:' . $productId);
     $text = '<b>' . $title . '</b>' . "\n\n"
-        . ($product !== null ? $product['emoji'] . ' ' . e((string) $product['name']) . "\n\n" : '')
-        . 'نام کاربری پنل را چطور بدهیم؟' . "\n"
+        . ($product !== null ? $product['emoji'] . ' ' . e((string) $product['name']) . "\n" : '')
+        . $countLine
+        . 'نام کاربری پنل را چطور انتخاب می‌کنید؟' . "\n"
         . '🎲 <b>رندوم</b>: ربات یک نام تصادفی می‌سازد.' . "\n"
-        . '✍️ <b>دلخواه</b>: مبلغ را خودتان می‌نویسید.';
+        . '✍️ <b>دلخواه</b>: نام کاربری را خودتان می‌نویسید.';
     Tg::show($chat, $messageId, $text, [
-        [btn('🎲 نام کاربر رندوم', 'uname:' . $mode . ':' . $productId . ':rand', null, 'success')],
-        [btn('✍️ نام کاربر دلخواه', 'uname:' . $mode . ':' . $productId . ':custom')],
-        [btn('« بازگشت', $mode === 'trial' ? 'menu:trial' : 'buy:p:' . $productId, null, 'danger')],
+        [btn('🎲 نام کاربر رندوم', 'uname:' . $mode . ':' . $productId . ':rand' . $suffix,
+            null, 'success')],
+        [btn('✍️ نام کاربر دلخواه', 'uname:' . $mode . ':' . $productId . ':custom' . $suffix)],
+        [btn('« بازگشت', $back, null, 'danger')],
     ]);
 }
 
@@ -963,7 +1031,7 @@ function order_track_card(int|string $chat, ?int $messageId, array $order): void
         $text .= "\n" . '📷 رسیدت رسیده و در انتظار تأیید مدیر است.' . "\n";
     }
     Tg::show($chat, $messageId, $text,
-        [[btn('🔎 کد دیگر', 'menu:track', null, 'success')],
+        [[btn('🧾 سفارش‌های من', 'menu:orders', null, 'success')],
          [btn('« خانه', 'home', null, 'danger')]]);
 }
 
@@ -1098,7 +1166,8 @@ function screen_panels(int|string $chat, ?int $messageId, int $uid): void
         . "('active','suspended','expired') ORDER BY is_trial, id DESC LIMIT 12", [$uid]);
     /* حجم همین حالا حساب می‌شود (نه هر بار که متن رفرش شود) و روی ردیف نوشته می‌شود */
     foreach ($panels as $idx => $row) {
-        if ((string) $row['status'] === 'active' && (int) ($row['is_trial'] ?? 0) !== 1) {
+        if ((string) $row['status'] === 'active' && (int) ($row['is_trial'] ?? 0) !== 1
+            && !panel_is_unlimited($row)) {
             panel_sync_usage((int) $row['id']);
             $panels[$idx] = DB::one('SELECT * FROM panels WHERE id=?', [(int) $row['id']]) ?? $row;
         }
@@ -1123,16 +1192,21 @@ function screen_panels(int|string $chat, ?int $messageId, int $uid): void
         . fa_digits(slots_available($uid)) . ")\n\n";
     foreach ($panels as $panel) {
         $isTrial = (int) ($panel['is_trial'] ?? 0) === 1;
-        $text .= (($icons[$panel['status']] ?? '⚪️')) . ($isTrial ? '🧪 ' : '')
-            . '<code>' . e($panel['panel_username'])
-            . '</code> — تا ' . fa_ts((int) ($panel['expires_at'] ?? 0));
-        if ($isTrial) {
-            $left = max(0, (int) ($panel['expires_at'] ?? 0) - now_ts());
-            $text .= ' · ' . fa_digits((int) ceil($left / 3600)) . ' ساعت مانده';
+        $isUnlimited = panel_is_unlimited($panel);
+        $text .= (($icons[$panel['status']] ?? '⚪️')) . ($isTrial ? '🧪 ' : ($isUnlimited ? '♾️ ' : ''))
+            . '<code>' . e($panel['panel_username']) . '</code> — ';
+        if ($isUnlimited) {
+            $text .= '♾️ طبق نقش پاسارگارد · 👥 سقف ' . fa_digits((int) ($panel['user_cap'] ?? 0));
+        } else {
+            $text .= 'تا ' . fa_ts((int) ($panel['expires_at'] ?? 0));
+            if ($isTrial) {
+                $left = max(0, (int) ($panel['expires_at'] ?? 0) - now_ts());
+                $text .= ' · ' . fa_digits((int) ceil($left / 3600)) . ' ساعت مانده';
+            }
+            $text .= ' · 📊 ' . gb_step_text((int) $panel['last_usage']) . ' گیگ';
         }
-        $text .= ' · 📊 ' . gb_step_text((int) $panel['last_usage']) . ' گیگ';
         $text .= "\n";
-        $rows[] = [btn(($icons[$panel['status']] ?? '⚪️') . ($isTrial ? '🧪 ' : '') . ' '
+        $rows[] = [btn(($icons[$panel['status']] ?? '⚪️') . ($isTrial ? '🧪 ' : ($isUnlimited ? '♾️ ' : '')) . ' '
             . $panel['panel_username'], 'pn:' . $panel['id'])];
     }
     if ($freeSlots + $boughtSlots < $slotCap) {
@@ -1159,6 +1233,10 @@ function panel_pg_row(array $panel): ?array
  */
 function panel_live_info(array $panel, bool $withDevices = true): array
 {
+    /* پنل نامحدود هرگز users_of/HWID scan ربات را اجرا نمی‌کند؛ نقش پاسارگارد مرجع است. */
+    if (panel_is_unlimited($panel)) {
+        $withDevices = false;
+    }
     $out = ['ok' => false, 'used' => (int) ($panel['last_usage'] ?? 0), 'limit' => 0,
             'users' => (int) ($panel['last_users'] ?? 0), 'devices' => 0, 'hwid_limit' => 0,
             'status' => '', 'violation' => false, 'error' => ''];
@@ -1216,7 +1294,7 @@ function panel_store_live(int $panelId, array $info): void
 
 function panel_sync_now(array $panel): array
 {
-    $info = panel_live_info($panel);
+    $info = panel_live_info($panel, !panel_is_unlimited($panel));
     if ($info['ok']) {
         panel_store_live((int) $panel['id'], $info);
     }
@@ -1231,7 +1309,8 @@ function screen_panel_detail(int|string $chat, ?int $messageId, int $panelId): v
             [[btn('« پنل‌های من', 'menu:panels', null, 'danger')]]);
         return;
     }
-    if ((string) $panel['status'] === 'active' && (int) ($panel['is_trial'] ?? 0) !== 1) {
+    if ((string) $panel['status'] === 'active' && (int) ($panel['is_trial'] ?? 0) !== 1
+        && !panel_is_unlimited($panel)) {
         panel_sync_usage($panelId);
         $panel = DB::one('SELECT * FROM panels WHERE id=?', [$panelId]) ?? $panel;
     }
@@ -1247,6 +1326,7 @@ function screen_panel_detail(int|string $chat, ?int $messageId, int $panelId): v
     }
     $product = $panel['product_id'] ? product_get((int) $panel['product_id']) : null;
     $isTrial = (int) ($panel['is_trial'] ?? 0) === 1;
+    $isUnlimited = panel_is_unlimited($panel);
     $statusMap = ['active' => '🟢 فعال', 'suspended' => '🟡 غیرفعال', 'expired' => '🔴 منقضی'];
     $status = $statusMap[$panel['status']] ?? e((string) $panel['status']);
     $cap = (int) ($panel['user_cap'] ?? 0) ?: (int) $panel['max_users'];
@@ -1255,58 +1335,68 @@ function screen_panel_detail(int|string $chat, ?int $messageId, int $panelId): v
     $panelUrl = $pgRow !== null ? panel_dashboard_url(normalize_panel_url((string) $pgRow['url'])) : '';
 
     $text = '🖥 <b>' . e((string) $panel['panel_username']) . '</b>'
-        . ($isTrial ? ' 🧪' : '') . "\n\n"
+        . ($isTrial ? ' 🧪' : ($isUnlimited ? ' ♾️' : '')) . "\n\n"
         . '👤 نام کاربری: <code>' . e((string) $panel['panel_username']) . "</code>\n"
         . '🔑 رمز ورود: <code>' . e((string) ($panel['panel_password'] ?? '—')) . "</code>\n";
     if ($panelUrl !== '') {
         $text .= '🌐 آدرس پنل: ' . e($panelUrl) . "\n";
     }
-    $text .= "\n"
-        . 'وضعیت: ' . $status . "\n"
-        . 'اعتبار تا: ' . fa_ts((int) ($panel['expires_at'] ?? 0)) . "\n"
-        . '👥 کاربر: ' . fa_digits((int) $panel['last_users']) . ' از ' . fa_digits($cap) . "\n"
-        . '📊 مصرف: <b>' . $gb((int) $panel['last_usage']) . ' گیگ</b>'
-        . ((int) $panel['data_cap'] > 0 ? ' از ' . $gb((int) $panel['data_cap']) . ' گیگ' : '') . "\n";
-    if (!$isTrial) {
-        $text .= '💵 هر گیگ: ' . money((int) $panel['per_gb_price'])
-            . ' · ⏱ هر ساعت: ' . money((int) $panel['hourly_price']) . "\n";
-    }
-    if ($isTrial) {
-        $leftH = max(0, (int) ceil(((int) ($panel['expires_at'] ?? 0) - now_ts()) / 3600));
-        $text .= "\n🧪 <i>پنل تست: رایگان است، هزینه‌ای از کیف پول کم نمی‌شود و با "
-            . 'موجودی صفر هم قطع یا حذف نمی‌شود.</i>' . "\n"
-            . '⏳ باقی‌مانده: <b>' . fa_digits($leftH) . " ساعت</b>\n"
-            . '<i>در پایان همین ۲۴ ساعت خودکار پاک می‌شود.</i>' . "\n";
-    }
-    if (!$isTrial && (int) $panel['hourly_price'] > 0) {
-        $text .= '📈 روزانه ' . money((int) $panel['hourly_price'] * 24)
-            . ' · ماهانه ' . money((int) $panel['hourly_price'] * 24 * 30) . "\n";
-    }
-    if (!$isTrial) {
-        $leftPrepaid = panel_prepaid_remaining($panel);
-        if ($leftPrepaid > 0) {
-            $text .= '🎁 <b>' . fa_digits((int) ceil($leftPrepaid / 3600))
-                . ' ساعت پیش‌پرداخت‌شده</b> باقی مانده — تا آن زمان کسر ساعتی شروع نمی‌شود' . "\n"
-                . '   شروع کسر ساعتی: ' . fa_ts((int) $panel['billing_start_at']) . "\n";
-        } elseif ((int) ($panel['prepaid_amount'] ?? 0) > 0) {
-            $text .= '⏱ کسر ساعتی از ' . fa_ts((int) $panel['billing_start_at'])
-                . ' فعال شده است' . "\n";
+    $text .= "\n" . 'وضعیت: ' . $status . "\n";
+    if ($isUnlimited) {
+        $text .= '♾️ نوع پنل: <b>نامحدود</b>' . "\n"
+            . '⏳ اعتبار: طبق تنظیمات نقش در پاسارگارد' . "\n"
+            . '📱 محدودیت دستگاه: طبق تنظیمات نقش در پاسارگارد' . "\n"
+            . '👥 کاربر: ' . fa_digits((int) $panel['last_users']) . ' از '
+                . fa_digits($cap) . "\n"
+            . '💵 قیمت هر کاربر برای شارژ: ' . money(panel_unlimited_user_price($panel)) . "\n"
+            . '🔻 حداقل شارژ: ' . fa_digits(panel_unlimited_min_users($panel)) . " کاربر\n"
+            . '<i>ربات کنترل دستگاه، حجم و اعتبار این پنل را اعمال نمی‌کند.</i>' . "\n";
+    } else {
+        $text .= 'اعتبار تا: ' . fa_ts((int) ($panel['expires_at'] ?? 0)) . "\n"
+            . '👥 کاربر: ' . fa_digits((int) $panel['last_users']) . ' از ' . fa_digits($cap) . "\n"
+            . '📊 مصرف: <b>' . $gb((int) $panel['last_usage']) . ' گیگ</b>'
+            . ((int) $panel['data_cap'] > 0 ? ' از ' . $gb((int) $panel['data_cap']) . ' گیگ' : '') . "\n";
+        if (!$isTrial) {
+            $text .= '💵 هر گیگ: ' . money((int) $panel['per_gb_price'])
+                . ' · ⏱ هر ساعت: ' . money((int) $panel['hourly_price']) . "\n";
+        }
+        if ($isTrial) {
+            $leftH = max(0, (int) ceil(((int) ($panel['expires_at'] ?? 0) - now_ts()) / 3600));
+            $text .= "\n🧪 <i>پنل تست: رایگان است، هزینه‌ای از کیف پول کم نمی‌شود و با "
+                . 'موجودی صفر هم قطع یا حذف نمی‌شود.</i>' . "\n"
+                . '⏳ باقی‌مانده: <b>' . fa_digits($leftH) . " ساعت</b>\n"
+                . '<i>در پایان همین ۲۴ ساعت خودکار پاک می‌شود.</i>' . "\n";
+        }
+        if (!$isTrial && (int) $panel['hourly_price'] > 0) {
+            $text .= '📈 روزانه ' . money((int) $panel['hourly_price'] * 24)
+                . ' · ماهانه ' . money((int) $panel['hourly_price'] * 24 * 30) . "\n";
+        }
+        if (!$isTrial) {
+            $leftPrepaid = panel_prepaid_remaining($panel);
+            if ($leftPrepaid > 0) {
+                $text .= '🎁 <b>' . fa_digits((int) ceil($leftPrepaid / 3600))
+                    . ' ساعت پیش‌پرداخت‌شده</b> باقی مانده — تا آن زمان کسر ساعتی شروع نمی‌شود' . "\n"
+                    . '   شروع کسر ساعتی: ' . fa_ts((int) $panel['billing_start_at']) . "\n";
+            } elseif ((int) ($panel['prepaid_amount'] ?? 0) > 0) {
+                $text .= '⏱ کسر ساعتی از ' . fa_ts((int) $panel['billing_start_at'])
+                    . ' فعال شده است' . "\n";
+            }
         }
     }
-    if ((int) $panel['last_devices'] > 0) {
+    if (!$isUnlimited && (int) $panel['last_devices'] > 0) {
         $text .= '📱 دستگاه متصل: ' . fa_digits((int) $panel['last_devices']) . "\n";
     }
-    if ((int) ($panel['violation_until'] ?? 0) > now_ts()) {
+    if (!$isUnlimited && (int) ($panel['violation_until'] ?? 0) > now_ts()) {
         $text .= '⏳ قطع به‌خاطر تخلف تا: ' . fa_ts((int) $panel['violation_until']) . "\n";
     }
-    $discountLine = $isTrial ? '' : panel_discount_text($panel);
+    $discountLine = ($isTrial || $isUnlimited) ? '' : panel_discount_text($panel);
     if ($discountLine !== '') {
         $text .= $discountLine . "\n";
     }
     if (!$live['ok'] && $live['error'] !== '') {
         $text .= "\n⚠️ خواندن از پنل نشد: <code>" . e($live['error']) . "</code>\n";
     }
-    if (!$isTrial) {
+    if (!$isTrial && !$isUnlimited) {
         $text .= "\n👛 موجودی کیف پول: <b>" . money(balance_of((int) $panel['tg_id'])) . '</b>';
     }
 
@@ -1315,18 +1405,23 @@ function screen_panel_detail(int|string $chat, ?int $messageId, int $panelId): v
     if ($panelUrl !== '') {
         $rows[] = [btn('🌐 ورود به پنل', null, $panelUrl, 'primary')];
     }
-    $rows[] = [btn('🔑 تغییر رمز', 'pn:' . $panelId . ':pass', null, 'primary'),
-               btn('📱 دستگاه‌ها', 'pn:' . $panelId . ':sec', null, 'primary')];
-    $blockPrice = $isTrial ? 0 : (int) ($product['extra_block_price'] ?? 0);
-    $blockSize = (int) ($product['extra_block_size'] ?? 1000) ?: 1000;
-    if ($blockPrice > 0) {
-        $rows[] = [btn('➕ ' . fa_digits($blockSize) . ' کاربر · ' . money($blockPrice),
-            'pn:' . $panelId . ':extra', null, 'primary')];
+    if ($isUnlimited) {
+        $rows[] = [btn('🔑 تغییر رمز', 'pn:' . $panelId . ':pass', null, 'primary')];
+        $rows[] = [btn('➕ شارژ / افزودن کاربر', 'pn:' . $panelId . ':users', null, 'success')];
+    } else {
+        $rows[] = [btn('🔑 تغییر رمز', 'pn:' . $panelId . ':pass', null, 'primary'),
+                   btn('📱 دستگاه‌ها', 'pn:' . $panelId . ':sec', null, 'primary')];
+        $blockPrice = $isTrial ? 0 : (int) ($product['extra_block_price'] ?? 0);
+        $blockSize = (int) ($product['extra_block_size'] ?? 1000) ?: 1000;
+        if ($blockPrice > 0) {
+            $rows[] = [btn('➕ ' . fa_digits($blockSize) . ' کاربر · ' . money($blockPrice),
+                'pn:' . $panelId . ':extra', null, 'primary')];
+        }
     }
-    if (!$isTrial && $discountLine === '') {
+    if (!$isTrial && !$isUnlimited && $discountLine === '') {
         $rows[] = [btn('🏷 کد تخفیف', 'pn:' . $panelId . ':disc', null, 'primary')];
     }
-    if (!$isTrial && $panel['status'] !== 'active') {
+    if (!$isTrial && !$isUnlimited && $panel['status'] !== 'active') {
         $rows[] = [btn('💳 شارژ کیف پول', 'menu:wallet', null, 'primary')];
     }
     if (!$isTrial) {
@@ -1375,7 +1470,8 @@ function panel_record_prepaid(int $panelId, int $tgId, int $amount, ?int $hours 
  */
 function panel_sync_prices(array $panel): array
 {
-    if ((int) ($panel['is_trial'] ?? 0) === 1 || empty($panel['product_id'])) {
+    if ((int) ($panel['is_trial'] ?? 0) === 1 || panel_is_unlimited($panel)
+        || empty($panel['product_id'])) {
         return $panel;
     }
     $prodRow = product_get((int) $panel['product_id']);
@@ -1491,6 +1587,14 @@ function screen_panel_security(int|string $chat, ?int $messageId, int $panelId):
     if ($panel === null) {
         return;
     }
+    if (panel_is_unlimited($panel)) {
+        Tg::show($chat, $messageId,
+            "♾️ <b>مدیریت دستگاه</b>\n\n"
+            . 'برای پنل نامحدود، محدودیت دستگاه و اعتبار فقط از نقش پاسارگارد اعمال می‌شود. '
+            . 'ربات بررسی یا محدودسازی دستگاه انجام نمی‌دهد.',
+            [[btn('« پنل', 'pn:' . $panelId, null, 'danger')]]);
+        return;
+    }
     $info = panel_live_info($panel);
     if ($info['ok']) {
         panel_store_live($panelId, $info);
@@ -1545,6 +1649,9 @@ function panel_reset_devices(int $panelId): array
     $panel = DB::one('SELECT * FROM panels WHERE id=?', [$panelId]);
     if ($panel === null) {
         return [false, 'پنل پیدا نشد.'];
+    }
+    if (panel_is_unlimited($panel)) {
+        return [false, 'برای پنل نامحدود، مدیریت دستگاه با نقش پاسارگارد است.'];
     }
     $pgRow = panel_pg_row($panel);
     if ($pgRow === null) {

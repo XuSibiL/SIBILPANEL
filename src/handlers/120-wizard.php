@@ -113,6 +113,14 @@ function wiz_pick(int $uid, mixed $value, int|string $chat, ?int $messageId): vo
     if ($step === null) {
         return;
     }
+    if (($step['options'] ?? null) === 'roles') {
+        $panelId = (int) ($data['values']['panel_id'] ?? 0);
+        [$roleOk, $roleWhy] = role_sale_allowed($panelId, (int) $value);
+        if (!$roleOk) {
+            Tg::send($chat, '❌ ' . $roleWhy);
+            return;
+        }
+    }
     $data['values'][$step['key']] = $value;
     $data['i'] = $i + 1;
     if ($data['i'] < count($data['steps'])) {
@@ -248,6 +256,12 @@ function wiz_finish(int $uid, array $data): void
                     [[btn('➕ محصول جدید', 'ad:cat:' . $catId . ':new', null, 'success')]]);
                 return;
             }
+            [$roleOk, $roleWhy] = role_sale_allowed((int) $panelRow['id'], $roleId);
+            if (!$roleOk) {
+                Tg::send($uid, '❌ ' . $roleWhy . "\n\n" . 'محصول ساخته نشد؛ دوباره نقش امنی انتخاب کنید.',
+                    [[btn('➕ محصول جدید', 'ad:cat:' . $catId . ':new', null, 'success')]]);
+                return;
+            }
             $roleName = '';
             foreach (roles_cache((int) $panelRow['id']) as $roleRow) {
                 if ($roleRow['id'] === $roleId) {
@@ -276,6 +290,63 @@ function wiz_finish(int $uid, array $data): void
             Tg::send($uid, $text, $buttons);
             return;
 
+        case 'prod_new_unlimited':
+            $catId = (int) ($ctx['cat_id'] ?? 0);
+            $panelId = (int) ($values['panel_id'] ?? 0);
+            $panelRow = $panelId ? DB::one('SELECT * FROM pg_panels WHERE id=? AND active=1', [$panelId]) : null;
+            if ($panelRow === null) {
+                $panelRow = DB::one('SELECT * FROM pg_panels WHERE active=1 '
+                    . 'ORDER BY is_default DESC, id LIMIT 1');
+            }
+            if ($panelRow === null) {
+                Tg::send($uid, '❌ هیچ پنل پاسارگارد فعالی نیست.',
+                    [[btn('🔌 پنل‌ها', 'ad:panel', null, 'primary')]]);
+                return;
+            }
+            $roleId = (int) ($values['role_id'] ?? 0);
+            [$roleOk, $roleWhy] = role_sale_allowed((int) $panelRow['id'], $roleId);
+            if ($roleId <= 0 || !$roleOk) {
+                Tg::send($uid, '❌ ' . ($roleWhy ?: 'نقش معتبری انتخاب نشد.') . "\n\n"
+                    . 'محصول ساخته نشد؛ دوباره از «➕ محصول» شروع کنید.',
+                    [[btn('➕ محصول جدید', 'ad:cat:' . $catId . ':new', null, 'success')]]);
+                return;
+            }
+            $perUser = (int) ($values['per_user_price'] ?? 0);
+            $minUsers = (int) ($values['min_users'] ?? 0);
+            if ($perUser <= 0 || $minUsers < 1 || $minUsers > UNLIMITED_USERS_MAX) {
+                Tg::send($uid, '❌ قیمت هر کاربر باید بیشتر از صفر و حداقل تعداد کاربر معتبر باشد.',
+                    [[btn('➕ محصول نامحدود', 'ad:cat:' . $catId . ':new:unlimited', null, 'success')]]);
+                return;
+            }
+            $roleName = '';
+            foreach (roles_cache((int) $panelRow['id']) as $roleRow) {
+                if ((int) $roleRow['id'] === $roleId) {
+                    $roleName = (string) $roleRow['name'];
+                    break;
+                }
+            }
+            $productId = DB::exec('INSERT INTO products(name, emoji, category, category_id, '
+                . 'role_id, group_ids, max_users, device_limit, days, data_cap_gb, per_gb_price, '
+                . 'hourly_price, min_balance, renew_price, slots_needed, panel_prefix, trial, '
+                . 'active, created_at, panel_id, sale_type, per_user_price, min_users) '
+                . 'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                [trim((string) $values['name']), $values['emoji'] ?: '♾️', 'v2ray', $catId,
+                 $roleId, '[]', 0, 0, 0, 0, 0, 0, 0, 0, 1, '', 0, 1, now_ts(),
+                 (int) $panelRow['id'], PRODUCT_SALE_UNLIMITED_USERS, $perUser, $minUsers]);
+            $text = '✅ محصول نامحدود #' . $productId . " ساخته شد.\n\n"
+                . ($values['emoji'] ?: '♾️') . ' <b>' . e((string) $values['name']) . "</b>\n"
+                . '🔌 پنل: ' . e((string) $panelRow['name']) . "\n"
+                . '🎭 نقش: ' . e($roleName !== '' ? $roleName : (string) $roleId) . "\n"
+                . '💵 قیمت هر کاربر: <b>' . money($perUser) . "</b>\n"
+                . '👥 حداقل تعداد کاربر: <b>' . fa_digits($minUsers) . "</b>\n\n"
+                . UNLIMITED_ROLE_GUIDE;
+            Tg::send($uid, $text, [
+                [btn('👁 پیش‌نمایش محصول', 'ad:prod:' . $productId)],
+                [btn('➕ محصول بعدی', 'ad:cat:' . $catId . ':new', null, 'success')],
+                [btn('« بازگشت به دسته', 'ad:cat:' . $catId, null, 'danger')],
+            ]);
+            return;
+
         case 'panel_pass':
             $panelId = (int) ($ctx['panel_id'] ?? 0);
             $password = trim((string) ($values['password'] ?? ''));
@@ -292,7 +363,18 @@ function wiz_finish(int $uid, array $data): void
                 Tg::send($uid, 'این گزینه پیدا نشد.', console_kb());
                 return;
             }
-            product_update($productId, $meta[2], $values['value']);
+            $value = $values['value'];
+            if ($field === 'peruser' && (int) $value <= 0) {
+                Tg::send($uid, '❌ قیمت هر کاربر باید بیشتر از صفر باشد.',
+                    [[btn('« محصول', 'ad:prod:' . $productId, null, 'danger')]]);
+                return;
+            }
+            if ($field === 'minusers' && ((int) $value < 1 || (int) $value > UNLIMITED_USERS_MAX)) {
+                Tg::send($uid, '❌ حداقل تعداد کاربر باید بین ۱ تا ' . fa_digits(UNLIMITED_USERS_MAX) . ' باشد.',
+                    [[btn('« محصول', 'ad:prod:' . $productId, null, 'danger')]]);
+                return;
+            }
+            product_update($productId, $meta[2], $value);
             if ($field === 'role') {
                 DB::exec('UPDATE products SET active=1 WHERE id=? AND role_id>0', [$productId]);
             }
@@ -571,7 +653,7 @@ function wiz_finish(int $uid, array $data): void
             if ($found === null) {
                 Tg::send($uid, '🔎 سفارشی با کد <code>' . e($code) . "</code> برای شما پیدا نشد.\n"
                     . '<i>کد پیگیری را دقیق بفرست؛ همان کدی که بعد از پرداخت گرفتی.</i>',
-                    [[btn('🔎 دوباره', 'menu:track', null, 'success')],
+                    [[btn('🧾 سفارش‌های من', 'menu:orders', null, 'success')],
                      [btn('« خانه', 'home', null, 'danger')]]);
                 return;
             }
@@ -745,8 +827,8 @@ function auto_role_id(array $panelRow): int
 {
     try {
         $client = new PgPanel($panelRow);
-        foreach ($client->roles() as $role) {
-            if (empty($role['is_owner'])) {
+        foreach (roles_normalize($client->roles()) as $role) {
+            if (empty($role['owner'])) {
                 return (int) ($role['id'] ?? 0);
             }
         }

@@ -57,6 +57,9 @@ function usage_blocks(int $bytes): int
  */
 function panel_balance_suspension_allowed(array $panel, ?int $at = null): bool
 {
+    if (panel_is_unlimited($panel)) {
+        return false;
+    }
     $billingStart = (int) ($panel['billing_start_at'] ?? 0);
     $at = $at ?? time();
     return $billingStart <= 0 || $at > $billingStart;
@@ -65,6 +68,9 @@ function panel_balance_suspension_allowed(array $panel, ?int $at = null): bool
 /** تنها تعلیق مجازِ پنجرهٔ پیش‌پرداخت: تمام‌شدن سقف ترافیک واقعی. */
 function panel_traffic_limit_reached(array $panel, array $usage): bool
 {
+    if (panel_is_unlimited($panel)) {
+        return false;
+    }
     $limit = (int) ($usage['limit'] ?? 0);
     if ($limit <= 0) {
         $limit = (int) ($panel['data_cap'] ?? 0);
@@ -75,6 +81,9 @@ function panel_traffic_limit_reached(array $panel, array $usage): bool
 /** هیچ تعلیقِ مانده از موجودی نباید سقف ترافیک/تاریخ انقضا را دور بزند. */
 function panel_balance_hold_can_resume(array $panel): bool
 {
+    if (panel_is_unlimited($panel)) {
+        return true;
+    }
     if (!empty($panel['expires_at']) && (int) $panel['expires_at'] <= now_ts()) {
         return false;
     }
@@ -160,8 +169,8 @@ function panel_charge_once(array $panel, int $usedBytes, bool $hourlyEnabled,
             'suspended' => false];
     $panelId = (int) $panel['id'];
     $tgId = (int) $panel['tg_id'];
-    if ((int) ($panel['is_trial'] ?? 0) === 1) {
-        return $out;   // پنل تست هیچ‌وقت حساب نمی‌شود
+    if ((int) ($panel['is_trial'] ?? 0) === 1 || panel_is_unlimited($panel)) {
+        return $out;   // پنل تست و پنل نامحدود هیچ صورتحساب محلی ندارند
     }
     $panel = panel_sync_prices($panel);
     $amounts = panel_meter_amounts($panel, $usedBytes, $hourlyEnabled, $perGbEnabled);
@@ -239,6 +248,17 @@ function panels_meter(bool $verbose = false): array
     $stats['resumed'] += $balancePass['resumed'];
     /* پنل‌های معلق: صورتحساب متوقف است و فقط شرط بازگشت بررسی می‌شود */
     foreach (DB::all("SELECT * FROM panels WHERE status='suspended'") as $held) {
+        if (panel_is_unlimited($held)) {
+            /* اگر نسخهٔ قبلی ربات به‌علت موجودی این پنل را بسته باشد، واگذار کردن
+               اختیار به Role مستلزم برداشتن همان محدودیت محلی است. */
+            if (($held['suspended_reason'] ?? '') === 'balance') {
+                DB::exec('UPDATE panels SET suspended_reason=NULL WHERE id=?', [(int) $held['id']]);
+                if (resume_panel($held)) {
+                    $stats['resumed']++;
+                }
+            }
+            continue;
+        }
         if ((int) ($held['is_trial'] ?? 0) === 1) {
             continue;
         }
@@ -254,6 +274,10 @@ function panels_meter(bool $verbose = false): array
     }
     $rows = DB::all("SELECT * FROM panels WHERE status='active'");
     foreach ($rows as $panel) {
+        if (panel_is_unlimited($panel)) {
+            /* هیچ خواندن مصرف، پایان اعتبار، حجم یا صورتحساب محلی برای این نوع نیست. */
+            continue;
+        }
         $panelRow = $panel['pg_panel_id']
             ? DB::one('SELECT * FROM pg_panels WHERE id=?', [(int) $panel['pg_panel_id']]) : null;
         if ($panelRow === null) {
@@ -388,6 +412,15 @@ function panels_balance_enforce(bool $verbose = false): array
     foreach (DB::all("SELECT * FROM panels WHERE status IN ('active','suspended')") as $panel) {
         if ((int) ($panel['is_trial'] ?? 0) === 1) {
             continue; // پنل تست رایگان است و به موجودی کاری ندارد
+        }
+        if (panel_is_unlimited($panel)) {
+            if ($panel['status'] === 'suspended' && ($panel['suspended_reason'] ?? '') === 'balance') {
+                DB::exec('UPDATE panels SET suspended_reason=NULL WHERE id=?', [(int) $panel['id']]);
+                if (resume_panel($panel)) {
+                    $out['resumed']++;
+                }
+            }
+            continue; // اعتبار، دستگاه و موجودی پنل نامحدود فقط با Role است
         }
         $balance = balance_of((int) $panel['tg_id']);
         /* پول ۲۴ ساعت اول در فاکتور اولیه تسویه شده است؛ تا عبور صریح زمان
@@ -631,6 +664,22 @@ function device_guard_unban(bool $verbose = false): int
     $back = 0;
     foreach (DB::all('SELECT * FROM temp_restricted_users') as $row) {
         $unbanAt = (int) $row['unban_at'];
+        $panelForRestriction = DB::one('SELECT * FROM panels WHERE id=?', [(int) $row['panel_id']]);
+        if ($panelForRestriction !== null && panel_is_unlimited($panelForRestriction)) {
+            /* جریمه‌ای که پیش از تغییر نوع/نسخه ثبت شده، نباید روی نامحدود بماند. */
+            $pgRow = panel_pg_row($panelForRestriction);
+            if ($pgRow !== null) {
+                try {
+                    (new PgPanel($pgRow))->set_user_status((string) $row['username'], 'active');
+                } catch (Throwable $ex) {
+                    log_line('warning', 'unlimited device release failed: ' . $ex->getMessage());
+                    continue;
+                }
+            }
+            DB::exec('DELETE FROM temp_restricted_users WHERE id=?', [(int) $row['id']]);
+            DB::exec('UPDATE panels SET violation_until=0 WHERE id=?', [(int) $row['panel_id']]);
+            continue;
+        }
         if ($unbanAt <= 0) {
             /* ردیف کهنه — بی‌معنا */
             DB::exec('DELETE FROM temp_restricted_users WHERE id=?', [(int) $row['id']]);
@@ -696,6 +745,11 @@ function device_guard_detect(bool $verbose = false): array
 
     foreach (DB::all("SELECT * FROM panels WHERE status='active'") as $panel) {
         $panelId = (int) $panel['id'];
+        if (panel_is_unlimited($panel)) {
+            /* فقط Role پاسارگارد دستگاه را کنترل می‌کند؛ حتی users_of هم صدا زده نمی‌شود. */
+            $out['skipped']++;
+            continue;
+        }
         $panelUsername = (string) $panel['panel_username'];
         /* فقط پنل‌های ثبت‌شده در ربات پایش می‌شوند */
         if ($panelUsername === '' || !isset($registered[$panelUsername])) {

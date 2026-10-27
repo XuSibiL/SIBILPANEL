@@ -340,10 +340,77 @@ function handle_message_inner(array $message): void
             screen_console($chatId, null);
             return;
 
+        case 'unlimited_initial_users':
+            $productId = (int) ($state['data']['product'] ?? 0);
+            if (in_array(mb_strtolower($text, 'UTF-8'), ['لغو', 'انصراف', 'cancel', '/cancel'], true)) {
+                State::clear($uid);
+                screen_product($chatId, null, $productId);
+                return;
+            }
+            $product = product_get($productId);
+            $count = to_int($text);
+            if ($product === null || (int) $product['active'] !== 1 || !product_is_unlimited($product)) {
+                State::clear($uid);
+                Tg::send($chatId, 'این محصول نامحدود دیگر فعال نیست.',
+                    [[btn('« خرید پنل', 'menu:buy', null, 'danger')]]);
+                return;
+            }
+            [$countOk, $countWhy] = unlimited_user_count_check($product, $count ?? 0);
+            if (!$countOk) {
+                Tg::send($chatId, '❌ ' . $countWhy . "\n\n" . 'دوباره فقط یک عدد بفرستید.');
+                return;
+            }
+            State::clear($uid);
+            screen_username_choice($chatId, null, $productId, 'buyu', (int) $count);
+            return;
+
+        case 'unlimited_add_users':
+            $panelId = (int) ($state['data']['panel_id'] ?? 0);
+            if (in_array(mb_strtolower($text, 'UTF-8'), ['لغو', 'انصراف', 'cancel', '/cancel'], true)) {
+                State::clear($uid);
+                screen_panel_detail($chatId, null, $panelId);
+                return;
+            }
+            $panel = DB::one('SELECT * FROM panels WHERE id=? AND tg_id=?', [$panelId, $uid]);
+            $count = to_int($text);
+            if ($panel === null || !panel_is_unlimited($panel)) {
+                State::clear($uid);
+                Tg::send($chatId, 'این پنل نامحدود پیدا نشد.',
+                    [[btn('« پنل‌های من', 'menu:panels', null, 'danger')]]);
+                return;
+            }
+            [$countOk, $countWhy] = panel_unlimited_user_count_check($panel, $count ?? 0);
+            if (!$countOk) {
+                Tg::send($chatId, '❌ ' . $countWhy . "\n\n" . 'دوباره فقط یک عدد بفرستید.');
+                return;
+            }
+            $count = (int) $count;
+            $unit = panel_unlimited_user_price($panel);
+            $price = $count * $unit;
+            State::clear($uid);
+            $order = create_order($uid, 'users', $price, (int) ($panel['product_id'] ?? 0), [
+                'panel_id' => $panelId,
+                'block' => $count, // سازگاری با فیلد قدیمی؛ شاخهٔ تحویل با unlimited_users تشخیص می‌دهد.
+                'sale_type' => PRODUCT_SALE_UNLIMITED_USERS,
+                'unlimited_users' => true,
+                'user_count' => $count,
+                'per_user_price' => $unit,
+                'min_users' => panel_unlimited_min_users($panel),
+            ]);
+            Tg::send($chatId,
+                invoice_text($order, 'افزودن کاربر به پنل نامحدود',
+                    '📦 پنل <code>' . e((string) $panel['panel_username']) . "</code>\n"
+                    . '👥 تعداد کاربر: <b>' . fa_digits($count) . "</b>\n"
+                    . '💵 ' . fa_digits($count) . ' × ' . money($unit) . ' = <b>'
+                        . money($price) . '</b>'),
+                invoice_kb($order, $uid));
+            return;
+
         case 'panel_username':
             $ctxName = $state['data'];
             $mode = (string) ($ctxName['mode'] ?? 'buy');
             $productId = (int) ($ctxName['product'] ?? 0);
+            $unlimitedUsers = (int) ($ctxName['unlimited_users'] ?? 0);
             [$nameOk, $nameWhy] = panel_username_check($text);
             if (!$nameOk) {
                 Tg::send($chatId, '❌ ' . e($nameWhy) . "\n" . 'یک نام دیگر بفرستید.');
@@ -353,7 +420,7 @@ function handle_message_inner(array $message): void
             if ($mode === 'trial') {
                 start_trial_order($uid, $chatId, null, $productId, trim($text));
             } else {
-                start_panel_order($uid, $chatId, null, $productId, trim($text));
+                start_panel_order($uid, $chatId, null, $productId, trim($text), $unlimitedUsers);
             }
             return;
 
@@ -395,7 +462,7 @@ function handle_message_inner(array $message): void
                 . '💵 مبلغ: <b>' . money((int) $order['payable']) . '</b>' . "\n"
                 . '⏳ وضعیت: در انتظار تأیید مدیر' . "\n\n"
                 . '<i>به‌محض تأیید، همین‌جا خبرت می‌کنیم. مهلتی هم در کار نیست.</i>',
-                [[btn('🔎 پیگیری با کد', 'menu:track', null, 'success')],
+                [[btn('🧾 سفارش‌های من', 'menu:orders', null, 'success')],
                  [btn('« خانه', 'home', null, 'danger')]]);
             return;
 

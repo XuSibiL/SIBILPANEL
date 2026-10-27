@@ -158,7 +158,10 @@ CREATE TABLE IF NOT EXISTS products (
     active         INTEGER NOT NULL DEFAULT 1,
     sort           INTEGER NOT NULL DEFAULT 0,
     created_at     INTEGER NOT NULL,
-    panel_id       INTEGER
+    panel_id       INTEGER,
+    sale_type      TEXT    NOT NULL DEFAULT 'metered',
+    per_user_price INTEGER NOT NULL DEFAULT 0,
+    min_users      INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS panels (
@@ -185,6 +188,9 @@ CREATE TABLE IF NOT EXISTS panels (
     created_at      INTEGER NOT NULL,
     pg_panel_id     INTEGER,
     is_trial        INTEGER NOT NULL DEFAULT 0,
+    is_unlimited    INTEGER NOT NULL DEFAULT 0,
+    unlimited_user_price INTEGER NOT NULL DEFAULT 0,
+    unlimited_min_users  INTEGER NOT NULL DEFAULT 1,
     hourly_paused   INTEGER NOT NULL DEFAULT 0,
     violation_until INTEGER,
     violation_count INTEGER NOT NULL DEFAULT 0,
@@ -421,7 +427,10 @@ function db_bootstrap(): void
     $wanted = [
         'products'  => ['panel_id' => 'INTEGER', 'category_id' => 'INTEGER',
                         'extra_block_size' => 'INTEGER DEFAULT 1000',
-                        'extra_block_price' => 'INTEGER DEFAULT 0'],
+                        'extra_block_price' => 'INTEGER DEFAULT 0',
+                        'sale_type' => "TEXT NOT NULL DEFAULT 'metered'",
+                        'per_user_price' => 'INTEGER NOT NULL DEFAULT 0',
+                        'min_users' => 'INTEGER NOT NULL DEFAULT 1'],
         'pg_panels' => ['category_id' => 'INTEGER', 'api_key' => 'TEXT'],
         'discounts' => ['per_user' => 'INTEGER DEFAULT 1', 'first_only' => 'INTEGER DEFAULT 0',
                         'days' => 'INTEGER DEFAULT 30', 'hours' => 'INTEGER DEFAULT 0',
@@ -439,6 +448,9 @@ function db_bootstrap(): void
                         'billing_start_at' => 'INTEGER DEFAULT 0',
                         'prepaid_amount' => 'INTEGER DEFAULT 0',
                         'is_trial' => 'INTEGER DEFAULT 0',
+                        'is_unlimited' => 'INTEGER DEFAULT 0',
+                        'unlimited_user_price' => 'INTEGER NOT NULL DEFAULT 0',
+                        'unlimited_min_users' => 'INTEGER NOT NULL DEFAULT 1',
                         'hourly_paused' => 'INTEGER DEFAULT 0',
                         'violation_until' => 'INTEGER', 'violation_count' => 'INTEGER DEFAULT 0',
                         'last_devices' => 'INTEGER DEFAULT 0',
