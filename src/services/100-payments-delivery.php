@@ -351,6 +351,128 @@ function order_product(array $order): ?array
 }
 
 /**
+ * Credit one wallet top-up and mark its order delivered as one durable local
+ * action. Provider verification has already happened before this helper is
+ * called; this function only makes a retry safe if a process stopped between
+ * the provider payment claim and customer delivery.
+ *
+ * The legacy wallet_tx table has no uniqueness constraint.  The BEGIN
+ * IMMEDIATE transaction plus the immutable topup/order id reference therefore
+ * form the durable exactly-once delivery claim: a later retry sees its own
+ * wallet entry and only repairs the unfinished order state.
+ *
+ * @return array{ok:bool,text:string,credited:bool}
+ */
+function settle_topup_once(array $order, string $source): array
+{
+    $orderId = (int) ($order['id'] ?? 0);
+    $tgId = (int) ($order['tg_id'] ?? 0);
+    $payload = json_decode((string) ($order['payload'] ?? ''), true);
+    $payload = is_array($payload) ? $payload : [];
+    $amount = (int) ($payload['topup'] ?? ($order['payable'] ?? 0));
+    if ($orderId <= 0 || $tgId <= 0 || $amount <= 0) {
+        return ['ok' => false, 'text' => 'اطلاعات شارژ کیف پول معتبر نیست.', 'credited' => false];
+    }
+
+    try {
+        $claim = DB::tx(static function () use ($orderId, $tgId, $amount, $source): array {
+            $fresh = order_get($orderId);
+            if ($fresh === null) {
+                return ['state' => 'notfound'];
+            }
+            if ((string) $fresh['status'] === 'delivered') {
+                return ['state' => 'already', 'balance' => balance_of($tgId)];
+            }
+            /* A finance-approved manual receipt intentionally moves its
+               order to review before the same idempotent credit path runs. */
+            if (!in_array((string) $fresh['status'], ['pending', 'review'], true)) {
+                return ['state' => 'closed'];
+            }
+            if (user_get($tgId) === null) {
+                return ['state' => 'user_missing'];
+            }
+
+            /* A pre-existing entry can only be this exact immutable order;
+               do not append a second ledger row while repairing delivery. */
+            $existing = DB::one("SELECT id FROM wallet_tx WHERE tg_id=? AND kind='topup' AND ref=? "
+                . 'ORDER BY id DESC LIMIT 1', [$tgId, (string) $orderId]);
+            $credited = $existing === null;
+            if ($credited) {
+                $changed = DB::update('UPDATE users SET balance = balance + ? WHERE tg_id=?',
+                    [$amount, $tgId]);
+                if ($changed !== 1) {
+                    return ['state' => 'user_missing'];
+                }
+                $balance = balance_of($tgId);
+                DB::exec('INSERT INTO wallet_tx(tg_id, amount, kind, ref, note, balance, created_at) '
+                    . 'VALUES(?,?,?,?,?,?,?)',
+                    [$tgId, $amount, 'topup', (string) $orderId,
+                        'شارژ کیف پول (' . pay_source_label($source) . ')', $balance, now_ts()]);
+            } else {
+                $balance = balance_of($tgId);
+            }
+
+            $marked = DB::update("UPDATE orders SET status='delivered', paid_at=? "
+                . "WHERE id=? AND status IN ('pending','review')", [now_ts(), $orderId]);
+            if ($marked !== 1) {
+                /* Rolling back a just-added wallet entry is safer than ever
+                   allowing an ambiguous second credit. */
+                throw new RuntimeException('topup delivery claim changed concurrently');
+            }
+            return ['state' => 'delivered', 'balance' => $balance, 'credited' => $credited];
+        });
+    } catch (Throwable $ex) {
+        log_line('warning', 'topup delivery failed: ' . $ex->getMessage(), ['order' => $orderId]);
+        return ['ok' => false, 'text' => 'شارژ کیف پول موقتاً انجام نشد.', 'credited' => false];
+    }
+
+    $state = (string) ($claim['state'] ?? 'notfound');
+    if ($state === 'already') {
+        return ['ok' => true, 'text' => '✅ این سفارش قبلاً انجام شده است.' . "\n"
+            . 'کد سفارش: <code>' . e((string) ($order['ref'] ?? '')) . '</code>', 'credited' => false];
+    }
+    if ($state !== 'delivered') {
+        return ['ok' => false, 'text' => $state === 'closed'
+            ? 'این سفارش دیگر برای شارژ کیف پول باز نیست.' : 'کاربر یا سفارش شارژ پیدا نشد.',
+            'credited' => false];
+    }
+
+    $balance = (int) ($claim['balance'] ?? balance_of($tgId));
+    if (!empty($claim['credited'])) {
+        /* Referral side effects intentionally run only for the one transaction
+           that inserted the top-up ledger entry.  A delivery repair can never
+           create a second deposit count, commission, or balance credit. */
+        try {
+            $depositNo = deposit_count_up($tgId);
+            if (ref_mode() === 'cash' && ref_cash_when() === 'purchase') {
+                referral_welcome_cash($tgId);
+            }
+            $commission = referral_deposit_payout($tgId, $amount);
+            if ($commission > 0) {
+                log_payment('referral commission', ['user' => $tgId, 'deposit' => $depositNo,
+                    'amount' => $amount, 'reward' => $commission]);
+            }
+        } catch (Throwable $ex) {
+            log_line('warning', 'referral deposit payout failed: ' . $ex->getMessage());
+        }
+        try {
+            $user = user_get($tgId);
+            post_report('💰 <b>شارژ کیف پول</b>' . "\n"
+                . '👤 ' . e(mb_substr((string) ($user['name'] ?? $tgId), 0, 22))
+                . ' <code>' . $tgId . "</code>\n"
+                . '💵 مبلغ: <b>' . money($amount) . "</b>\n"
+                . '🔀 روش: ' . e(pay_source_label($source)) . "\n"
+                . '👛 موجودی جدید: ' . money($balance), 'topup');
+        } catch (Throwable $ex) {
+            log_line('warning', 'topup report failed: ' . $ex->getMessage(), ['order' => $orderId]);
+        }
+    }
+
+    return ['ok' => true, 'text' => '✅ کیف پول شارژ شد: ' . money($amount) . "\nموجودی جدید: "
+        . money($balance), 'credited' => !empty($claim['credited'])];
+}
+
+/**
  * تسویهٔ سفارش. خروجی: [موفق, متن برای کاربر]
  * انواع: panel | topup | slot
  */
@@ -371,34 +493,8 @@ function settle_payment(array $order, string $source = 'wallet', int $adminId = 
             . 'برای دیدن پنل‌ها «📦 پنل‌های من» را بزنید.'];
     }
     if ($kind === 'topup') {
-        $payload = json_decode((string) $order['payload'], true) ?: [];
-        $amount = (int) ($payload['topup'] ?? $order['payable']);
-        $newBalance = add_balance($tgId, $amount, 'topup', (string) $order['id'],
-            'شارژ کیف پول (' . pay_source_label($source) . ')');
-        order_mark((int) $order['id'], 'delivered');
-        /* شمارش واریزی + پورسانت معرف (فقط واریزی اول و دوم) */
-        try {
-            $depositNo = deposit_count_up($tgId);
-            if (ref_mode() === 'cash' && ref_cash_when() === 'purchase') {
-                referral_welcome_cash($tgId);   // پاداش نقدی معلق، با اولین شارژ
-            }
-            $commission = referral_deposit_payout($tgId, $amount);
-            if ($commission > 0) {
-                log_payment('referral commission', ['user' => $tgId, 'deposit' => $depositNo,
-                    'amount' => $amount, 'reward' => $commission]);
-            }
-        } catch (Throwable $ex) {
-            log_line('warning', 'referral deposit payout failed: ' . $ex->getMessage());
-        }
-        $user = user_get($tgId);
-        post_report('💰 <b>شارژ کیف پول</b>' . "\n"
-            . '👤 ' . e(mb_substr((string) ($user['name'] ?? $tgId), 0, 22))
-            . ' <code>' . $tgId . "</code>\n"
-            . '💵 مبلغ: <b>' . money($amount) . "</b>\n"
-            . '🔀 روش: ' . e(pay_source_label($source)) . "\n"
-            . '👛 موجودی جدید: ' . money($newBalance), 'topup');
-        return [true, '✅ کیف پول شارژ شد: ' . money($amount) . "\nموجودی جدید: "
-            . money($newBalance)];
+        $topup = settle_topup_once($order, $source);
+        return [(bool) ($topup['ok'] ?? false), (string) ($topup['text'] ?? '')];
     }
     if ($kind === 'users') {
         $payload = json_decode((string) $order['payload'], true) ?: [];

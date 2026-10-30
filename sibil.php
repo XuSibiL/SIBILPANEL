@@ -21,7 +21,7 @@
 
 declare(strict_types=1);
 
-const PANEL_VERSION = '3.18.4';
+const PANEL_VERSION = '3.18.5';
 const IRAN_OFFSET   = 3.5 * 3600;
 const DAY           = 86400;
 
@@ -13391,6 +13391,128 @@ function order_product(array $order): ?array
 }
 
 /**
+ * Credit one wallet top-up and mark its order delivered as one durable local
+ * action. Provider verification has already happened before this helper is
+ * called; this function only makes a retry safe if a process stopped between
+ * the provider payment claim and customer delivery.
+ *
+ * The legacy wallet_tx table has no uniqueness constraint.  The BEGIN
+ * IMMEDIATE transaction plus the immutable topup/order id reference therefore
+ * form the durable exactly-once delivery claim: a later retry sees its own
+ * wallet entry and only repairs the unfinished order state.
+ *
+ * @return array{ok:bool,text:string,credited:bool}
+ */
+function settle_topup_once(array $order, string $source): array
+{
+    $orderId = (int) ($order['id'] ?? 0);
+    $tgId = (int) ($order['tg_id'] ?? 0);
+    $payload = json_decode((string) ($order['payload'] ?? ''), true);
+    $payload = is_array($payload) ? $payload : [];
+    $amount = (int) ($payload['topup'] ?? ($order['payable'] ?? 0));
+    if ($orderId <= 0 || $tgId <= 0 || $amount <= 0) {
+        return ['ok' => false, 'text' => 'اطلاعات شارژ کیف پول معتبر نیست.', 'credited' => false];
+    }
+
+    try {
+        $claim = DB::tx(static function () use ($orderId, $tgId, $amount, $source): array {
+            $fresh = order_get($orderId);
+            if ($fresh === null) {
+                return ['state' => 'notfound'];
+            }
+            if ((string) $fresh['status'] === 'delivered') {
+                return ['state' => 'already', 'balance' => balance_of($tgId)];
+            }
+            /* A finance-approved manual receipt intentionally moves its
+               order to review before the same idempotent credit path runs. */
+            if (!in_array((string) $fresh['status'], ['pending', 'review'], true)) {
+                return ['state' => 'closed'];
+            }
+            if (user_get($tgId) === null) {
+                return ['state' => 'user_missing'];
+            }
+
+            /* A pre-existing entry can only be this exact immutable order;
+               do not append a second ledger row while repairing delivery. */
+            $existing = DB::one("SELECT id FROM wallet_tx WHERE tg_id=? AND kind='topup' AND ref=? "
+                . 'ORDER BY id DESC LIMIT 1', [$tgId, (string) $orderId]);
+            $credited = $existing === null;
+            if ($credited) {
+                $changed = DB::update('UPDATE users SET balance = balance + ? WHERE tg_id=?',
+                    [$amount, $tgId]);
+                if ($changed !== 1) {
+                    return ['state' => 'user_missing'];
+                }
+                $balance = balance_of($tgId);
+                DB::exec('INSERT INTO wallet_tx(tg_id, amount, kind, ref, note, balance, created_at) '
+                    . 'VALUES(?,?,?,?,?,?,?)',
+                    [$tgId, $amount, 'topup', (string) $orderId,
+                        'شارژ کیف پول (' . pay_source_label($source) . ')', $balance, now_ts()]);
+            } else {
+                $balance = balance_of($tgId);
+            }
+
+            $marked = DB::update("UPDATE orders SET status='delivered', paid_at=? "
+                . "WHERE id=? AND status IN ('pending','review')", [now_ts(), $orderId]);
+            if ($marked !== 1) {
+                /* Rolling back a just-added wallet entry is safer than ever
+                   allowing an ambiguous second credit. */
+                throw new RuntimeException('topup delivery claim changed concurrently');
+            }
+            return ['state' => 'delivered', 'balance' => $balance, 'credited' => $credited];
+        });
+    } catch (Throwable $ex) {
+        log_line('warning', 'topup delivery failed: ' . $ex->getMessage(), ['order' => $orderId]);
+        return ['ok' => false, 'text' => 'شارژ کیف پول موقتاً انجام نشد.', 'credited' => false];
+    }
+
+    $state = (string) ($claim['state'] ?? 'notfound');
+    if ($state === 'already') {
+        return ['ok' => true, 'text' => '✅ این سفارش قبلاً انجام شده است.' . "\n"
+            . 'کد سفارش: <code>' . e((string) ($order['ref'] ?? '')) . '</code>', 'credited' => false];
+    }
+    if ($state !== 'delivered') {
+        return ['ok' => false, 'text' => $state === 'closed'
+            ? 'این سفارش دیگر برای شارژ کیف پول باز نیست.' : 'کاربر یا سفارش شارژ پیدا نشد.',
+            'credited' => false];
+    }
+
+    $balance = (int) ($claim['balance'] ?? balance_of($tgId));
+    if (!empty($claim['credited'])) {
+        /* Referral side effects intentionally run only for the one transaction
+           that inserted the top-up ledger entry.  A delivery repair can never
+           create a second deposit count, commission, or balance credit. */
+        try {
+            $depositNo = deposit_count_up($tgId);
+            if (ref_mode() === 'cash' && ref_cash_when() === 'purchase') {
+                referral_welcome_cash($tgId);
+            }
+            $commission = referral_deposit_payout($tgId, $amount);
+            if ($commission > 0) {
+                log_payment('referral commission', ['user' => $tgId, 'deposit' => $depositNo,
+                    'amount' => $amount, 'reward' => $commission]);
+            }
+        } catch (Throwable $ex) {
+            log_line('warning', 'referral deposit payout failed: ' . $ex->getMessage());
+        }
+        try {
+            $user = user_get($tgId);
+            post_report('💰 <b>شارژ کیف پول</b>' . "\n"
+                . '👤 ' . e(mb_substr((string) ($user['name'] ?? $tgId), 0, 22))
+                . ' <code>' . $tgId . "</code>\n"
+                . '💵 مبلغ: <b>' . money($amount) . "</b>\n"
+                . '🔀 روش: ' . e(pay_source_label($source)) . "\n"
+                . '👛 موجودی جدید: ' . money($balance), 'topup');
+        } catch (Throwable $ex) {
+            log_line('warning', 'topup report failed: ' . $ex->getMessage(), ['order' => $orderId]);
+        }
+    }
+
+    return ['ok' => true, 'text' => '✅ کیف پول شارژ شد: ' . money($amount) . "\nموجودی جدید: "
+        . money($balance), 'credited' => !empty($claim['credited'])];
+}
+
+/**
  * تسویهٔ سفارش. خروجی: [موفق, متن برای کاربر]
  * انواع: panel | topup | slot
  */
@@ -13411,34 +13533,8 @@ function settle_payment(array $order, string $source = 'wallet', int $adminId = 
             . 'برای دیدن پنل‌ها «📦 پنل‌های من» را بزنید.'];
     }
     if ($kind === 'topup') {
-        $payload = json_decode((string) $order['payload'], true) ?: [];
-        $amount = (int) ($payload['topup'] ?? $order['payable']);
-        $newBalance = add_balance($tgId, $amount, 'topup', (string) $order['id'],
-            'شارژ کیف پول (' . pay_source_label($source) . ')');
-        order_mark((int) $order['id'], 'delivered');
-        /* شمارش واریزی + پورسانت معرف (فقط واریزی اول و دوم) */
-        try {
-            $depositNo = deposit_count_up($tgId);
-            if (ref_mode() === 'cash' && ref_cash_when() === 'purchase') {
-                referral_welcome_cash($tgId);   // پاداش نقدی معلق، با اولین شارژ
-            }
-            $commission = referral_deposit_payout($tgId, $amount);
-            if ($commission > 0) {
-                log_payment('referral commission', ['user' => $tgId, 'deposit' => $depositNo,
-                    'amount' => $amount, 'reward' => $commission]);
-            }
-        } catch (Throwable $ex) {
-            log_line('warning', 'referral deposit payout failed: ' . $ex->getMessage());
-        }
-        $user = user_get($tgId);
-        post_report('💰 <b>شارژ کیف پول</b>' . "\n"
-            . '👤 ' . e(mb_substr((string) ($user['name'] ?? $tgId), 0, 22))
-            . ' <code>' . $tgId . "</code>\n"
-            . '💵 مبلغ: <b>' . money($amount) . "</b>\n"
-            . '🔀 روش: ' . e(pay_source_label($source)) . "\n"
-            . '👛 موجودی جدید: ' . money($newBalance), 'topup');
-        return [true, '✅ کیف پول شارژ شد: ' . money($amount) . "\nموجودی جدید: "
-            . money($newBalance)];
+        $topup = settle_topup_once($order, $source);
+        return [(bool) ($topup['ok'] ?? false), (string) ($topup['text'] ?? '')];
     }
     if ($kind === 'users') {
         $payload = json_decode((string) $order['payload'], true) ?: [];
@@ -19861,6 +19957,19 @@ function gw_daily_capacity_available(string $gw, int $amount): bool
     return $paid + $amount <= $limit;
 }
 
+/** Returns an available automatic card-to-card provider, if one replaced the
+    manual receipt path for buyers.  The administrator can still manage the
+    manual card setting and review existing receipts; only the buyer selector
+    is de-duplicated. */
+function gw_automatic_card_gateway(): string
+{
+    /* The requested policy is deliberately scoped to Aban's configured
+       automatic card path. Other gateways retain their existing independent
+       customer visibility and cannot silently remove the manual fallback. */
+    [$ready] = gw_readiness('iranpay4');
+    return $ready ? 'iranpay4' : '';
+}
+
 /** A visible provider must be able to receive a signed/authoritative callback. */
 function gw_readiness(string $gw): array
 {
@@ -19872,7 +19981,19 @@ function gw_readiness(string $gw): array
         return [true, []];
     }
     if ($gw === 'card') {
-        return [set_get('card_number', '') !== '', ['شماره کارت ثبت نشده']];
+        $missing = [];
+        if (!gw_on('card')) {
+            $missing[] = 'کارت‌به‌کارت دستی خاموش است';
+        }
+        if (trim(set_get('card_number', '')) === '') {
+            $missing[] = 'شماره کارت ثبت نشده';
+        }
+        $automatic = gw_automatic_card_gateway();
+        if ($automatic !== '') {
+            $missing[] = 'مسیر کارت‌به‌کارت خودکار ' . (PAY_GATEWAYS[$automatic]['label'] ?? $automatic)
+                . ' برای مشتری آماده است';
+        }
+        return [$missing === [], $missing];
     }
     $missing = [];
     if (!gw_on($gw)) {
@@ -19975,8 +20096,10 @@ function pay_set_authority(int $paymentId, string $authority, array $extra = [])
 function pay_find_by_authority(string $authority): ?array
 {
     /* Expired rows remain discoverable solely so an authoritative late provider
-       signal can be escalated to finance; pay_settle() still refuses auto-credit. */
-    return DB::one("SELECT * FROM payments WHERE authority=? AND status IN ('unpaid','expire') "
+       signal can be escalated to finance. Paid rows are included only so a
+       durable top-up delivery repair can finish after a process interruption;
+       they are never re-verified from callback data. */
+    return DB::one("SELECT * FROM payments WHERE authority=? AND status IN ('unpaid','expire','paid') "
         . 'ORDER BY id DESC LIMIT 1', [$authority]);
 }
 
@@ -20162,22 +20285,39 @@ function pay_settle(int $paymentId, string $ref = '', array $extra = [], bool $f
     if (!is_array($payment) || !is_array($order)) {
         return ['ok' => false, 'state' => 'notfound', 'text' => 'پرداخت یا سفارش پیدا نشد'];
     }
+    $recoveringDelivery = false;
     if ($state === 'already') {
-        /* A prior process may have completed delivery but stopped before its
-           cashback marker; safely repair that tiny post-settlement window. */
+        /* The provider claim is durable before delivery.  A crash or transient
+           local failure must not turn an authoritative paid top-up into a
+           permanently uncredited wallet: retry only the idempotent top-up
+           delivery claim, never a browser/client payment assertion. */
         $freshOrder = order_get((int) $order['id']) ?? $order;
-        if ((string) $freshOrder['status'] === 'delivered') {
-            pay_apply_cashback_once($payment);
+        if ((string) $freshOrder['kind'] === 'topup' && (string) $freshOrder['status'] === 'pending') {
+            $order = $freshOrder;
+            $payment = pay_get($paymentId) ?? $payment;
+            $recoveringDelivery = true;
+        } else {
+            /* A prior process may have completed delivery but stopped before
+               its cashback marker; safely repair that tiny post-settlement window. */
+            if ((string) $freshOrder['status'] === 'delivered') {
+                pay_apply_cashback_once($payment);
+            }
+            return ['ok' => true, 'state' => 'already', 'text' => 'قبلاً تأیید شده است'];
         }
-        return ['ok' => true, 'state' => 'already', 'text' => 'قبلاً تأیید شده است'];
     }
 
-    log_payment('gateway paid', [
+    log_payment($recoveringDelivery ? 'gateway paid delivery recovery' : 'gateway paid', [
         'payment' => $paymentId, 'method' => $payment['method'],
         'order' => (int) $payment['order_id'], 'tg' => (int) $payment['tg_id'],
         'ref' => $ref, 'amount' => (int) $order['payable'],
     ]);
-    [$ok, $text] = settle_payment($order, (string) $payment['method']);
+    if ((string) $order['kind'] === 'topup') {
+        $topup = settle_topup_once($order, (string) $payment['method']);
+        $ok = (bool) ($topup['ok'] ?? false);
+        $text = (string) ($topup['text'] ?? '');
+    } else {
+        [$ok, $text] = settle_payment($order, (string) $payment['method']);
+    }
     $tgId = (int) $payment['tg_id'];
     if (!$ok) {
         Tg::send($tgId, '⚠️ <b>پرداخت تأیید شد، اما انجام سفارش نیاز به بررسی دارد</b>' . "\n\n"
@@ -20881,13 +21021,19 @@ function pay_zarinpal_create(array $payment, array $order): array
 
 function pay_zarinpal_verify(array $payment, array $query): array
 {
-    $authority = (string) ($query['Authority'] ?? $query['authority'] ?? '');
+    /* A browser return may supply Authority, but it was already persisted
+       at create time.  The stored value makes an authoritative server poll
+       possible after a missed return without trusting any browser field. */
+    $authority = (string) ($query['Authority'] ?? $query['authority'] ?? $payment['authority'] ?? '');
     $status = strtoupper((string) ($query['Status'] ?? $query['status'] ?? ''));
     if ($authority === '' || !hash_equals((string) $payment['authority'], $authority)) {
         return ['ok' => false, 'state' => 'notfound',
                 'text' => 'این پرداخت به هیچ سفارشی در ربات وصل نیست.'];
     }
-    if ($status !== 'OK') {
+    /* Status is a browser-return hint. A missing status is deliberately
+       allowed for authoritative polling; an explicit failed browser return
+       keeps the existing quick failure response. */
+    if ($status !== '' && $status !== 'OK') {
         return ['ok' => false, 'state' => 'failed', 'text' => 'پرداخت لغو شد یا انجام نشد.'];
     }
     $res = pay_json_post(gw_endpoint('zarinpal', gw_endpoint_default('zarinpal'))
@@ -20953,7 +21099,9 @@ function pay_aqaye_create(array $payment, array $order): array
 
 function pay_aqaye_verify(array $payment, array $params): array
 {
-    $transid = (string) ($params['transid'] ?? '');
+    /* transid is immutable from create, so provider polling can re-check it
+       even when no form/browser callback ever arrived. */
+    $transid = (string) ($params['transid'] ?? $payment['authority'] ?? '');
     $invoice = (string) ($params['invoice_id'] ?? '');
     if ($invoice !== '' && $invoice !== (string) $payment['id']
         && !hash_equals((string) $payment['authority'], $transid)) {
@@ -21120,8 +21268,60 @@ function pay_abanpay_endpoint(): string
     return gw_https_url($endpoint) ? rtrim($endpoint, '/') : '';
 }
 
-/** Mirrors Mirza 0.9's AbanGateway contract: POST /create, Bearer API key,
-    amount/order_id/callback_url, and its canonical payment_link response. */
+/** Mirrors Mirza's public AbanGateway adapter contract: bearer POST to the
+    configured /create and /verify routes.  The configured endpoint remains
+    intentionally compatible with existing installations; an official Aban
+    hosted payment URL returned by that adapter is still a normal valid link. */
+function pay_abanpay_order_ref(array $payment): string
+{
+    $saved = trim((string) (pay_meta($payment)['order_ref'] ?? ''));
+    if ($saved !== '') {
+        return $saved;
+    }
+    /* Older rows predate the metadata snapshot. Their immutable local order
+       remains the only safe compatibility fallback for reconciliation. */
+    $order = order_get((int) ($payment['order_id'] ?? 0));
+    return trim((string) ($order['ref'] ?? ''));
+}
+
+function pay_abanpay_param(array $params, array $keys): string
+{
+    foreach ($keys as $key) {
+        $value = $params[$key] ?? null;
+        if (is_scalar($value) && trim((string) $value) !== '') {
+            return trim((string) $value);
+        }
+    }
+    return '';
+}
+
+/** A modern adapter may retain an official invoice id separately from its
+    custom authority. SQLite JSON support is not assumed, so inspect a small,
+    bounded set of open/recent Aban rows in PHP instead of issuing a broad or
+    provider-trusting lookup. */
+function pay_abanpay_find_by_invoice(string $invoiceId): ?array
+{
+    $invoiceId = trim($invoiceId);
+    if ($invoiceId === '') {
+        return null;
+    }
+    $direct = pay_find_by_authority($invoiceId);
+    if ($direct !== null && (string) $direct['method'] === 'iranpay4') {
+        return $direct;
+    }
+    $rows = DB::all("SELECT * FROM payments WHERE method='iranpay4' "
+        . "AND status IN ('unpaid','expire','paid') ORDER BY id DESC LIMIT 100");
+    foreach ($rows as $row) {
+        $create = pay_meta($row)['create'] ?? [];
+        $saved = is_array($create) ? pay_response_value($create,
+            ['invoice_id', 'data.invoice_id', 'data.invoice.id']) : '';
+        if ($saved !== '' && hash_equals($saved, $invoiceId)) {
+            return $row;
+        }
+    }
+    return null;
+}
+
 function pay_abanpay_create(array $payment, array $order): array
 {
     $endpoint = pay_abanpay_endpoint();
@@ -21135,6 +21335,10 @@ function pay_abanpay_create(array $payment, array $order): array
     $res = pay_json_post($endpoint . '/create', [
         'amount'       => (int) $payment['amount'],
         'order_id'     => (string) $order['ref'],
+        /* Mirza sends the bound Telegram buyer too.  This is not trusted for
+           settlement, but lets the compatible adapter bind a hosted invoice
+           and its provider callback to the same customer. */
+        'user_id'      => (string) $order['tg_id'],
         'callback_url' => pay_callback_url('iranpay4'),
     ], ['Authorization: Bearer ' . $key]);
     $url = pay_response_value($res, ['payment_link', 'payment_url', 'pay_url', 'url',
@@ -21143,42 +21347,83 @@ function pay_abanpay_create(array $payment, array $order): array
         return ['ok' => false, 'url' => '', 'text' => 'AbanPay: '
             . pay_error_text($res, 'لینک پرداخت معتبر برنگشت')];
     }
-    $authority = pay_response_value($res, ['authority', 'token', 'transaction_id',
-        'data.authority', 'data.token', 'data.transaction_id']);
-    /* The reference Aban contract identifies the return by order_id; authority
-       may legitimately be absent, so the immutable order reference is retained. */
+    /* Older Mirza adapters call this authority, while current adapters may
+       expose an invoice id. Preserve either as the callback lookup handle. */
+    $authority = pay_response_value($res, ['authority', 'token', 'transaction_id', 'invoice_id',
+        'data.authority', 'data.token', 'data.transaction_id', 'data.invoice_id', 'data.invoice.id']);
+    /* The reference contract identifies a payment by order_id when no opaque
+       authority is returned, so retain the immutable order reference then. */
     pay_set_authority((int) $payment['id'], $authority !== '' ? $authority : (string) $order['ref'], $res);
     return ['ok' => true, 'url' => $url, 'text' => 'AbanPay'];
 }
 
-function pay_abanpay_verify(array $payment, array $params): array
+/**
+ * Verify an Aban payment only against the configured provider adapter.  Query,
+ * form, and JSON callbacks are merely lookup hints: omitted callback fields
+ * fall back to the locally persisted invoice binding, while conflicting fields
+ * are rejected before contacting the provider.
+ */
+function pay_abanpay_verify(array $payment, array $params = []): array
 {
     $endpoint = pay_abanpay_endpoint();
-    $expectedOrder = (string) (pay_meta($payment)['order_ref'] ?? '');
-    $orderRef = trim((string) ($params['order_id'] ?? $params['order'] ?? $params['invoice_id'] ?? ''));
-    if ($endpoint === '' || $expectedOrder === '' || $orderRef === ''
-        || !hash_equals($expectedOrder, $orderRef)) {
+    $expectedOrder = pay_abanpay_order_ref($payment);
+    /* invoice_id can be either a legacy alias for our order reference or a
+       provider invoice handle. Only regard it as an order field when it is
+       literally our persisted reference; otherwise it remains a lookup hint. */
+    $suppliedOrder = pay_abanpay_param($params, ['order_id', 'order', 'merchant_order_id']);
+    $invoiceHint = pay_abanpay_param($params, ['invoice_id']);
+    if ($suppliedOrder === '' && $invoiceHint !== '' && $expectedOrder !== ''
+        && hash_equals($expectedOrder, $invoiceHint)) {
+        $suppliedOrder = $invoiceHint;
+    }
+    if ($endpoint === '' || $expectedOrder === ''
+        || ($suppliedOrder !== '' && !hash_equals($expectedOrder, $suppliedOrder))) {
         return ['ok' => false, 'state' => 'notfound', 'text' => 'این پرداخت به سفارش دیگری تعلق دارد.'];
     }
-    $authority = trim((string) ($params['authority'] ?? $params['token'] ?? $payment['authority'] ?? ''));
+    $orderRef = $expectedOrder;
+
+    $storedAuthority = trim((string) ($payment['authority'] ?? ''));
+    $suppliedAuthority = pay_abanpay_param($params,
+        ['authority', 'token', 'transaction_id', 'payment_id']);
+    if ($suppliedAuthority === '' && $storedAuthority !== '' && $storedAuthority !== $expectedOrder) {
+        $suppliedAuthority = $invoiceHint;
+    }
+    /* If creation stored a genuine opaque authority, a callback cannot swap it
+       for another invoice.  A legacy fallback equal to order_ref intentionally
+       accepts the provider's later authority and remains backward compatible. */
+    if ($suppliedAuthority !== '' && $storedAuthority !== '' && $storedAuthority !== $expectedOrder
+        && !hash_equals($storedAuthority, $suppliedAuthority)) {
+        return ['ok' => false, 'state' => 'notfound', 'text' => 'شناسهٔ پرداخت ابان با فاکتور مطابقت ندارد.'];
+    }
+    /* A legacy fallback authority equal to our order reference was not an
+       opaque provider token.  Preserve Mirza's empty-authority verify form in
+       that case so an adapter that reconciles by order_id is not fed a forged
+       token. Genuine persisted provider authorities remain usable for polls. */
+    $authority = $suppliedAuthority !== '' ? $suppliedAuthority
+        : ($storedAuthority === $expectedOrder ? '' : $storedAuthority);
+
     $res = pay_json_post($endpoint . '/verify', [
         'order_id'  => $orderRef,
         'authority' => $authority,
         'amount'    => (int) $payment['amount'],
     ], ['Authorization: Bearer ' . gw_key('iranpay4')]);
-    $providerOrder = pay_response_value($res, ['order_id', 'data.order_id']);
-    $providerAmount = pay_response_value($res, ['amount', 'data.amount']);
+    $providerOrder = pay_response_value($res, ['order_id', 'merchant_order_id',
+        'data.order_id', 'data.merchant_order_id']);
+    $providerAmount = pay_response_value($res, ['amount', 'paid_amount', 'amount_rial', 'payable_rial',
+        'data.amount', 'data.paid_amount', 'data.amount_rial', 'data.payable_rial']);
     $paid = gw_amount_toman((float) $providerAmount, (int) $payment['amount']);
-    $providerState = strtolower(pay_response_value($res, ['status', 'data.status', 'message', 'data.message']));
-    $success = !empty($res['success']) || in_array($providerState, ['paid', 'verified', 'success', 'completed'], true);
+    $providerState = strtolower(pay_response_value($res, ['status', 'message',
+        'data.status', 'data.message']));
+    $success = !empty($res['success']) || !empty($res['data']['success'])
+        || in_array($providerState, ['paid', 'verified', 'success', 'completed'], true);
     if ((int) ($res['_status'] ?? 0) !== 200 || !$success
         || !hash_equals($orderRef, $providerOrder)
         || $paid + 0.000001 < (int) $payment['amount']) {
         return ['ok' => false, 'state' => 'failed',
             'text' => 'AbanPay: مبلغ، وضعیت یا کد سفارش تأیید نشد.'];
     }
-    $reference = pay_response_value($res, ['ref_id', 'reference', 'transaction_id',
-        'authority', 'data.ref_id', 'data.reference', 'data.transaction_id']);
+    $reference = pay_response_value($res, ['ref_id', 'reference', 'transaction_id', 'authority',
+        'data.ref_id', 'data.reference', 'data.transaction_id', 'data.authority']);
     return pay_accept($payment, $paid, $reference !== '' ? $reference : $authority, $res);
 }
 
@@ -21439,6 +21684,13 @@ function pay_tetrapay_start_return(int $tgId, int|string $chatId, string $payloa
         return false;
     }
     if ((string) $payment['status'] === 'paid') {
+        /* A payment that was authoritatively verified before a process stopped
+           may still have a pending top-up order.  This enters only the durable
+           local delivery repair; it never treats the Telegram return as proof. */
+        $repair = pay_settle((int) $payment['id']);
+        if (($repair['state'] ?? '') === 'success') {
+            return true;
+        }
         Tg::send($chatId, '✅ این پرداخت تتراپی قبلاً به‌صورت قطعی تأیید شده است.', home_kb($tgId));
         return true;
     }
@@ -21503,7 +21755,11 @@ function pay_tetrapay_webhook(array $body, string $raw, string $signature): arra
         return ['ok' => false, 'code' => 404, 'text' => 'payment not found'];
     }
     if ((string) $payment['status'] === 'paid') {
-        return ['ok' => true, 'code' => 200, 'text' => 'already'];
+        /* Signed retries may be the first event after an interrupted local
+           delivery. pay_settle() can safely repair only a pending top-up. */
+        $repair = pay_settle((int) $payment['id']);
+        return ['ok' => (bool) ($repair['ok'] ?? false), 'code' => 200,
+            'text' => (string) (($repair['state'] ?? '') === 'success' ? 'success' : 'already')];
     }
     if (!in_array((string) $payment['status'], ['unpaid', 'expire'], true)) {
         return ['ok' => false, 'code' => 409, 'text' => 'payment closed'];
@@ -22190,27 +22446,68 @@ function pay_note_message(int $orderId, string $method, int $messageId): void
         [json_encode($meta, JSON_UNESCAPED_UNICODE), (int) $row['id']]);
 }
 
-function payments_poll(): int
+/**
+ * A provider claim is made before order delivery.  This bounded repair sweep
+ * handles the only safe unfinished case: a paid provider top-up whose local
+ * order is still pending.  settle_topup_once() owns the durable wallet ledger
+ * claim, so a sweep can never append a second wallet credit.
+ */
+function payments_recover_paid_topups(int $limit = 15): int
 {
-    $settled = 0;
-    $rows = DB::all("SELECT * FROM payments WHERE status='unpaid' "
-        . "AND method IN ('trx','plisio','nowpayment','tetrapay') AND authority<>'' "
-        . 'ORDER BY id LIMIT 15');
+    $recovered = 0;
+    $rows = DB::all("SELECT p.* FROM payments p JOIN orders o ON o.id=p.order_id "
+        . "WHERE p.status='paid' AND o.status='pending' AND o.kind='topup' "
+        . 'ORDER BY p.paid_at, p.id LIMIT ' . max(1, min(50, $limit)));
     foreach ($rows as $row) {
         try {
-            $result = match ((string) $row['method']) {
-                'trx'        => pay_trx_verify($row),
-                'plisio'     => pay_plisio_status($row),
-                'nowpayment' => pay_nowpay_status($row),
-                'tetrapay'   => pay_tetrapay_verify($row),
-                default      => ['ok' => false, 'state' => 'waiting'],
-            };
+            $result = pay_settle((int) $row['id']);
+            if (($result['ok'] ?? false) && ($result['state'] ?? '') === 'success') {
+                $recovered++;
+            }
         } catch (Throwable $ex) {
-            log_line('warning', 'payment poll failed: ' . $ex->getMessage());
-            continue;
+            log_line('warning', 'paid topup delivery recovery failed: ' . $ex->getMessage(),
+                ['payment' => (int) ($row['id'] ?? 0)]);
         }
-        if (($result['ok'] ?? false) && ($result['state'] ?? '') === 'success') {
-            $settled++;
+    }
+    return $recovered;
+}
+
+function payments_poll(): int
+{
+    /* A missed return/webhook must not strand a provider-confirmed invoice.
+       Each method below has a documented server-side status/verify operation
+       using an immutable value saved at checkout creation.  IranPay1/2 need a
+       provider-issued authority not available before their callback, Variza is
+       signed-webhook-only, and Stars is Telegram-authoritative, so none is
+       guessed or polled with invented endpoints. */
+    $settled = payments_recover_paid_topups();
+    $pollable = ['zarinpal', 'aqayepardakht', 'iranpay4', 'tetrapay', 'nowpayment', 'plisio', 'trx'];
+    foreach ($pollable as $method) {
+        /* Separate bounded queues mean a backlog at one provider cannot starve
+           Aban or Tetra reconciliation. The worker invokes this sweep every
+           five minutes, so this remains a fallback rather than a callback loop. */
+        $rows = DB::all("SELECT * FROM payments WHERE status='unpaid' AND method=? "
+            . "AND authority<>'' ORDER BY id LIMIT 10", [$method]);
+        foreach ($rows as $row) {
+            try {
+                $result = match ($method) {
+                    'zarinpal'      => pay_zarinpal_verify($row, ['Authority' => (string) $row['authority']]),
+                    'aqayepardakht' => pay_aqaye_verify($row, ['transid' => (string) $row['authority']]),
+                    'iranpay4'      => pay_abanpay_verify($row),
+                    'tetrapay'      => pay_tetrapay_verify($row),
+                    'nowpayment'    => pay_nowpay_status($row),
+                    'plisio'        => pay_plisio_status($row),
+                    'trx'           => pay_trx_verify($row),
+                    default         => ['ok' => false, 'state' => 'waiting'],
+                };
+            } catch (Throwable $ex) {
+                log_line('warning', 'payment poll failed: ' . $ex->getMessage(),
+                    ['payment' => (int) ($row['id'] ?? 0), 'method' => $method]);
+                continue;
+            }
+            if (($result['ok'] ?? false) && ($result['state'] ?? '') === 'success') {
+                $settled++;
+            }
         }
     }
     return $settled;
@@ -22232,6 +22529,35 @@ function web_input(): array
         'get'  => $_GET ?? [],
         'post' => $_POST ?? [],
     ];
+}
+
+/** Normalize callback lookup hints from browser query/form returns and modern
+    provider JSON webhooks. Values remain untrusted: every route below still
+    calls its provider verify/status API (or checks a documented signature)
+    before it can settle a local payment. */
+function web_callback_fields(array $input): array
+{
+    $fields = [];
+    foreach (['get', 'post', 'json'] as $source) {
+        $part = is_array($input[$source] ?? null) ? $input[$source] : [];
+        $nested = is_array($part['data'] ?? null) ? $part['data'] : [];
+        $fields = array_replace($fields, $nested, $part);
+    }
+    return $fields;
+}
+
+function web_callback_value(array $fields, array $keys): string
+{
+    foreach ($keys as $key) {
+        $value = $fields[$key] ?? null;
+        if (is_scalar($value)) {
+            $value = trim((string) $value);
+            if ($value !== '') {
+                return mb_substr($value, 0, 255);
+            }
+        }
+    }
+    return '';
 }
 
 function web_header(string $name): string
@@ -22327,6 +22653,11 @@ function web_handle(): void
         return;
     }
     $gw = substr($path, 5);
+    /* Existing Aban installations use /pay/iranpay4. Accept the common
+       webhook suffix too without changing the configured callback address. */
+    if ($gw === 'iranpay4/webhook') {
+        $gw = 'iranpay4';
+    }
 
     /*
      * قاعدهٔ طلایی این بخش: هیچ پرداختی با «برگشتن کاربر» موفق نمی‌شود.
@@ -22375,21 +22706,34 @@ function web_handle(): void
         return;
     }
 
-    /* ── بازگشت کاربر از درگاه: پیدا کردن پرداخت ──────────────────────── */
+    /* ── بازگشت/وب‌هوک درگاه: پیدا کردن پرداخت ─────────────────────── */
+    $fields = web_callback_fields($input);
     $payment = null;
-    $authority = (string) ($input['get']['Authority'] ?? $input['get']['authority']
-        ?? $input['post']['authority'] ?? $input['get']['token'] ?? $input['post']['token']
-        ?? $input['get']['txn_id'] ?? '');
-    if ($authority !== '') {
-        $payment = pay_find_by_authority($authority);
+    $authority = web_callback_value($fields,
+        ['Authority', 'authority', 'token', 'txn_id', 'transid', 'hashid', 'Hash_id', 'slug']);
+    if ($authority === '' && $gw === 'iranpay4') {
+        $authority = web_callback_value($fields, ['invoice_id', 'payment_id']);
     }
-    if ($payment === null && $gw === 'aqayepardakht' && isset($input['post']['invoice_id'])) {
-        $payment = pay_get((int) $input['post']['invoice_id']);
+    if ($authority !== '') {
+        $candidate = $gw === 'iranpay4'
+            ? pay_abanpay_find_by_invoice($authority) : pay_find_by_authority($authority);
+        /* An identifier from one provider must never route another provider's
+           row to a different verifier. */
+        if ($candidate !== null && (string) $candidate['method'] === $gw) {
+            $payment = $candidate;
+        }
+    }
+    if ($payment === null && $gw === 'aqayepardakht') {
+        $invoice = web_callback_value($fields, ['invoice_id']);
+        if ($invoice !== '' && ctype_digit($invoice)) {
+            $candidate = pay_get((int) $invoice);
+            if ($candidate !== null && (string) $candidate['method'] === $gw) {
+                $payment = $candidate;
+            }
+        }
     }
     if ($payment === null && in_array($gw, ['iranpay2', 'iranpay4', 'variza'], true)) {
-        $orderRef = (string) ($input['get']['order_id'] ?? $input['post']['order_id']
-            ?? $input['get']['order'] ?? $input['post']['order']
-            ?? $input['get']['invoice_id'] ?? $input['post']['invoice_id'] ?? '');
+        $orderRef = web_callback_value($fields, ['order_id', 'order', 'merchant_order_id', 'invoice_id']);
         if ($orderRef !== '') {
             $order = DB::one('SELECT * FROM orders WHERE ref=?', [$orderRef]);
             if ($order !== null) {
@@ -22399,7 +22743,7 @@ function web_handle(): void
         }
     }
     if ($payment === null && $gw === 'plisio') {
-        $orderRef = (string) ($input['get']['order_number'] ?? '');
+        $orderRef = web_callback_value($fields, ['order_number']);
         if ($orderRef !== '') {
             $order = DB::one('SELECT * FROM orders WHERE ref=?', [$orderRef]);
             if ($order !== null) {
@@ -22426,20 +22770,29 @@ function web_handle(): void
     $order = order_get((int) $payment['order_id']);
     $orderRef = $order !== null ? (string) $order['ref'] : '';
 
-    /* اگر قبلاً تأیید شده، همان را نشان بدهید */
+    /* A prior authoritative provider verify may have claimed this payment but
+       been interrupted before top-up delivery. Re-enter only the local,
+       idempotent delivery claim; callback fields are not trusted or reused. */
     if ((string) $payment['status'] === 'paid') {
-        web_html(pay_result_page('already', $orderRef, (int) $payment['amount']));
+        $repair = pay_settle((int) $payment['id']);
+        $repairState = (string) ($repair['state'] ?? 'already');
+        if ($input['json'] !== [] || str_contains(strtolower(web_header('Accept')), 'json')) {
+            web_json(200, ['status' => (bool) ($repair['ok'] ?? false), 'state' => $repairState]);
+            return;
+        }
+        web_html(pay_result_page($repairState === 'success' ? 'success' : 'already',
+            $orderRef, (int) $payment['amount']));
         return;
     }
 
     try {
         $result = match ($gw) {
-            'zarinpal'      => pay_zarinpal_verify($payment, $input['get']),
-            'aqayepardakht' => pay_aqaye_verify($payment, $input['post'] + $input['get']),
-            'iranpay1'      => pay_floypay_verify($payment, $input['json'] + $input['get'] + $input['post']),
-            'iranpay2'      => pay_cubepay_verify($payment, $input['json'] + $input['get'] + $input['post']),
-            'iranpay4'      => pay_abanpay_verify($payment, $input['get'] + $input['post']),
-            'tetrapay'      => pay_tetrapay_verify($payment, $input['get'] + $input['post']),
+            'zarinpal'      => pay_zarinpal_verify($payment, $fields),
+            'aqayepardakht' => pay_aqaye_verify($payment, $fields),
+            'iranpay1'      => pay_floypay_verify($payment, $fields),
+            'iranpay2'      => pay_cubepay_verify($payment, $fields),
+            'iranpay4'      => pay_abanpay_verify($payment, $fields),
+            'tetrapay'      => pay_tetrapay_verify($payment, $fields),
             'plisio'        => pay_plisio_status($payment),
             'nowpayment'    => pay_nowpay_status($payment),
             'variza'        => ['ok' => false, 'state' => 'waiting',
@@ -22452,10 +22805,11 @@ function web_handle(): void
         $result = ['ok' => false, 'state' => 'waiting', 'text' => 'خطا در تأیید پرداخت'];
     }
 
-    /* درگاه‌هایی که جواب JSON می‌خواهند */
-    if (in_array($gw, ['iranpay2', 'iranpay4', 'nowpayment', 'plisio'], true)
-        && (str_contains(web_header('Accept'), 'json') || $input['json'] !== [])) {
-        web_json(200, ['status' => (bool) ($result['ok'] ?? false)]);
+    /* JSON provider callbacks receive a compact machine response. Browser
+       returns retain their human result page. */
+    if ($input['json'] !== [] || str_contains(strtolower(web_header('Accept')), 'json')) {
+        web_json(200, ['status' => (bool) ($result['ok'] ?? false),
+            'state' => (string) ($result['state'] ?? 'waiting')]);
         return;
     }
 

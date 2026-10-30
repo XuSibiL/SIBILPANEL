@@ -4,12 +4,12 @@
 
 **ربات فروش پنل پاسارگارد (PasarGuard) — نسخهٔ PHP**
 
-**نسخهٔ پایدار: `3.18.4`**
+**نسخهٔ پایدار: `3.18.5`**
 
 فروش پنل حجمی/ساعتی، کیف پول، درگاه‌های پرداخت ایرانی و کریپتو، احراز هویت دو سطحی،
 کد تخفیف، سیستم دعوت دوستان و پنل مدیریت کامل — بدون فریم‌ورک، بدون Composer.
 
-![version](https://img.shields.io/badge/version-3.18.4-2ea043)
+![version](https://img.shields.io/badge/version-3.18.5-2ea043)
 ![php](https://img.shields.io/badge/PHP-8.1%2B-777bb4)
 ![db](https://img.shields.io/badge/SQLite-PDO-003b57)
 ![license](https://img.shields.io/badge/license-MIT-blue)

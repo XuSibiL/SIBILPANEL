@@ -76,7 +76,9 @@ foreach ($rows as $row) {
         $texts[] = (string) ($button['text'] ?? '');
     }
 }
-$expectedGateways = ['card', 'plisio', 'nowpayment', 'trx', 'iranpay1', 'iranpay2',
+/* A customer-ready automatic Aban card route replaces the duplicate manual
+   receipt choice. The administrator settings remain available for fallback. */
+$expectedGateways = ['plisio', 'nowpayment', 'trx', 'iranpay1', 'iranpay2',
     'iranpay4', 'tetrapay', 'aqayepardakht', 'zarinpal', 'variza', 'stars'];
 $expectedCallbacks = array_map(static fn(string $gw): string => 'inv:pay:' . $order['id'] . ':' . $gw,
     $expectedGateways);
@@ -90,6 +92,19 @@ okselector($callbacks === $expectedCallbacks, 'gateway order and final close cal
 okselector($texts === $expectedTexts, 'gateway captions and exact close-list caption match Mirza');
 okselector(!in_array('nav:back', $callbacks, true) && !in_array('nav:back:user', $callbacks, true),
     'no generic back row is appended after the close-list row');
+$withAban = gw_available($uid);
+okselector(!isset($withAban['card']) && isset($withAban['iranpay4']),
+    'customer-ready Aban card path hides the duplicate manual card method');
+set_put('pay_iranpay4_on', '0');
+$manualFallback = gw_available($uid);
+okselector(isset($manualFallback['card']),
+    'manual card-to-card remains available when no automatic card gateway is ready');
+set_put('pay_card_on', '0');
+$manualDisabled = gw_available($uid);
+okselector(!isset($manualDisabled['card']),
+    'turning the manual card gateway off removes it from the buyer selector');
+set_put('pay_card_on', '1');
+set_put('pay_iranpay4_on', '1');
 
 $invoiceButtons = invoice_kb($order, $uid);
 $invoiceCallbacks = [];

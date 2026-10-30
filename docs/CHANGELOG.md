@@ -1,5 +1,11 @@
 # تغییرها
 
+## 3.18.5 — 2026-10-31
+
+- Aban Gateway now uses Mirza-compatible buyer binding, accepts JSON/form/query provider callbacks only as lookup hints, verifies server-side, and has bounded authoritative reconciliation for missed callbacks.
+- Provider-confirmed wallet top-ups, including TetraPay, now have a durable exactly-once delivery repair path; ZarinPal and AghayePardakht can re-verify their saved authorities when a return is missed.
+- The manual card-to-card choice now disappears from the customer selector when the configured automatic Aban card route is ready, while remaining as the fallback otherwise.
+
 ## 3.18.4 — 2026-10-30
 - **TetraPay v1 بازگشت رباتی:** برای درگاه Telegram، `callback_url` اکنون دقیقاً
   `https://t.me/<bot>?start=…` با payload یکتای محلی است؛ این همان فرم مستند

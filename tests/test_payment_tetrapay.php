@@ -206,6 +206,33 @@ okpay(($hookAgain['ok'] ?? false) === true && ($hookAgain['text'] ?? '') === 'al
 okpay(balance_of($uid) === 50000, 'webhook adds the second top-up exactly once');
 okpay(($bad['ok'] ?? true) === false && ($bad['code'] ?? 0) === 403, 'invalid webhook signature is rejected');
 
+/* Simulate the narrow failure window this release repairs: provider verify
+   already made a Tetra payment paid, but the process stopped before wallet
+   delivery. The buyer-bound Telegram return can only re-enter the durable
+   local top-up claim; it performs no new provider verify and cannot duplicate. */
+$recoveryOrder = create_order($uid, 'topup', 25000, null, ['topup' => 25000]);
+$recoveryPayment = pay_new($recoveryOrder, 'tetrapay', 25000);
+pay_prepare($recoveryPayment, $recoveryOrder);
+$recoveryPayment = pay_get((int) $recoveryPayment['id']) ?? $recoveryPayment;
+$recoveryStart = tetrapay_start_payload($recoveryPayment);
+DB::exec("UPDATE payments SET status='paid', paid_at=? WHERE id=?", [now_ts(), (int) $recoveryPayment['id']]);
+$recoveryCallsBefore = count($calls);
+/* The five-minute server sweep is the callback-independent recovery route. */
+$recoverySweep = payments_poll();
+$recoverySweepAgain = payments_poll();
+/* A later buyer return sees only the already-authoritative paid row; it cannot
+   invoke provider verification or create another credit. */
+$recoveryFirst = pay_tetrapay_start_return($uid, $uid, $recoveryStart);
+$recoveryAgain = pay_tetrapay_start_return($uid, $uid, $recoveryStart);
+$recoveryOrderAfter = order_get((int) $recoveryOrder['id']) ?? [];
+$recoveryTx = (int) DB::val("SELECT COUNT(*) FROM wallet_tx WHERE tg_id=? AND kind='topup' AND ref=?",
+    [$uid, (string) $recoveryOrder['id']], 0);
+echo "\n== paid Tetra delivery recovery ==\n";
+okpay($recoverySweep === 1 && $recoverySweepAgain === 0 && $recoveryFirst && $recoveryAgain
+    && ($recoveryOrderAfter['status'] ?? '') === 'delivered'
+    && balance_of($uid) === 75000 && $recoveryTx === 1 && count($calls) === $recoveryCallsBefore,
+    'a paid Tetra row with pending wallet delivery is repaired once by the server sweep without treating Telegram return as payment proof');
+
 /* The administrative check is intentionally local-only: no checkout is created. */
 $beforeCheck = count($calls);
 $safe = gw_live_test('tetrapay');

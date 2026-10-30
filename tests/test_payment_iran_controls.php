@@ -202,11 +202,17 @@ $GLOBALS['panel_http_mock'] = static function (string $method, string $url, arra
     $request = json_decode((string) $body, true) ?: [];
     if ($method === 'POST' && $url === 'https://aban.example.test/api/create') {
         return [json_encode(['payment_link' => 'https://pay.example.test/aban-token',
-            'authority' => 'aban-token']), '', 201];
+            'authority' => 'aban-token', 'invoice_id' => 'inv-' . ($request['order_id'] ?? '')]), '', 201];
     }
     if ($method === 'POST' && $url === 'https://aban.example.test/api/verify') {
         return [json_encode(['success' => true, 'order_id' => $request['order_id'] ?? '',
             'amount' => $request['amount'] ?? 0, 'reference' => 'aban-ref-1']), '', 200];
+    }
+    if ($method === 'POST' && str_ends_with($url, '/pg/v4/payment/verify.json')) {
+        return [json_encode(['data' => ['code' => 100, 'ref_id' => 'zarin-poll-ref']]), '', 200];
+    }
+    if ($method === 'POST' && str_ends_with($url, '/api/v2/verify')) {
+        return [json_encode(['code' => '1']), '', 200];
     }
     return [json_encode(['error' => 'not found']), '', 404];
 };
@@ -221,6 +227,7 @@ $abanCreate = pay_start($abanOrder, 'iranpay4');
 $abanPayment = DB::one("SELECT * FROM payments WHERE order_id=? AND method='iranpay4'", [(int) $abanOrder['id']]);
 $abanCreateBody = json_decode((string) ($abanCalls[0][3] ?? ''), true) ?: [];
 $abanHeaders = implode("\n", $abanCalls[0][2] ?? []);
+$abanInvoiceLookup = pay_abanpay_find_by_invoice('inv-' . (string) $abanOrder['ref']);
 $abanBalanceBeforeVerify = balance_of($abanUid);
 $abanVerify = pay_abanpay_verify($abanPayment ?? [], [
     'order_id' => (string) $abanOrder['ref'], 'authority' => 'aban-token',
@@ -228,13 +235,109 @@ $abanVerify = pay_abanpay_verify($abanPayment ?? [], [
 okcontrol(($abanCreate['ok'] ?? false) === true && ($abanCreate['url'] ?? '') === 'https://pay.example.test/aban-token',
     'AbanPay creates the hosted payment link');
 okcontrol(($abanCreateBody['order_id'] ?? '') === (string) $abanOrder['ref']
+    && ($abanCreateBody['user_id'] ?? '') === (string) $abanUid
     && ($abanCreateBody['callback_url'] ?? '') === 'https://panel.example.test/pay/iranpay4'
     && str_contains($abanHeaders, 'Authorization: Bearer aban-api-key'),
-    'AbanPay create payload and bearer authorization match the provider contract');
-okcontrol($abanBalanceBeforeVerify === 0,
-    'AbanPay creation alone does not produce an early wallet credit');
+    'AbanPay create payload, buyer binding, and bearer authorization match Mirza adapter contract');
+okcontrol($abanBalanceBeforeVerify === 0 && (int) ($abanInvoiceLookup['id'] ?? 0) === (int) ($abanPayment['id'] ?? 0),
+    'AbanPay creation alone does not produce an early wallet credit and retains invoice lookup binding');
 okcontrol(($abanVerify['state'] ?? '') === 'success' && balance_of($abanUid) === 25000,
     'AbanPay verify matching order and amount settles exactly once');
+
+/* The deployed adapter may deliver a provider JSON body rather than a browser
+   query/form return. Nested data remains only a lookup hint; verify performs
+   the authoritative order and amount check. */
+$abanJsonOrder = create_order($abanUid, 'topup', 25000, null, ['topup' => 25000]);
+$abanJsonCreate = pay_start($abanJsonOrder, 'iranpay4');
+$abanJsonPayment = DB::one("SELECT * FROM payments WHERE order_id=? AND method='iranpay4'",
+    [(int) $abanJsonOrder['id']]);
+$abanJsonFields = web_callback_fields(['get' => [], 'post' => [], 'raw' => '{fixture}',
+    'json' => ['event' => 'payment.paid', 'data' => ['order_id' => (string) $abanJsonOrder['ref'],
+        'authority' => 'aban-token']]]);
+$abanJsonBefore = balance_of($abanUid);
+$abanJsonVerify = pay_abanpay_verify($abanJsonPayment ?? [], $abanJsonFields);
+$abanJsonRepeat = pay_abanpay_verify(pay_get((int) ($abanJsonPayment['id'] ?? 0)) ?? [], $abanJsonFields);
+okcontrol(($abanJsonCreate['ok'] ?? false) === true
+    && ($abanJsonFields['order_id'] ?? '') === (string) $abanJsonOrder['ref']
+    && ($abanJsonVerify['state'] ?? '') === 'success'
+    && ($abanJsonRepeat['state'] ?? '') === 'already'
+    && balance_of($abanUid) === $abanJsonBefore + 25000,
+    'nested JSON Aban callback is server-verified and credits its bound top-up once');
+
+$abanMismatchOrder = create_order($abanUid, 'topup', 25000, null, ['topup' => 25000]);
+$abanMismatchCreate = pay_start($abanMismatchOrder, 'iranpay4');
+$abanMismatchPayment = DB::one("SELECT * FROM payments WHERE order_id=? AND method='iranpay4'",
+    [(int) $abanMismatchOrder['id']]);
+$abanMismatchBefore = balance_of($abanUid);
+$abanMismatch = pay_abanpay_verify($abanMismatchPayment ?? [],
+    ['order_id' => 'OTHER-ORDER', 'authority' => 'aban-token']);
+okcontrol(($abanMismatchCreate['ok'] ?? false) === true && ($abanMismatch['ok'] ?? true) === false
+    && ($abanMismatch['state'] ?? '') === 'notfound'
+    && balance_of($abanUid) === $abanMismatchBefore,
+    'mismatched Aban callback data cannot select or credit another order');
+/* Keep this deliberately invalid fixture out of the later real-provider poll;
+   a provider-side verify for its own legitimate order would of course be able
+   to settle it, independently of the rejected forged callback. */
+if ($abanMismatchPayment !== null) {
+    DB::exec("UPDATE payments SET status='expire' WHERE id=?", [(int) $abanMismatchPayment['id']]);
+    DB::exec("UPDATE orders SET status='canceled' WHERE id=?", [(int) $abanMismatchOrder['id']]);
+}
+
+/* A missed callback must be repaired by the bounded authoritative polling
+   fallback. Clear the current metadata snapshot to exercise legacy rows too. */
+$abanPollOrder = create_order($abanUid, 'topup', 25000, null, ['topup' => 25000]);
+$abanPollCreate = pay_start($abanPollOrder, 'iranpay4');
+$abanPollPayment = DB::one("SELECT * FROM payments WHERE order_id=? AND method='iranpay4'",
+    [(int) $abanPollOrder['id']]);
+$abanPollMeta = $abanPollPayment ? pay_meta($abanPollPayment) : [];
+unset($abanPollMeta['order_ref']);
+if ($abanPollPayment !== null) {
+    /* Older SIBIL rows stored the local order reference when the adapter did
+       not return an opaque authority. Reconciliation must retain Mirza's blank
+       authority verify form while binding the order on the server. */
+    DB::exec('UPDATE payments SET authority=? WHERE id=?', [(string) $abanPollOrder['ref'],
+        (int) $abanPollPayment['id']]);
+    pay_save_meta((int) $abanPollPayment['id'], $abanPollMeta);
+}
+$abanPollBefore = balance_of($abanUid);
+$abanPollSettled = payments_poll();
+$abanPollAgain = payments_poll();
+$abanPollAfter = $abanPollPayment ? pay_get((int) $abanPollPayment['id']) : null;
+$abanPollOrderAfter = order_get((int) $abanPollOrder['id']) ?? [];
+$abanPollTx = (int) DB::val("SELECT COUNT(*) FROM wallet_tx WHERE tg_id=? AND kind='topup' AND ref=?",
+    [$abanUid, (string) ($abanPollOrder['id'] ?? 0)], 0);
+okcontrol(($abanPollCreate['ok'] ?? false) === true && $abanPollSettled >= 1 && $abanPollAgain === 0
+    && ($abanPollAfter['status'] ?? '') === 'paid' && ($abanPollOrderAfter['status'] ?? '') === 'delivered'
+    && balance_of($abanUid) === $abanPollBefore + 25000 && $abanPollTx === 1,
+    'Aban authoritative poll repairs a missed callback once, including a legacy row without order metadata');
+
+/* ZarinPal and AghayePardakht save their provider authorities at creation, so
+   their documented server verify APIs are also eligible for safe fallback
+   reconciliation rather than trusting a missing browser return. */
+echo "\n== provider-authoritative fallback reconciliation ==\n";
+set_put('pay_zarinpal_key', 'zarin-poll-key');
+set_put('pay_aqayepardakht_key', 'aqaye-poll-key');
+$zarinUid = 810007;
+$aqayeUid = 810008;
+user_ensure($zarinUid, 'Zarin Poll', 'zarinpoll');
+user_ensure($aqayeUid, 'Aqaye Poll', 'aqayepoll');
+$zarinOrder = create_order($zarinUid, 'topup', 25000, null, ['topup' => 25000]);
+$aqayeOrder = create_order($aqayeUid, 'topup', 25000, null, ['topup' => 25000]);
+$zarinPayment = pay_new($zarinOrder, 'zarinpal', 25000);
+$aqayePayment = pay_new($aqayeOrder, 'aqayepardakht', 25000);
+pay_prepare($zarinPayment, $zarinOrder);
+pay_prepare($aqayePayment, $aqayeOrder);
+pay_set_authority((int) $zarinPayment['id'], 'zarin-poll-authority');
+pay_set_authority((int) $aqayePayment['id'], 'aqaye-poll-transid');
+$providerPoll = payments_poll();
+$providerPollAgain = payments_poll();
+$zarinAfter = pay_get((int) $zarinPayment['id']) ?? [];
+$aqayeAfter = pay_get((int) $aqayePayment['id']) ?? [];
+okcontrol($providerPoll >= 2 && $providerPollAgain === 0
+    && ($zarinAfter['status'] ?? '') === 'paid' && ($aqayeAfter['status'] ?? '') === 'paid'
+    && balance_of($zarinUid) === 25000 && balance_of($aqayeUid) === 25000,
+    'stored provider authorities let ZarinPal and AghayePardakht verify and credit exactly once without a return page');
+
 $abanLateOrder = create_order($abanUid, 'topup', 25000, null, ['topup' => 25000]);
 $abanLateCreate = pay_start($abanLateOrder, 'iranpay4');
 $abanLatePayment = DB::one("SELECT * FROM payments WHERE order_id=? AND method='iranpay4'",

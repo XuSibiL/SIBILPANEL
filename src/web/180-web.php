@@ -19,6 +19,35 @@ function web_input(): array
     ];
 }
 
+/** Normalize callback lookup hints from browser query/form returns and modern
+    provider JSON webhooks. Values remain untrusted: every route below still
+    calls its provider verify/status API (or checks a documented signature)
+    before it can settle a local payment. */
+function web_callback_fields(array $input): array
+{
+    $fields = [];
+    foreach (['get', 'post', 'json'] as $source) {
+        $part = is_array($input[$source] ?? null) ? $input[$source] : [];
+        $nested = is_array($part['data'] ?? null) ? $part['data'] : [];
+        $fields = array_replace($fields, $nested, $part);
+    }
+    return $fields;
+}
+
+function web_callback_value(array $fields, array $keys): string
+{
+    foreach ($keys as $key) {
+        $value = $fields[$key] ?? null;
+        if (is_scalar($value)) {
+            $value = trim((string) $value);
+            if ($value !== '') {
+                return mb_substr($value, 0, 255);
+            }
+        }
+    }
+    return '';
+}
+
 function web_header(string $name): string
 {
     $key = 'HTTP_' . strtoupper(str_replace('-', '_', $name));
@@ -112,6 +141,11 @@ function web_handle(): void
         return;
     }
     $gw = substr($path, 5);
+    /* Existing Aban installations use /pay/iranpay4. Accept the common
+       webhook suffix too without changing the configured callback address. */
+    if ($gw === 'iranpay4/webhook') {
+        $gw = 'iranpay4';
+    }
 
     /*
      * قاعدهٔ طلایی این بخش: هیچ پرداختی با «برگشتن کاربر» موفق نمی‌شود.
@@ -160,21 +194,34 @@ function web_handle(): void
         return;
     }
 
-    /* ── بازگشت کاربر از درگاه: پیدا کردن پرداخت ──────────────────────── */
+    /* ── بازگشت/وب‌هوک درگاه: پیدا کردن پرداخت ─────────────────────── */
+    $fields = web_callback_fields($input);
     $payment = null;
-    $authority = (string) ($input['get']['Authority'] ?? $input['get']['authority']
-        ?? $input['post']['authority'] ?? $input['get']['token'] ?? $input['post']['token']
-        ?? $input['get']['txn_id'] ?? '');
-    if ($authority !== '') {
-        $payment = pay_find_by_authority($authority);
+    $authority = web_callback_value($fields,
+        ['Authority', 'authority', 'token', 'txn_id', 'transid', 'hashid', 'Hash_id', 'slug']);
+    if ($authority === '' && $gw === 'iranpay4') {
+        $authority = web_callback_value($fields, ['invoice_id', 'payment_id']);
     }
-    if ($payment === null && $gw === 'aqayepardakht' && isset($input['post']['invoice_id'])) {
-        $payment = pay_get((int) $input['post']['invoice_id']);
+    if ($authority !== '') {
+        $candidate = $gw === 'iranpay4'
+            ? pay_abanpay_find_by_invoice($authority) : pay_find_by_authority($authority);
+        /* An identifier from one provider must never route another provider's
+           row to a different verifier. */
+        if ($candidate !== null && (string) $candidate['method'] === $gw) {
+            $payment = $candidate;
+        }
+    }
+    if ($payment === null && $gw === 'aqayepardakht') {
+        $invoice = web_callback_value($fields, ['invoice_id']);
+        if ($invoice !== '' && ctype_digit($invoice)) {
+            $candidate = pay_get((int) $invoice);
+            if ($candidate !== null && (string) $candidate['method'] === $gw) {
+                $payment = $candidate;
+            }
+        }
     }
     if ($payment === null && in_array($gw, ['iranpay2', 'iranpay4', 'variza'], true)) {
-        $orderRef = (string) ($input['get']['order_id'] ?? $input['post']['order_id']
-            ?? $input['get']['order'] ?? $input['post']['order']
-            ?? $input['get']['invoice_id'] ?? $input['post']['invoice_id'] ?? '');
+        $orderRef = web_callback_value($fields, ['order_id', 'order', 'merchant_order_id', 'invoice_id']);
         if ($orderRef !== '') {
             $order = DB::one('SELECT * FROM orders WHERE ref=?', [$orderRef]);
             if ($order !== null) {
@@ -184,7 +231,7 @@ function web_handle(): void
         }
     }
     if ($payment === null && $gw === 'plisio') {
-        $orderRef = (string) ($input['get']['order_number'] ?? '');
+        $orderRef = web_callback_value($fields, ['order_number']);
         if ($orderRef !== '') {
             $order = DB::one('SELECT * FROM orders WHERE ref=?', [$orderRef]);
             if ($order !== null) {
@@ -211,20 +258,29 @@ function web_handle(): void
     $order = order_get((int) $payment['order_id']);
     $orderRef = $order !== null ? (string) $order['ref'] : '';
 
-    /* اگر قبلاً تأیید شده، همان را نشان بدهید */
+    /* A prior authoritative provider verify may have claimed this payment but
+       been interrupted before top-up delivery. Re-enter only the local,
+       idempotent delivery claim; callback fields are not trusted or reused. */
     if ((string) $payment['status'] === 'paid') {
-        web_html(pay_result_page('already', $orderRef, (int) $payment['amount']));
+        $repair = pay_settle((int) $payment['id']);
+        $repairState = (string) ($repair['state'] ?? 'already');
+        if ($input['json'] !== [] || str_contains(strtolower(web_header('Accept')), 'json')) {
+            web_json(200, ['status' => (bool) ($repair['ok'] ?? false), 'state' => $repairState]);
+            return;
+        }
+        web_html(pay_result_page($repairState === 'success' ? 'success' : 'already',
+            $orderRef, (int) $payment['amount']));
         return;
     }
 
     try {
         $result = match ($gw) {
-            'zarinpal'      => pay_zarinpal_verify($payment, $input['get']),
-            'aqayepardakht' => pay_aqaye_verify($payment, $input['post'] + $input['get']),
-            'iranpay1'      => pay_floypay_verify($payment, $input['json'] + $input['get'] + $input['post']),
-            'iranpay2'      => pay_cubepay_verify($payment, $input['json'] + $input['get'] + $input['post']),
-            'iranpay4'      => pay_abanpay_verify($payment, $input['get'] + $input['post']),
-            'tetrapay'      => pay_tetrapay_verify($payment, $input['get'] + $input['post']),
+            'zarinpal'      => pay_zarinpal_verify($payment, $fields),
+            'aqayepardakht' => pay_aqaye_verify($payment, $fields),
+            'iranpay1'      => pay_floypay_verify($payment, $fields),
+            'iranpay2'      => pay_cubepay_verify($payment, $fields),
+            'iranpay4'      => pay_abanpay_verify($payment, $fields),
+            'tetrapay'      => pay_tetrapay_verify($payment, $fields),
             'plisio'        => pay_plisio_status($payment),
             'nowpayment'    => pay_nowpay_status($payment),
             'variza'        => ['ok' => false, 'state' => 'waiting',
@@ -237,10 +293,11 @@ function web_handle(): void
         $result = ['ok' => false, 'state' => 'waiting', 'text' => 'خطا در تأیید پرداخت'];
     }
 
-    /* درگاه‌هایی که جواب JSON می‌خواهند */
-    if (in_array($gw, ['iranpay2', 'iranpay4', 'nowpayment', 'plisio'], true)
-        && (str_contains(web_header('Accept'), 'json') || $input['json'] !== [])) {
-        web_json(200, ['status' => (bool) ($result['ok'] ?? false)]);
+    /* JSON provider callbacks receive a compact machine response. Browser
+       returns retain their human result page. */
+    if ($input['json'] !== [] || str_contains(strtolower(web_header('Accept')), 'json')) {
+        web_json(200, ['status' => (bool) ($result['ok'] ?? false),
+            'state' => (string) ($result['state'] ?? 'waiting')]);
         return;
     }
 
