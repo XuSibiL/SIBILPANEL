@@ -1569,32 +1569,56 @@ function tetrapay_public_https_url(string $url): bool
     return true;
 }
 
-/** Build the documented callback path without carrying an unsafe query/fragment. */
-function tetrapay_callback_from_base(string $base): string
+/**
+ * Reduce a configured public website to its canonical HTTPS origin. Tetra's
+ * documented callback is always /pay/tetrapay at the public hostname; legacy
+ * PANEL_WEB_URL values may contain an application path, which must never leak
+ * into that provider callback. Non-standard ports are intentionally rejected:
+ * a public provider callback needs normal HTTPS on 443.
+ */
+function tetrapay_public_origin(string $base): string
 {
     $base = trim($base);
-    if ($base === '' || str_contains($base, '?') || str_contains($base, '#')) {
+    if ($base === '' || str_contains($base, '?') || str_contains($base, '#')
+        || !gw_https_url($base)) {
         return '';
     }
-    $url = rtrim($base, '/') . '/pay/tetrapay';
-    return tetrapay_public_https_url($url) ? $url : '';
+    $parts = parse_url($base);
+    if (!is_array($parts) || isset($parts['port']) && (int) $parts['port'] !== 443) {
+        return '';
+    }
+    $host = strtolower(rtrim(trim((string) ($parts['host'] ?? '')), '.'));
+    // This also rejects IPs/localhost and keeps the callback rooted at a real
+    // public DNS hostname rather than a local test or internal service URL.
+    if (!tetrapay_public_https_url('https://' . $host . '/')) {
+        return '';
+    }
+    return 'https://' . $host;
+}
+
+/** Build the documented fixed callback route from a canonical public origin. */
+function tetrapay_callback_from_base(string $base): string
+{
+    $origin = tetrapay_public_origin($base);
+    return $origin === '' ? '' : $origin . '/pay/tetrapay';
 }
 
 /**
- * Tetra validates the callback against the installed public website. Prefer
- * the installer/runtime URL, then PANEL_DOMAIN, before the legacy public-web
- * setting used by older SIBIL deployments.
+ * Tetra validates the callback against the installed public domain. PANEL_DOMAIN
+ * is the canonical deployment source; PANEL_WEB_URL and the old database value
+ * are fallback discovery only. Paths in those legacy values are stripped rather
+ * than becoming a custom Tetra endpoint.
  */
 function tetrapay_callback_url(): string
 {
     $candidates = [];
-    $web = trim((string) cfg('PANEL_WEB_URL', ''));
-    if ($web !== '') {
-        $candidates[] = $web;
-    }
     $domain = trim((string) cfg('PANEL_DOMAIN', ''));
     if ($domain !== '') {
         $candidates[] = str_contains($domain, '://') ? $domain : 'https://' . $domain;
+    }
+    $web = trim((string) cfg('PANEL_WEB_URL', ''));
+    if ($web !== '') {
+        $candidates[] = $web;
     }
     $legacy = trim(web_base());
     if ($legacy !== '') {

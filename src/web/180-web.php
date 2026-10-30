@@ -66,10 +66,11 @@ function web_status(int $code): void
  */
 function tetrapay_callback_ready_page(): string
 {
-    $name = e(bot_name());
-    return '<!doctype html><meta charset="utf-8"><title>' . $name . ' payment return</title>'
+    // Keep this page dependency-free: provider callback validation must not be
+    // delayed by SQLite, configuration, Telegram, or the bot settings layer.
+    return '<!doctype html><meta charset="utf-8"><title>SIBIL payment return</title>'
         . '<body style="font-family:Tahoma,sans-serif;text-align:center;padding:60px">'
-        . '<h2>' . $name . ' payment return is online.</h2>'
+        . '<h2>SIBIL payment return is online.</h2>'
         . '<p>This endpoint verifies a payment server-side after a provider token arrives.</p>'
         . '<p>No wallet or order has been credited by this health response.</p></body>';
 }
@@ -77,11 +78,25 @@ function tetrapay_callback_ready_page(): string
 /** مسیریابی درخواست وب */
 function web_handle(): void
 {
+    $path = parse_url((string) ($_SERVER['REQUEST_URI'] ?? '/'), PHP_URL_PATH) ?: '/';
+    $path = rtrim($path, '/');
+
+    /*
+     * Tetra probes the bare, public callback before it creates a checkout.
+     * Answer this exact no-token GET/HEAD route before loading .env or SQLite.
+     * Any query/post/body callback still follows the normal authoritative
+     * lookup + provider verification path below; this probe can never settle.
+     */
+    $method = strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET'));
+    if ($path === '/pay/tetrapay' && ($method === 'GET' || $method === 'HEAD')
+        && ($_GET ?? []) === [] && ($_POST ?? []) === []) {
+        web_html(tetrapay_callback_ready_page());
+        return;
+    }
+
     load_env();
     db_bootstrap();
     settings_bootstrap();
-    $path = parse_url((string) ($_SERVER['REQUEST_URI'] ?? '/'), PHP_URL_PATH) ?: '/';
-    $path = rtrim($path, '/');
     $input = web_input();
 
     if ($path === '' || $path === '/') {

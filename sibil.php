@@ -538,6 +538,10 @@ function log_device_guard(string $event, array $context = []): void
 final class DB
 {
     private static ?PDO $pdo = null;
+    /* PDO SQLite versions differ: some do not report a transaction opened by
+       raw `BEGIN IMMEDIATE` through PDO::inTransaction(). Track our own outer
+       transaction so nested DB::tx()/db_tx() calls never issue a second BEGIN. */
+    private static int $txDepth = 0;
 
     public static function pdo(): PDO
     {
@@ -563,6 +567,7 @@ final class DB
     public static function close(): void
     {
         self::$pdo = null;
+        self::$txDepth = 0;
     }
 
     public static function q(string $sql, array $params = []): PDOStatement
@@ -613,10 +618,15 @@ final class DB
     public static function tx(callable $body): mixed
     {
         $pdo = self::pdo();
-        if ($pdo->inTransaction()) {
+        /* A raw SQLite BEGIN IMMEDIATE is not reported by inTransaction() on
+           every supported PDO SQLite build. txDepth is therefore authoritative
+           for transactions opened by this class; inTransaction still respects a
+           caller-owned PDO transaction. */
+        if (self::$txDepth > 0 || $pdo->inTransaction()) {
             return $body();       // تراکنش تودرتو لازم نیست
         }
         $pdo->exec('BEGIN IMMEDIATE');
+        self::$txDepth = 1;
         try {
             $result = $body();
             $pdo->exec('COMMIT');
@@ -627,6 +637,8 @@ final class DB
             } catch (Throwable $ignored) {
             }
             throw $ex;
+        } finally {
+            self::$txDepth = 0;
         }
     }
 }
@@ -21192,32 +21204,56 @@ function tetrapay_public_https_url(string $url): bool
     return true;
 }
 
-/** Build the documented callback path without carrying an unsafe query/fragment. */
-function tetrapay_callback_from_base(string $base): string
+/**
+ * Reduce a configured public website to its canonical HTTPS origin. Tetra's
+ * documented callback is always /pay/tetrapay at the public hostname; legacy
+ * PANEL_WEB_URL values may contain an application path, which must never leak
+ * into that provider callback. Non-standard ports are intentionally rejected:
+ * a public provider callback needs normal HTTPS on 443.
+ */
+function tetrapay_public_origin(string $base): string
 {
     $base = trim($base);
-    if ($base === '' || str_contains($base, '?') || str_contains($base, '#')) {
+    if ($base === '' || str_contains($base, '?') || str_contains($base, '#')
+        || !gw_https_url($base)) {
         return '';
     }
-    $url = rtrim($base, '/') . '/pay/tetrapay';
-    return tetrapay_public_https_url($url) ? $url : '';
+    $parts = parse_url($base);
+    if (!is_array($parts) || isset($parts['port']) && (int) $parts['port'] !== 443) {
+        return '';
+    }
+    $host = strtolower(rtrim(trim((string) ($parts['host'] ?? '')), '.'));
+    // This also rejects IPs/localhost and keeps the callback rooted at a real
+    // public DNS hostname rather than a local test or internal service URL.
+    if (!tetrapay_public_https_url('https://' . $host . '/')) {
+        return '';
+    }
+    return 'https://' . $host;
+}
+
+/** Build the documented fixed callback route from a canonical public origin. */
+function tetrapay_callback_from_base(string $base): string
+{
+    $origin = tetrapay_public_origin($base);
+    return $origin === '' ? '' : $origin . '/pay/tetrapay';
 }
 
 /**
- * Tetra validates the callback against the installed public website. Prefer
- * the installer/runtime URL, then PANEL_DOMAIN, before the legacy public-web
- * setting used by older SIBIL deployments.
+ * Tetra validates the callback against the installed public domain. PANEL_DOMAIN
+ * is the canonical deployment source; PANEL_WEB_URL and the old database value
+ * are fallback discovery only. Paths in those legacy values are stripped rather
+ * than becoming a custom Tetra endpoint.
  */
 function tetrapay_callback_url(): string
 {
     $candidates = [];
-    $web = trim((string) cfg('PANEL_WEB_URL', ''));
-    if ($web !== '') {
-        $candidates[] = $web;
-    }
     $domain = trim((string) cfg('PANEL_DOMAIN', ''));
     if ($domain !== '') {
         $candidates[] = str_contains($domain, '://') ? $domain : 'https://' . $domain;
+    }
+    $web = trim((string) cfg('PANEL_WEB_URL', ''));
+    if ($web !== '') {
+        $candidates[] = $web;
     }
     $legacy = trim(web_base());
     if ($legacy !== '') {
@@ -22199,10 +22235,11 @@ function web_status(int $code): void
  */
 function tetrapay_callback_ready_page(): string
 {
-    $name = e(bot_name());
-    return '<!doctype html><meta charset="utf-8"><title>' . $name . ' payment return</title>'
+    // Keep this page dependency-free: provider callback validation must not be
+    // delayed by SQLite, configuration, Telegram, or the bot settings layer.
+    return '<!doctype html><meta charset="utf-8"><title>SIBIL payment return</title>'
         . '<body style="font-family:Tahoma,sans-serif;text-align:center;padding:60px">'
-        . '<h2>' . $name . ' payment return is online.</h2>'
+        . '<h2>SIBIL payment return is online.</h2>'
         . '<p>This endpoint verifies a payment server-side after a provider token arrives.</p>'
         . '<p>No wallet or order has been credited by this health response.</p></body>';
 }
@@ -22210,11 +22247,25 @@ function tetrapay_callback_ready_page(): string
 /** مسیریابی درخواست وب */
 function web_handle(): void
 {
+    $path = parse_url((string) ($_SERVER['REQUEST_URI'] ?? '/'), PHP_URL_PATH) ?: '/';
+    $path = rtrim($path, '/');
+
+    /*
+     * Tetra probes the bare, public callback before it creates a checkout.
+     * Answer this exact no-token GET/HEAD route before loading .env or SQLite.
+     * Any query/post/body callback still follows the normal authoritative
+     * lookup + provider verification path below; this probe can never settle.
+     */
+    $method = strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET'));
+    if ($path === '/pay/tetrapay' && ($method === 'GET' || $method === 'HEAD')
+        && ($_GET ?? []) === [] && ($_POST ?? []) === []) {
+        web_html(tetrapay_callback_ready_page());
+        return;
+    }
+
     load_env();
     db_bootstrap();
     settings_bootstrap();
-    $path = parse_url((string) ($_SERVER['REQUEST_URI'] ?? '/'), PHP_URL_PATH) ?: '/';
-    $path = rtrim($path, '/');
     $input = web_input();
 
     if ($path === '' || $path === '/') {

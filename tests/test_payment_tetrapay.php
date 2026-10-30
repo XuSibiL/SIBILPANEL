@@ -37,7 +37,8 @@ set_put('pay_tetrapay_key', 'test-api-key');
 set_put('pay_tetrapay_key2', 'test-webhook-secret');
 set_put('pay_tetrapay_on', '1');
 
-/* Trusted installation values outrank the legacy configurable web_url. */
+/* The installed public domain is canonical; legacy web URL paths cannot become
+   custom Tetra callback routes. */
 putenv('PANEL_WEB_URL=https://runtime.example.test/sibil');
 putenv('PANEL_DOMAIN=domain.example.test');
 $trustedCallback = tetrapay_callback_url();
@@ -64,6 +65,10 @@ okpay(tetrapay_public_https_url('https://public.example.test/pay/tetrapay')
     && !tetrapay_public_https_url('https://localhost/pay/tetrapay')
     && !tetrapay_public_https_url('https://127.0.0.1/pay/tetrapay'),
     'Tetra callback selection rejects non-public localhost and IP return hosts');
+okpay(tetrapay_callback_from_base('https://legacy.example.test/old/panel')
+    === 'https://legacy.example.test/pay/tetrapay'
+    && tetrapay_callback_from_base('https://legacy.example.test:8443') === '',
+    'Tetra callback strips legacy paths and rejects non-standard HTTPS ports');
 
 $calls = [];
 $GLOBALS['panel_http_mock'] = static function (string $method, string $url, array $headers, ?string $body) use (&$calls): array {
@@ -109,8 +114,8 @@ okpay(($created['alt_url'] ?? '') === 'https://t.me/TetraBot?start=tp_token_1234
 okpay(($request['amount'] ?? '') === '250000', 'internal toman amount is sent to TetraPay as Rial');
 okpay(str_starts_with((string) ($request['order_id'] ?? ''), 'sibil-'), 'provider order ID is payment-specific');
 okpay(tetrapay_base_url() === 'https://api.tetra98.com/api/v1'
-    && $trustedCallback === 'https://runtime.example.test/sibil/pay/tetrapay',
-    'TetraPay uses fixed production v1 and trusted PANEL_WEB_URL callback priority');
+    && $trustedCallback === 'https://domain.example.test/pay/tetrapay',
+    'TetraPay uses fixed production v1 and the canonical public domain callback');
 okpay(($request['callback_url'] ?? '') === 'https://panel.example.test/pay/tetrapay', 'public HTTPS callback is generated');
 okpay(array_keys($request) === ['amount', 'order_id', 'callback_url']
     && !isset($request['webhook_url']) && !isset($request['allow_partial']),

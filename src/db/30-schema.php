@@ -6,6 +6,10 @@ declare(strict_types=1);
 final class DB
 {
     private static ?PDO $pdo = null;
+    /* PDO SQLite versions differ: some do not report a transaction opened by
+       raw `BEGIN IMMEDIATE` through PDO::inTransaction(). Track our own outer
+       transaction so nested DB::tx()/db_tx() calls never issue a second BEGIN. */
+    private static int $txDepth = 0;
 
     public static function pdo(): PDO
     {
@@ -31,6 +35,7 @@ final class DB
     public static function close(): void
     {
         self::$pdo = null;
+        self::$txDepth = 0;
     }
 
     public static function q(string $sql, array $params = []): PDOStatement
@@ -81,10 +86,15 @@ final class DB
     public static function tx(callable $body): mixed
     {
         $pdo = self::pdo();
-        if ($pdo->inTransaction()) {
+        /* A raw SQLite BEGIN IMMEDIATE is not reported by inTransaction() on
+           every supported PDO SQLite build. txDepth is therefore authoritative
+           for transactions opened by this class; inTransaction still respects a
+           caller-owned PDO transaction. */
+        if (self::$txDepth > 0 || $pdo->inTransaction()) {
             return $body();       // تراکنش تودرتو لازم نیست
         }
         $pdo->exec('BEGIN IMMEDIATE');
+        self::$txDepth = 1;
         try {
             $result = $body();
             $pdo->exec('COMMIT');
@@ -95,6 +105,8 @@ final class DB
             } catch (Throwable $ignored) {
             }
             throw $ex;
+        } finally {
+            self::$txDepth = 0;
         }
     }
 }

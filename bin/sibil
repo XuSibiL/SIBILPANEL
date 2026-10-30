@@ -193,6 +193,67 @@ cli_is_owned() {
     grep -qF "$PANEL_HOME/sibil.php" "$path" 2>/dev/null
 }
 
+# Keep one canonical, versioned CLI inside PANEL_HOME.  Global commands are
+# owned symlinks to it, so an update can never leave the operator on a stale
+# /usr/local/bin/sibil menu after the project files were refreshed.
+cli_patch_identity() {
+    local file="$1"
+    [[ -f "$file" ]] || return 1
+    grep -qF "$SIBIL_OWNER_MARKER" "$file" 2>/dev/null \
+        || sed -i "2i# $SIBIL_OWNER_MARKER" "$file" 2>/dev/null || return 1
+    # Deliberately leave an environment override possible while binding this
+    # installed copy to its own panel home when no override is supplied.
+    sed -i "s|^PANEL_HOME_DEFAULT=.*|PANEL_HOME_DEFAULT=\"\${PANEL_HOME_DEFAULT:-$PANEL_HOME}\"|" "$file" \
+        2>/dev/null || return 1
+    chmod 755 "$file" 2>/dev/null || true
+}
+
+cli_atomic_copy() {
+    local source="$1" destination="$2" tmp
+    [[ -f "$source" ]] || return 1
+    mkdir -p "$(dirname "$destination")" 2>/dev/null || return 1
+    tmp="${destination}.sibil-new.$$"
+    rm -f "$tmp"
+    install -m 755 "$source" "$tmp" 2>/dev/null || return 1
+    mv -f "$tmp" "$destination" 2>/dev/null || { rm -f "$tmp"; return 1; }
+}
+
+cli_atomic_link() {
+    local target="$1" destination="$2" tmp
+    mkdir -p "$(dirname "$destination")" 2>/dev/null || return 1
+    tmp="${destination}.sibil-link.$$"
+    rm -f "$tmp"
+    ln -s "$target" "$tmp" 2>/dev/null || return 1
+    mv -f "$tmp" "$destination" 2>/dev/null || { rm -f "$tmp"; return 1; }
+}
+
+cli_refresh_launcher() {
+    local source="${1:-$PANEL_HOME/bin/sibil}" canonical target
+    canonical="$PANEL_HOME/bin/sibil"
+    [[ -f "$source" ]] || { warn "updated CLI source is missing: $source"; return 1; }
+    if [[ "$(readlink -f "$source" 2>/dev/null || printf '%s' "$source")" \
+        != "$(readlink -f "$canonical" 2>/dev/null || printf '%s' "$canonical")" ]]; then
+        cli_atomic_copy "$source" "$canonical" || { warn "could not install canonical CLI: $canonical"; return 1; }
+    fi
+    cli_patch_identity "$canonical" || { warn "could not mark canonical CLI: $canonical"; return 1; }
+
+    # Never overwrite another program named sibil. Existing SIBIL launchers and
+    # an absent destination are safe to replace with this canonical symlink.
+    for target in "$CLI_PATH"; do
+        [[ "$target" == "$canonical" ]] && continue
+        if [[ -e "$target" || -L "$target" ]] && ! cli_is_owned "$target"; then
+            warn "preserved unowned command: $target"
+            continue
+        fi
+        if cli_atomic_link "$canonical" "$target"; then
+            ok "SIBIL command now points to the current dashboard: $target"
+        else
+            warn "could not refresh command launcher: $target"
+        fi
+    done
+    return 0
+}
+
 caddy_conf_dir() { printf '%s' "${SIBIL_CADDY_CONF_DIR:-/etc/caddy/conf.d}"; }
 caddy_main_file() { printf '%s' "${SIBIL_CADDYFILE:-/etc/caddy/Caddyfile}"; }
 caddy_site_file() { printf '%s/sibil-%s.caddy' "$(caddy_conf_dir)" "$1"; }
@@ -1053,6 +1114,15 @@ github_update() {
             cp -f "$root/$f" "$PANEL_HOME/$f" && copied=$((copied + 1))
         fi
     done
+    # The archive now contains the advanced CLI under PANEL_HOME/bin. Refresh
+    # the owned command launcher too; otherwise an older /usr/local/bin/sibil
+    # process keeps showing the legacy menu even though the project updated.
+    if [[ -f "$PANEL_HOME/bin/sibil" ]]; then
+        cli_refresh_launcher "$PANEL_HOME/bin/sibil" \
+            || warn "project updated, but the command launcher needs repair: sudo $PANEL_HOME/bin/sibil dashboard"
+    else
+        warn "project updated without bin/sibil; command launcher was not changed"
+    fi
     rm -rf "$tmp"
     ((copied >= 3)) || { bad "nothing was copied — the update was aborted"; return 1; }
     ok "code replaced ($copied items) — .env, database, logs and backups untouched"
@@ -1307,14 +1377,22 @@ cmd_domain_health() {
     domain_dns_check "$dom" || return 1
     if command -v curl >/dev/null 2>&1; then
         local code tetrapayCode
-        code="$(curl -ksSIL --max-time 12 -o /dev/null -w '%{http_code}' "https://$dom/" 2>/dev/null || true)"
+        # Do not use curl -k here: Tetra validates a publicly trusted HTTPS
+        # certificate, so an insecure local probe would create a false pass.
+        code="$(curl -sS --connect-timeout 6 --max-time 15 -o /dev/null -w '%{http_code}' \
+            "https://$dom/" 2>/dev/null || true)"
         [[ "$code" =~ ^[1-5][0-9][0-9]$ ]] && ok "HTTPS responds with HTTP $code" \
-            || warn "HTTPS endpoint did not answer yet (DNS/TLS/proxy may still be propagating)"
-        # A no-token probe is intentionally non-settling; it only proves the public return path.
-        tetrapayCode="$(curl -ksSIL --max-time 12 -o /dev/null -w '%{http_code}' "https://$dom/pay/tetrapay" 2>/dev/null || true)"
-        [[ "$tetrapayCode" =~ ^2[0-9][0-9]$ ]] \
-            && ok "TetraPay return endpoint responds with HTTP $tetrapayCode" \
-            || warn "TetraPay return endpoint is not publicly healthy yet: https://$dom/pay/tetrapay"
+            || warn "HTTPS endpoint did not answer with a trusted TLS connection yet"
+        # This direct GET is intentionally non-settling. No redirect is followed:
+        # the provider must reach this exact public HTTPS callback URL itself.
+        tetrapayCode="$(curl -sS --connect-timeout 6 --max-time 15 -o /dev/null -w '%{http_code}' \
+            "https://$dom/pay/tetrapay" 2>/dev/null || true)"
+        if [[ "$tetrapayCode" =~ ^2[0-9][0-9]$ ]]; then
+            ok "TetraPay callback is direct, trusted HTTPS (HTTP $tetrapayCode)"
+        else
+            warn "TetraPay callback is not publicly healthy: https://$dom/pay/tetrapay (HTTP ${tetrapayCode:-000})"
+            say "  needs a public trusted HTTPS 2xx on port 443; check Caddy, local UFW and the cloud/provider firewall"
+        fi
     fi
     cert_expiry_status "$dom" || true
 }

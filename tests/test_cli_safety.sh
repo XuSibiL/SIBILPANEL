@@ -55,9 +55,23 @@ exit 0
 EOF
 cat >"$MOCKBIN/curl" <<'EOF'
 #!/usr/bin/env bash
-# Tests are offline: callers see a reachable curl binary but no remote payload.
-# The dashboard must fall back cleanly without waiting for GitHub.
+# Tests are offline. A caller can explicitly provide one tarball to exercise
+# the real CLI update-copy path; all other probes return no remote payload.
 [[ -n "${SIBIL_TEST_CURL_LOG:-}" ]] && printf '%s\n' "$*" >>"$SIBIL_TEST_CURL_LOG"
+out=""
+while [[ $# -gt 0 ]]; do
+  if [[ "$1" == "-o" ]]; then out="${2:-}"; shift 2; continue; fi
+  shift
+done
+if [[ -n "${SIBIL_TEST_UPDATE_ARCHIVE:-}" && -n "$out" ]]; then
+  cp "$SIBIL_TEST_UPDATE_ARCHIVE" "$out"
+fi
+exit 0
+EOF
+cat >"$MOCKBIN/nohup" <<'EOF'
+#!/usr/bin/env bash
+# An installer update may create its non-systemd runner. Do not launch a poller
+# during this filesystem-only safety regression.
 exit 0
 EOF
 chmod 755 "$MOCKBIN"/*
@@ -175,6 +189,101 @@ else
   require_contains "$CLI" 'exec bash "$fresh" menu' && pass "update option contains the fresh-CLI re-exec guard"
 fi
 
+# Regression for the reported deployment defect: a real legacy global launcher
+# must become an owned link to the newly installed canonical dashboard after a
+# normal installer --update, while an unrelated same-name command is untouched.
+UPDATE_HOME="$TMP/update-home"
+LEGACY_GLOBAL="$TMP/global/sibil"
+UNOWNED_GLOBAL="$TMP/unowned/sibil"
+mkdir -p "$UPDATE_HOME" "$(dirname "$LEGACY_GLOBAL")" "$(dirname "$UNOWNED_GLOBAL")"
+cat >"$UPDATE_HOME/.env" <<EOF
+PANEL_HOME="$UPDATE_HOME"
+PANEL_DB="$UPDATE_HOME/sibil.sqlite3"
+PANEL_DOMAIN="example.org"
+PANEL_WEB_URL="https://example.org/old-panel"
+PANEL_WEB_PORT="8080"
+PANEL_ADMINS="100"
+PANEL_PRIMARY_OWNER_ID="100"
+EOF
+printf 'SIBILPANEL-OWNED\n' >"$UPDATE_HOME/.sibil-owned"
+cat >"$UPDATE_HOME/sibil.php" <<'PHP'
+<?php
+const PANEL_VERSION = 'legacy-test';
+PHP
+cat >"$LEGACY_GLOBAL" <<EOF
+#!/usr/bin/env bash
+# SIBILPANEL-OWNED
+# Panel Service · v3.18.3 (legacy launcher fixture)
+PANEL_HOME_DEFAULT="\${PANEL_HOME_DEFAULT:-$UPDATE_HOME}"
+printf 'LEGACY-PANEL-SERVICE\n'
+EOF
+cat >"$UNOWNED_GLOBAL" <<'EOF'
+#!/usr/bin/env bash
+printf 'UNRELATED-COMMAND\n'
+EOF
+chmod 755 "$LEGACY_GLOBAL" "$UNOWNED_GLOBAL"
+"$LEGACY_GLOBAL" >"$TMP/legacy-before.log"
+require_contains "$TMP/legacy-before.log" "LEGACY-PANEL-SERVICE"
+if ! env \
+  PATH="$PATH" PANEL_HOME="$UPDATE_HOME" PANEL_CLI_PATH="$LEGACY_GLOBAL" \
+  SIBIL_GLOBAL_CLI_PATH="$UNOWNED_GLOBAL" SIBIL_SYSTEMD_DIR="$SYSTEMD" \
+  SIBIL_CADDYFILE="$CADDY" SIBIL_CADDY_CONF_DIR="$CADCONF" \
+  SIBIL_NGINX_SITES_ENABLED_DIR="$NGINX_ENABLED" SIBIL_NGINX_SITES_AVAILABLE_DIR="$NGINX_AVAILABLE" \
+  SIBIL_NGINX_CONF_DIR="$NGINX_CONF" SIBIL_CRON_DIR="$CRON" \
+  SIBIL_UNINSTALL_BACKUP_DIR="$BACKUPS" PANEL_BACKUP_DIR="$BACKUPS" \
+  SIBIL_DISABLE_SYSTEMD=1 PANEL_NO_PAUSE=1 TERM=dumb \
+  bash "$INSTALLER" --update >"$TMP/legacy-installer-update.log" 2>&1; then
+  cat "$TMP/legacy-installer-update.log" >&2
+  fail "installer update failed for a legacy global launcher"
+elif [[ -L "$LEGACY_GLOBAL" && "$(readlink "$LEGACY_GLOBAL")" == "$UPDATE_HOME/bin/sibil" ]] \
+    && "$LEGACY_GLOBAL" dashboard >"$TMP/legacy-after.log" 2>&1 \
+    && grep -qF "SIBIL PANEL" "$TMP/legacy-after.log" \
+    && ! grep -qF "Panel Service" "$TMP/legacy-after.log"; then
+  pass "legacy global launcher is atomically replaced by the current SIBIL dashboard"
+else
+  cat "$TMP/legacy-installer-update.log" "$TMP/legacy-after.log" 2>/dev/null >&2 || true
+  fail "legacy global launcher did not reach the current dashboard"
+fi
+require_contains "$UPDATE_HOME/bin/sibil" "SIBILPANEL-OWNED" \
+  && pass "installer keeps one marked canonical dashboard inside PANEL_HOME"
+require_contains "$UNOWNED_GLOBAL" "UNRELATED-COMMAND" \
+  && [[ ! -L "$UNOWNED_GLOBAL" ]] \
+  && pass "installer refuses to overwrite an unrelated global command"
+
+# The regular update engine used by interactive menu option 2 must perform the
+# same launcher refresh, rather than only replacing hidden PANEL_HOME files.
+CURRENT_GLOBAL="$TMP/current-global/sibil"
+ARCHIVE_ROOT="$TMP/current-update-archive/SIBILPANEL-main"
+mkdir -p "$(dirname "$CURRENT_GLOBAL")" "$ARCHIVE_ROOT"
+cp "$CLI" "$CURRENT_GLOBAL"
+chmod 755 "$CURRENT_GLOBAL"
+# Use a real codeload-shaped archive of this checkout; mock curl supplies it
+# only to the download requested by github_update().
+for item in sibil.php migration.php install.sh deploy.sh README.md LICENSE VERSION src bin build docs .github dist; do
+  [[ -e "$ROOT/$item" ]] && cp -a "$ROOT/$item" "$ARCHIVE_ROOT/"
+done
+tar -czf "$TMP/current-update.tar.gz" -C "$(dirname "$ARCHIVE_ROOT")" "$(basename "$ARCHIVE_ROOT")"
+if ! env \
+  PATH="$PATH" PANEL_HOME="$UPDATE_HOME" PANEL_CLI_PATH="$CURRENT_GLOBAL" \
+  PANEL_UPDATE_ARCHIVE_URL="https://fixture.invalid/current-update.tar.gz" \
+  SIBIL_TEST_UPDATE_ARCHIVE="$TMP/current-update.tar.gz" SIBIL_TEST_CURL_LOG="$TMP/current-update-curl.log" \
+  SIBIL_SYSTEMD_DIR="$SYSTEMD" SIBIL_CADDYFILE="$CADDY" SIBIL_CADDY_CONF_DIR="$CADCONF" \
+  SIBIL_NGINX_SITES_ENABLED_DIR="$NGINX_ENABLED" SIBIL_NGINX_SITES_AVAILABLE_DIR="$NGINX_AVAILABLE" \
+  SIBIL_NGINX_CONF_DIR="$NGINX_CONF" SIBIL_CRON_DIR="$CRON" \
+  SIBIL_UNINSTALL_BACKUP_DIR="$BACKUPS" PANEL_BACKUP_DIR="$BACKUPS" \
+  SIBIL_DISABLE_SYSTEMD=1 PANEL_NO_PAUSE=1 TERM=dumb \
+  bash "$CURRENT_GLOBAL" update --force >"$TMP/current-global-update.log" 2>&1; then
+  cat "$TMP/current-global-update.log" >&2
+  fail "normal CLI update failed in launcher-refresh regression"
+elif [[ -L "$CURRENT_GLOBAL" && "$(readlink "$CURRENT_GLOBAL")" == "$UPDATE_HOME/bin/sibil" ]] \
+    && "$CURRENT_GLOBAL" dashboard >"$TMP/current-global-dashboard.log" 2>&1 \
+    && grep -qF "SIBIL PANEL" "$TMP/current-global-dashboard.log"; then
+  pass "normal update refreshes the active owned global launcher before returning to dashboard"
+else
+  cat "$TMP/current-global-update.log" "$TMP/current-global-dashboard.log" 2>/dev/null >&2 || true
+  fail "normal update left the active global launcher stale"
+fi
+
 # Domain validation/confirmation logic must never silently write a bad domain.
 old_env="$(cat "$HOME1/.env")"
 if cli domain change bad.invalid --yes >"$TMP/domain-bad.log" 2>&1; then
@@ -187,8 +296,8 @@ require_contains "$TMP/domain-cancel.log" "cancelled" && require_contains "$HOME
 cli domain change example.org --yes >"$TMP/domain-ok.log" 2>&1
 require_contains "$HOME1/.env" 'PANEL_DOMAIN="example.org"' && require_contains "$HOME1/.env" 'PANEL_WEB_URL="https://example.org"' && pass "confirmed domain change updates callback values"
 cli domain health example.org >"$TMP/domain-health.log" 2>&1
-require_contains "$TMP/domain-health.log" "TetraPay return endpoint"
-require_contains "$TMP/curl.log" "https://example.org/pay/tetrapay" && pass "domain health checks the public non-settling TetraPay return path"
+require_contains "$TMP/domain-health.log" "TetraPay callback"
+require_contains "$TMP/curl.log" "https://example.org/pay/tetrapay" && pass "domain health checks the public non-settling TetraPay callback path"
 cli domain change bad.invalid --force --yes >"$TMP/domain-force.log" 2>&1
 require_contains "$HOME1/.env" 'PANEL_DOMAIN="bad.invalid"' && pass "DNS bypass requires explicit --force and accepts either option order"
 cli domain change example.org --yes >/dev/null 2>&1

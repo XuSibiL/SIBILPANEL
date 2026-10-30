@@ -85,6 +85,9 @@ fi
 export PANEL_HOME
 SERVICE="sibil"
 WEB_SERVICE="sibil-web"
+# Preserve an explicitly supplied legacy/custom launcher path during --update.
+# A non-root fresh install without one still defaults safely to ~/.local/bin.
+CLI_PATH_WAS_SET="${PANEL_CLI_PATH:+1}"
 CLI_PATH="${PANEL_CLI_PATH:-/usr/local/bin/sibil}"
 SYSTEMD_DIR="${SIBIL_SYSTEMD_DIR:-/etc/systemd/system}"
 PHP_BIN="php"
@@ -195,6 +198,63 @@ cli_is_owned() {
     grep -qF "$SIBIL_OWNER_MARKER" "$f" 2>/dev/null && return 0
     grep -qF "$quoted_home" "$f" 2>/dev/null && return 0
     grep -qF "PANEL_HOME_DEFAULT=$PANEL_HOME" "$f" 2>/dev/null
+}
+
+# The command in PATH is only a safe owned link.  The executable source of
+# truth lives in PANEL_HOME/bin/sibil, which lets an update replace the entire
+# dashboard atomically while refusing to clobber someone else's command.
+GLOBAL_CLI_PATH="${SIBIL_GLOBAL_CLI_PATH:-/usr/local/bin/sibil}"
+cli_patch_identity() {
+    local file="$1"
+    [[ -f "$file" ]] || return 1
+    grep -qF "$SIBIL_OWNER_MARKER" "$file" 2>/dev/null \
+        || sed -i "2i# $SIBIL_OWNER_MARKER" "$file" 2>/dev/null || return 1
+    sed -i "s|^PANEL_HOME_DEFAULT=.*|PANEL_HOME_DEFAULT=\"\${PANEL_HOME_DEFAULT:-$PANEL_HOME}\"|" "$file" \
+        2>/dev/null || return 1
+    chmod 755 "$file" 2>/dev/null || true
+}
+
+cli_atomic_link() {
+    local source="$1" destination="$2" tmp
+    mkdir -p "$(dirname "$destination")" 2>/dev/null || return 1
+    tmp="${destination}.sibil-link.$$"
+    rm -f "$tmp"
+    ln -s "$source" "$tmp" 2>/dev/null || return 1
+    mv -f "$tmp" "$destination" 2>/dev/null || { rm -f "$tmp"; return 1; }
+}
+
+install_cli_launcher() {
+    local cli_src="$1" canonical="$PANEL_HOME/bin/sibil" target tmp
+    [[ -f "$cli_src" ]] || return 1
+    if [[ $DRY -eq 1 ]]; then
+        say "  [dry] would install canonical dashboard: $canonical"
+        say "  [dry] would refresh owned command: $CLI_PATH"
+        return 0
+    fi
+    mkdir -p "$(dirname "$canonical")" 2>/dev/null || return 1
+    tmp="${canonical}.sibil-new.$$"
+    rm -f "$tmp"
+    install -m 755 "$cli_src" "$tmp" 2>/dev/null || return 1
+    cli_patch_identity "$tmp" || { rm -f "$tmp"; return 1; }
+    mv -f "$tmp" "$canonical" 2>/dev/null || { rm -f "$tmp"; return 1; }
+
+    # CLI_PATH is the requested launcher.  The conventional global path is
+    # refreshed as well only when it is absent or proven SIBIL-owned.
+    local -a targets=("$CLI_PATH")
+    [[ $IS_ROOT -eq 1 && "$GLOBAL_CLI_PATH" != "$CLI_PATH" ]] && targets+=("$GLOBAL_CLI_PATH")
+    for target in "${targets[@]}"; do
+        [[ "$target" == "$canonical" ]] && continue
+        if [[ -e "$target" || -L "$target" ]] && ! cli_is_owned "$target"; then
+            warn "preserved unowned command: $target"
+            continue
+        fi
+        if cli_atomic_link "$canonical" "$target"; then
+            ok "dashboard command refreshed: $target -> $canonical"
+        else
+            warn "could not refresh dashboard command: $target"
+        fi
+    done
+    return 0
 }
 
 caddy_conf_dir() { printf '%s' "${SIBIL_CADDY_CONF_DIR:-/etc/caddy/conf.d}"; }
@@ -1032,43 +1092,21 @@ copy_payload() {
     [[ -f "$SRC_DIR/sibil" ]] && cli_src="$SRC_DIR/sibil"
     [[ -z "$cli_src" && -f "$SRC_DIR/bin/sibil" ]] && cli_src="$SRC_DIR/bin/sibil"
     if [[ -n "$cli_src" ]]; then
-        [[ $IS_ROOT -eq 1 ]] && run "install -d -m 755 '$(dirname "$CLI_PATH")'"
-        if [[ $IS_ROOT -eq 1 ]]; then
-            run "install -m 755 '$cli_src' '$CLI_PATH'"
-        elif [[ $DRY -eq 0 ]]; then
-            mkdir -p "$HOME/.local/bin" 2>/dev/null
-            install -m 755 "$cli_src" "$HOME/.local/bin/sibil" 2>/dev/null \
-                && CLI_PATH="$HOME/.local/bin/sibil"
+        # Non-root installs keep their launcher under ~/.local/bin; root keeps
+        # the explicit CLI path (normally /usr/local/bin/sibil).
+        if [[ $IS_ROOT -eq 0 && -z "$CLI_PATH_WAS_SET" ]]; then
+            CLI_PATH="$HOME/.local/bin/sibil"
+        fi
+        if ! install_cli_launcher "$cli_src"; then
+            die "could not install the SIBIL dashboard launcher safely"
+        fi
+        if command -v sibil >/dev/null 2>&1; then
+            ok "command in PATH: $(command -v sibil)"
+        elif [[ $IS_ROOT -eq 0 && -f "$HOME/.bashrc" ]] && ! grep -q 'HOME/.local/bin' "$HOME/.bashrc" 2>/dev/null; then
+            printf '\nexport PATH="$HOME/.local/bin:$PATH"\n' >>"$HOME/.bashrc" 2>/dev/null || true
+            ok "added $HOME/.local/bin to PATH in ~/.bashrc (open a new terminal)"
         else
-            say "  [dry] would install the command at $HOME/.local/bin/sibil"
-        fi
-        # مسیر واقعی نصب داخل خودِ اسکریپت CLI نوشته می‌شود تا «sibil» همیشه خانه را بشناسد
-        if [[ $DRY -eq 0 ]]; then
-            local cli_dst="$CLI_PATH"
-            grep -q "$SIBIL_OWNER_MARKER" "$cli_dst" 2>/dev/null \
-                || sed -i "2i# $SIBIL_OWNER_MARKER" "$cli_dst" 2>/dev/null || true
-            sed -i "s|^PANEL_HOME_DEFAULT=.*|PANEL_HOME_DEFAULT=\"$PANEL_HOME\"|" "$cli_dst" 2>/dev/null || true
-        fi
-        # همیشه در /usr/local/bin هم لینک می‌شود تا «sibil» در هر ترمینالی کار کند
-        if [[ $DRY -eq 0 ]]; then
-            chmod 755 "$CLI_PATH" 2>/dev/null || true
-            if [[ $IS_ROOT -eq 1 && "$CLI_PATH" != "/usr/local/bin/sibil" ]]; then
-                ln -sf "$CLI_PATH" /usr/local/bin/sibil 2>/dev/null || true
-            fi
-            if command -v sibil >/dev/null 2>&1; then
-                ok "command in PATH: $(command -v sibil)"
-            else
-                local bindir; bindir="$(dirname "$CLI_PATH")"
-                if [[ $IS_ROOT -eq 1 ]]; then
-                    ln -sf "$CLI_PATH" /usr/local/bin/sibil 2>/dev/null || true
-                elif [[ -f "$HOME/.bashrc" ]] && ! grep -q 'HOME/.local/bin' "$HOME/.bashrc" 2>/dev/null; then
-                    printf '\nexport PATH="$HOME/.local/bin:$PATH"\n' >>"$HOME/.bashrc" 2>/dev/null || true
-                    ok "added $bindir to PATH in ~/.bashrc (open a new terminal)"
-                fi
-                command -v sibil >/dev/null 2>&1 \
-                    && ok "command in PATH: $(command -v sibil)" \
-                    || warn "the command lives at $CLI_PATH — run it directly or add $bindir to PATH"
-            fi
+            warn "the dashboard command lives at $CLI_PATH — run it directly or add its directory to PATH"
         fi
     else
         warn "the CLI file (bin/sibil) was not found — 'sibil' will not be installed"
@@ -1213,6 +1251,44 @@ EOF
         fi
         ok "start it with: $PANEL_HOME/run.sh  or: sibil start"
     fi
+}
+
+# Open only the two standard web ports, only when an already-enabled local UFW
+# would otherwise block Caddy/Tetra. Never enable UFW, modify cloud firewalls,
+# remove rules, or touch another firewall product.
+ensure_callback_firewall() {
+    local domain="${1:-$DOMAIN_IN}" status port
+    [[ $NO_SSL -eq 0 && -n "$domain" ]] || return 0
+    if [[ $DRY -eq 1 ]]; then
+        say "  [dry] would inspect active local UFW for HTTP/HTTPS callback access"
+        return 0
+    fi
+    if [[ $IS_ROOT -ne 1 ]]; then
+        warn "not root: could not inspect local UFW; public ports 80/443 must reach $domain"
+        return 0
+    fi
+    command -v ufw >/dev/null 2>&1 || return 0
+    status="$(ufw status 2>/dev/null || true)"
+    if grep -qi '^Status: inactive' <<<"$status"; then
+        ok "local UFW is inactive; no local web-port rule was added"
+        return 0
+    fi
+    if ! grep -qi '^Status: active' <<<"$status"; then
+        warn "could not read local UFW status; verify public TCP 80 and 443 manually"
+        return 0
+    fi
+    for port in 80 443; do
+        if awk -v p="$port" '$1 == p || $1 == p "/tcp" { if ($2 == "ALLOW") ok=1 } END { exit ok ? 0 : 1 }' <<<"$status"; then
+            ok "local UFW already allows TCP $port"
+            continue
+        fi
+        if ufw allow "$port/tcp" comment "SIBILPANEL callback" >/dev/null 2>&1; then
+            ok "opened local UFW TCP $port for the public callback"
+        else
+            warn "could not open local UFW TCP $port; allow it manually if UFW is enforcing"
+        fi
+    done
+    say "  note: cloud/provider firewalls are outside this server; they must also allow TCP 80 and 443"
 }
 
 setup_ssl_proxy() {
@@ -1381,16 +1457,36 @@ unit_is_stale() {
     return 1
 }
 
+# Updating code must not silently introduce Caddy onto a host that did not
+# already choose it; it could conflict with an unrelated web server. Existing
+# Caddy installs remain repaired through the same ownership-checked path.
+repair_existing_ssl_proxy() {
+    [[ $NO_SSL -eq 0 && -n "$DOMAIN_IN" ]] || return 0
+    if command -v caddy >/dev/null 2>&1; then
+        setup_ssl_proxy || warn "TLS callback proxy was not changed; run the domain health check after fixing the reported issue"
+        return 0
+    fi
+    warn "Caddy is not installed; update preserved existing web-server ownership and did not add a competing proxy"
+    say "  callback still needs public trusted HTTPS at https://$DOMAIN_IN/pay/tetrapay (TCP 80/443)"
+    return 0
+}
+
 do_update() {
     step "Updating code (database and configuration are kept)"
     resolve_sources
     install_packages   # نسخهٔ PHP به php-cli و php-sqlite3 نیاز دارد
     [[ -f "$PANEL_HOME/.env" ]] || die "no previous installation found in $PANEL_HOME — install first"
+    # A normal --update has no --domain argument, but must still repair the
+    # owned public callback proxy for the already configured canonical domain.
+    if [[ -z "$DOMAIN_IN" ]]; then
+        DOMAIN_IN="$(grep -E '^PANEL_DOMAIN=' "$PANEL_HOME/.env" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"')"
+    fi
     copy_payload
     setup_user
     ensure_env_keys
     ensure_primary_owner_env
     ensure_web_url
+    ensure_callback_firewall "$DOMAIN_IN"
     if [[ $IS_ROOT -eq 1 && $HAS_SYSTEMD -eq 1 ]]; then
         if unit_is_stale; then
             step "Rewriting the service unit for the php edition"
@@ -1399,6 +1495,7 @@ do_update() {
         fi
         write_web_service
     fi
+    repair_existing_ssl_proxy
     [[ $DRY -eq 0 ]] && chmod 600 "$PANEL_HOME/.env" 2>/dev/null
     if [[ $DRY -eq 0 ]]; then
         PANEL_HOME="$PANEL_HOME" PANEL_ENV="$PANEL_HOME/.env" \
@@ -1511,6 +1608,7 @@ setup_user
 write_env
 write_systemd || write_runner
 write_web_service || true
+ensure_callback_firewall "$DOMAIN_IN"
 setup_ssl_proxy
 [[ $DRY -eq 0 && -n "$UPDATE_URL_IN" ]] && printf '%s\n' "$UPDATE_URL_IN" >"$PANEL_HOME/.installer-url"
 run_check

@@ -62,6 +62,22 @@ okcontrol(str_contains($notice, 'یک روز') && str_contains($notice, 'Verify/
     && !str_contains($notice, 'به کیف پول شما واریز گردید'),
     'created notice is one-day pending guidance with no premature credit claim');
 
+/* PDO SQLite builds disagree on whether raw BEGIN IMMEDIATE is visible through
+   inTransaction(). Nested project transactions must therefore remain safe on
+   both older and newer server PHP builds. */
+echo "\n== nested SQLite transaction compatibility ==\n";
+$nestedTxOk = false;
+try {
+    DB::tx(static function () use (&$nestedTxOk): void {
+        DB::tx(static function () use (&$nestedTxOk): void {
+            $nestedTxOk = true;
+        });
+    });
+} catch (Throwable) {
+    $nestedTxOk = false;
+}
+okcontrol($nestedTxOk, 'nested DB transactions do not issue a second BEGIN IMMEDIATE');
+
 /* Atomic final daily check: two independently-created provider payments can
    both exist, but only capacity available while claiming settlement is used. */
 echo "\n== final daily-ceiling claim ==\n";
