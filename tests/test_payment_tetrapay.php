@@ -55,12 +55,26 @@ http_response_code(200);
 ob_start();
 web_handle();
 $probeHtml = (string) ob_get_clean();
+/* Tetra may validate callback_url with a generated token before its create
+   response gives SIBIL that token. Unknown tokens must get a harmless 200,
+   not a 404 that the provider interprets as INVALID_CALLBACK. */
+$_SERVER = ['REQUEST_URI' => '/pay/tetrapay?token=provider_probe_token&status=created',
+    'REQUEST_METHOD' => 'GET'];
+$_GET = ['token' => 'provider_probe_token', 'status' => 'created'];
+$_POST = [];
+http_response_code(200);
+ob_start();
+web_handle();
+$unknownProbeHtml = (string) ob_get_clean();
 echo "\n== callback preflight ==\n";
 okpay(str_contains($probeHtml, 'payment return is online'),
     'public no-token Tetra callback probe receives a healthy response');
 okpay(str_contains($probeHtml, 'No wallet or order has been credited')
     && balance_of(771001) === $balanceBeforeProbe,
     'callback health response cannot credit a wallet or claim payment success');
+okpay(http_response_code() === 200 && str_contains($unknownProbeHtml, 'payment return is online')
+    && balance_of(771001) === $balanceBeforeProbe,
+    'unknown token callback probe receives non-settling HTTP 200');
 okpay(tetrapay_public_https_url('https://public.example.test/pay/tetrapay')
     && !tetrapay_public_https_url('https://localhost/pay/tetrapay')
     && !tetrapay_public_https_url('https://127.0.0.1/pay/tetrapay'),

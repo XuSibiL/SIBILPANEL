@@ -194,8 +194,15 @@ function web_handle(): void
         }
     }
 
-    if ($payment === null && $gw === 'tetrapay' && $authority === '') {
-        /* Provider callback preflight: 200 is intentional, but does not settle anything. */
+    if ($payment === null && $gw === 'tetrapay') {
+        /*
+         * Tetra can probe the documented callback_url with a generated token
+         * before that token has been returned to (and stored by) SIBIL. A 404
+         * here makes a healthy public callback look invalid to the provider.
+         * Acknowledge an unknown token with the same non-settling health page;
+         * only a locally bound authority below ever reaches provider verify or
+         * wallet settlement.
+         */
         web_html(tetrapay_callback_ready_page());
         return;
     }

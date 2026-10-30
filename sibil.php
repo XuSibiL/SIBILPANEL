@@ -21292,7 +21292,7 @@ function tetrapay_error(array $res, string $fallback = 'ساخت لینک تتر
         'UNAUTHORIZED' => 'کلید API تتراپی پذیرفته نشد یا باطل شده است.',
         'GATEWAY_SUSPENDED' => 'درگاه تتراپی در پنل پذیرنده غیرفعال یا تعلیق شده است.',
         'NO_METHOD_AVAILABLE' => 'هیچ روش پرداخت فعالی در پنل تتراپی روشن نیست.',
-        'INVALID_CALLBACK' => 'تتراپی آدرس بازگشت را نپذیرفت. دامنهٔ عمومی HTTPS ربات و مسیر /pay/tetrapay را در SIBIL بررسی کنید.',
+        'INVALID_CALLBACK' => 'تتراپی callback_url را نپذیرفت. API طبق مستندات به api.tetra98.com/api/v1 می‌رود؛ callback_url نباید API باشد و باید URL عمومی HTTPS ربات در مسیر /pay/tetrapay باشد.',
         'INVALID_WEBHOOK', 'WEBHOOK_NOT_CONFIGURED' => 'وب‌هوک اختیاری تتراپی پذیرفته نشد؛ بررسی بازگشت پرداخت ادامه دارد.',
         'AMOUNT_OUT_OF_RANGE' => 'مبلغ خارج از بازهٔ مجاز تتراپی است.',
         'RATE_LIMITED' => $retry > 0
@@ -22363,8 +22363,15 @@ function web_handle(): void
         }
     }
 
-    if ($payment === null && $gw === 'tetrapay' && $authority === '') {
-        /* Provider callback preflight: 200 is intentional, but does not settle anything. */
+    if ($payment === null && $gw === 'tetrapay') {
+        /*
+         * Tetra can probe the documented callback_url with a generated token
+         * before that token has been returned to (and stored by) SIBIL. A 404
+         * here makes a healthy public callback look invalid to the provider.
+         * Acknowledge an unknown token with the same non-settling health page;
+         * only a locally bound authority below ever reaches provider verify or
+         * wallet settlement.
+         */
         web_html(tetrapay_callback_ready_page());
         return;
     }
