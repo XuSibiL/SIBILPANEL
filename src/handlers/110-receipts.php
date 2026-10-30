@@ -225,31 +225,89 @@ function receipt_close_card(int $receiptId, bool $approve, int $adminId, string 
     }
 }
 
+/** Apply manual-card cashback at most once, after approved order delivery. */
+function receipt_apply_cashback_once(int $receiptId): int
+{
+    return DB::tx(static function () use ($receiptId): int {
+        $receipt = DB::one('SELECT * FROM receipts WHERE id=?', [$receiptId]);
+        if ($receipt === null || (string) $receipt['status'] !== 'approved') {
+            return 0;
+        }
+        $note = (string) ($receipt['note'] ?? '');
+        if (str_contains($note, '[cashback-paid:')) {
+            return 0;
+        }
+        $percent = gw_cashback('card');
+        $reward = $percent > 0 ? intdiv((int) $receipt['amount'] * $percent, 100) : 0;
+        if ($reward <= 0) {
+            return 0;
+        }
+        $tag = '[cashback-paid:' . $reward . ']';
+        $newNote = trim($note . ($note === '' ? '' : "\n") . $tag);
+        $changed = DB::update("UPDATE receipts SET note=? WHERE id=? AND status='approved'",
+            [$newNote, $receiptId]);
+        if ($changed !== 1) {
+            return 0;
+        }
+        add_balance((int) $receipt['tg_id'], $reward, 'ref', 'card-receipt:' . $receiptId,
+            'کش‌بک ' . $percent . '٪ کارت‌به‌کارت');
+        return $reward;
+    });
+}
+
 function review_receipt(int $receiptId, bool $approve, int $adminId): array
 {
     /* دفاع لایه‌ای: حتی فراخوانی مستقیم این سرویس هم فقط برای نقش رسید است. */
     if (!admin_can($adminId, 'receipt')) {
         return [false, 'دسترسی بررسی رسید ندارید.'];
     }
-    $receipt = DB::one('SELECT * FROM receipts WHERE id=?', [$receiptId]);
-    if ($receipt === null) {
+    /* Claiming a receipt and reserving today's card capacity share one
+       BEGIN IMMEDIATE transaction. Two finance operators therefore cannot both
+       approve the last available amount of the daily ceiling. */
+    $claim = DB::tx(static function () use ($receiptId, $approve, $adminId): array {
+        $receipt = DB::one('SELECT * FROM receipts WHERE id=?', [$receiptId]);
+        if ($receipt === null) {
+            return ['state' => 'missing'];
+        }
+        if ((string) $receipt['status'] !== 'pending') {
+            return ['state' => 'already', 'receipt' => $receipt];
+        }
+        $order = order_get((int) $receipt['order_id']);
+        if ($order === null) {
+            return ['state' => 'order-missing'];
+        }
+        if ($approve && !gw_daily_capacity_available('card', (int) $receipt['amount'])) {
+            return ['state' => 'limit', 'receipt' => $receipt, 'order' => $order];
+        }
+        $claimed = DB::update("UPDATE receipts SET status=?, reviewed_by=?, reviewed_at=? "
+            . "WHERE id=? AND status='pending'",
+            [$approve ? 'approved' : 'rejected', $adminId, now_ts(), $receiptId]);
+        if ($claimed !== 1) {
+            return ['state' => 'already'];
+        }
+        /* A receipt is evidence submitted before the deadline. Normalize old
+           rows that predate the review status so delivery never treats it as a
+           newly-expired pending invoice. */
+        DB::update("UPDATE orders SET status='review' WHERE id=? AND status='pending'", [(int) $order['id']]);
+        $order = order_get((int) $order['id']) ?? $order;
+        return ['state' => 'claimed', 'receipt' => DB::one('SELECT * FROM receipts WHERE id=?', [$receiptId]) ?? $receipt,
+            'order' => $order];
+    });
+    $claimState = (string) ($claim['state'] ?? 'missing');
+    if ($claimState === 'missing') {
         return [false, 'رسید پیدا نشد'];
     }
-    if ($receipt['status'] !== 'pending') {
-        return [false, 'این رسید قبلاً بررسی شده است'];
-    }
-    $order = order_get((int) $receipt['order_id']);
-    if ($order === null) {
+    if ($claimState === 'order-missing') {
         return [false, 'سفارش پیدا نشد'];
     }
-    /* سه مسئول ممکن است هم‌زمان روی یک کارت بزنند؛ فقط اولین نفر حق
-       تغییر pending را دارد تا تحویل/اعتبار هرگز دوبار اجرا نشود. */
-    $claimed = DB::update("UPDATE receipts SET status=?, reviewed_by=?, reviewed_at=? "
-        . "WHERE id=? AND status='pending'",
-        [$approve ? 'approved' : 'rejected', $adminId, now_ts(), $receiptId]);
-    if ($claimed !== 1) {
-        return [false, 'این رسید همین حالا توسط مسئول دیگری بررسی شد'];
+    if ($claimState === 'limit') {
+        return [false, 'سقف تراکنشِ تأییدشدهٔ امروز برای کارت‌به‌کارت پر شده است؛ رسید همچنان در انتظار بررسی ماند.'];
     }
+    if ($claimState !== 'claimed') {
+        return [false, 'این رسید قبلاً بررسی شده است'];
+    }
+    $receipt = $claim['receipt'];
+    $order = $claim['order'];
     log_payment('card receipt reviewed', [
         'receipt' => $receiptId, 'approve' => $approve, 'admin' => $adminId,
         'tg' => (int) $receipt['tg_id'], 'amount' => (int) $receipt['amount'],
@@ -270,7 +328,11 @@ function review_receipt(int $receiptId, bool $approve, int $adminId): array
     }
     $balanceBefore = balance_of((int) $order['tg_id']);
     [$ok, $text] = settle_payment($order, 'card', $adminId);
+    $reward = $ok ? receipt_apply_cashback_once($receiptId) : 0;
     $balanceAfter = balance_of((int) $order['tg_id']);
+    if ($reward > 0) {
+        $text .= "\n🎁 " . money($reward) . ' کش‌بک کارت‌به‌کارت به کیف پولتان اضافه شد.';
+    }
     support_send_admin_message($adminId, (int) $order['tg_id'], $text, home_kb((int) $order['tg_id']));
     $footer = $stamp;
     if ($ok) {
@@ -279,7 +341,9 @@ function review_receipt(int $receiptId, bool $approve, int $adminId): array
     } else {
         $footer .= "\n⚠️ ولی تحویل با خطا مواجه شد — گزارش خطا را ببینید.";
     }
-    receipt_close_card($receiptId, $ok, $adminId, $footer);
+    /* The money receipt remains approved even when downstream panel delivery
+       needs repair; showing it as rejected would invite a duplicate payment. */
+    receipt_close_card($receiptId, true, $adminId, $footer);
     return [true, $ok ? 'تأیید و تحویل شد ✅' : 'تأیید شد ولی تحویل خطا داد ⚠️'];
 }
 

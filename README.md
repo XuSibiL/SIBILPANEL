@@ -4,16 +4,16 @@
 
 **ربات فروش پنل پاسارگارد (PasarGuard) — نسخهٔ PHP**
 
-**نسخهٔ پایدار: `3.18.2`**
+**نسخهٔ پایدار: `3.18.3`**
 
 فروش پنل حجمی/ساعتی، کیف پول، درگاه‌های پرداخت ایرانی و کریپتو، احراز هویت دو سطحی،
 کد تخفیف، سیستم دعوت دوستان و پنل مدیریت کامل — بدون فریم‌ورک، بدون Composer.
 
-![version](https://img.shields.io/badge/version-3.18.2-2ea043)
+![version](https://img.shields.io/badge/version-3.18.3-2ea043)
 ![php](https://img.shields.io/badge/PHP-8.1%2B-777bb4)
 ![db](https://img.shields.io/badge/SQLite-PDO-003b57)
 ![license](https://img.shields.io/badge/license-MIT-blue)
-![tests](https://img.shields.io/badge/tests-746%20passing-2ea043)
+![tests](https://img.shields.io/badge/tests-198%20passing-2ea043)
 
 [![کانال رسمی تلگرام](https://img.shields.io/badge/Telegram-%DA%A9%D8%A7%D9%86%D8%A7%D9%84%20%D8%B1%D8%B3%D9%85%DB%8C-229ED9?logo=telegram&logoColor=white)](https://t.me/sibilpanel)
 [![GitHub](https://img.shields.io/badge/GitHub-XuSibiL%2FSIBILPANEL-181717?logo=github&logoColor=white)](https://github.com/XuSibiL/SIBILPANEL)
@@ -340,7 +340,7 @@ sibil-panel/
 │   ├── handlers/             ← روتر کال‌بک/پیام، ویزارد، رسیدها
 │   ├── cli/                  ← سلف‌تست و دستورهای خط فرمان
 │   └── web/                  ← وب‌هوک درگاه‌ها
-├── tests/                    ← ۶ سوئیت تست
+├── tests/                    ← ۷ سوئیت تست
 ├── docs/                     ← معماری، امنیت، یادداشت نسخه
 └── .github/workflows/ci.yml  ← CI: lint + تست
 ```
@@ -350,17 +350,17 @@ sibil-panel/
 ## تست‌ها
 
 ```bash
-php tests/test_all.php         # 687
-php tests/test_panel_flow.php  # 221
-php tests/test_kyc.php         # 184
-php tests/test_payments.php    # 166
-php tests/test_update.php      # 57 (بروزرسانی از گیت‌هاب)
-php tests/audit_buttons.php    # همهٔ دکمه‌ها و صفحه‌ها
-php tests/audit_owner.php      # 25
+php tests/test_payment_iran_controls.php
+php tests/test_payment_tetrapay.php
+php tests/test_mirza_payment_selector.php
+php tests/test_hourly_unlimited.php
+php tests/test_v318_unlimited.php
+php tests/test_rbac_force_join.php
+bash tests/test_cli_safety.sh
 ```
 
-همه بدون شبکه اجرا می‌شوند (تلگرام و پنل mock/dry هستند) و باید آخرشان
-`RESULT: OK` بدهند.
+همه بدون شبکه اجرا می‌شوند (تلگرام و پنل mock/dry هستند). هر سوئیت PHP باید با
+`failed: 0` و سوئیت shell با گزارش بدون خطا پایان یابد.
 
 ---
 

@@ -487,10 +487,10 @@ function handle_callback_inner(array $cb): void
             $gw = (string) ($parts[3] ?? '');
             /* مهلت پرداخت واقعاً اعمال می‌شود: اگر فاکتور از حد گذشته باشد هیچ
                درگاهی باز نمی‌شود و سفارش بسته می‌شود — نه فقط یک نوشته. */
-            payments_expire(set_int('pay_expire_minutes', 30));
+            payments_expire(set_int('pay_expire_minutes', 1440));
             $fresh = order_get((int) $order['id']);
             if ($fresh === null || $fresh['status'] !== 'pending') {
-                $minutes = max(1, set_int('pay_expire_minutes', 30));
+                $minutes = max(1, set_int('pay_expire_minutes', 1440));
                 Tg::show($chatId, $messageId,
                     '⌛️ <b>مهلت پرداخت تمام شد</b>' . "\n\n"
                     . 'این فاکتور ' . fa_digits($minutes) . ' دقیقه اعتبار داشت و اکنون بسته شد.'
@@ -571,7 +571,21 @@ function handle_callback_inner(array $cb): void
             Tg::show($chatId, $messageId, 'این سفارش معتبر نیست.', home_kb($uid));
             return;
         }
-        if ((string) $order['status'] !== 'pending' && (string) $order['status'] !== 'review') {
+        if ((string) $order['status'] === 'pending' && order_cancel_if_payment_expired($order)) {
+            State::clear($uid);
+            Tg::show($chatId, $messageId,
+                '⌛️ مهلت ارسال رسید این فاکتور تمام شده است.' . "\n" . 'یک سفارش تازه بساز.',
+                [[btn('💳 شارژ کیف پول', 'menu:wallet', null, 'success')],
+                 [btn('« خانه', 'home', null, 'danger')]]);
+            return;
+        }
+        if ((string) $order['status'] === 'review') {
+            State::clear($uid);
+            Tg::show($chatId, $messageId, 'این رسید قبلاً برای بررسی ثبت شده است.', home_kb($uid));
+            return;
+        }
+        if ((string) $order['status'] !== 'pending') {
+            State::clear($uid);
             Tg::show($chatId, $messageId,
                 '⌛️ این سفارش دیگر باز نیست.' . "\n" . 'یک سفارش تازه بساز.',
                 [[btn('💳 شارژ کیف پول', 'menu:wallet', null, 'success')],
@@ -1175,11 +1189,6 @@ function handle_callback_inner(array $cb): void
                 screen_pay_gateway($chatId, $messageId, $gw);
                 return;
             }
-            if ($op === 'sandbox' && $gw === 'tetrapay') {
-                set_put('pay_tetrapay_sandbox', tetrapay_sandbox() ? '0' : '1');
-                screen_pay_gateway($chatId, $messageId, $gw);
-                return;
-            }
             if ($op === 'test') {
                 $test = gw_live_test($gw);
                 $text = '🛡 <b>بررسی امن پیکربندی ' . e(PAY_GATEWAYS[$gw]['label']) . "</b>\n\n"
@@ -1193,31 +1202,51 @@ function handle_callback_inner(array $cb): void
                      [btn('« ' . PAY_GATEWAYS[$gw]['label'], 'ad:pay:' . $gw, null, 'danger')]]);
                 return;
             }
-            if (in_array($op, ['key', 'key2', 'min', 'max', 'cashback', 'minfiat', 'endpoint'], true)) {
-                $labels = ['key' => 'کلید درگاه (API key / merchant / pin)',
-                           'key2' => 'کلید دوم (secret / endpoint / آدرس کیف پول / IPN)',
+            if ($op === 'endpoint' && $gw !== 'iranpay4') {
+                Tg::answer($cbId, 'آدرس سرویس فقط برای ابان‌پی قابل تنظیم است.', true);
+                screen_pay_gateway($chatId, $messageId, $gw);
+                return;
+            }
+            if ($op === 'key2' && $gw === 'tetrapay') {
+                Tg::answer($cbId, 'تتراپی فقط با کلید API اصلی تنظیم می‌شود.', true);
+                screen_pay_gateway($chatId, $messageId, $gw);
+                return;
+            }
+            if (in_array($op, ['key', 'key2', 'min', 'max', 'daily', 'cashback', 'help', 'minfiat', 'endpoint'], true)) {
+                $key2Label = match ($gw) {
+                    'variza' => 'کلید امضای وب‌هوک Variza',
+                    'nowpayment' => 'IPN secret نواپی‌منت',
+                    'iranpay2' => 'کلید دوم / امضای کال‌بک CubePay',
+                    'trx' => 'آدرس کیف پول TRX',
+                    default => 'کلید دوم',
+                };
+                $labels = ['key' => 'کلید اصلی درگاه (API key / merchant / pin)',
+                           'key2' => $key2Label,
                            'min' => 'حداقل مبلغ برای این درگاه (تومان)',
                            'max' => 'حداکثر مبلغ برای این درگاه (تومان)',
+                           'daily' => 'سقف مجموع تراکنش‌های تأییدشدهٔ امروز (تومان؛ 0 = بدون سقف)',
                            'minfiat' => 'حداقل تراکنش این درگاه (دلار، 0 = خودکار از خود درگاه)',
-                           'endpoint' => 'آدرس سرویس درگاه (با https؛ خالی = پیش‌فرض رسمی)',
-                           'cashback' => 'درصد کش‌بک این درگاه (0 = بدون کش‌بک)'];
+                           'endpoint' => 'آدرس HTTPS سرویس AbanPay (بدون /create؛ خالی = غیرفعال)',
+                           'cashback' => 'درصد کش‌بک این درگاه (0 = بدون کش‌بک)',
+                           'help' => 'راهنمای کوتاه مشتری پس از ساخت فاکتور (برای پاک‌کردن: -)'];
                 $current = match ($op) {
                     'key' => set_get('pay_' . $gw . '_key'),
                     'key2' => set_get('pay_' . $gw . '_key2'),
                     'min' => (string) gw_min($gw),
                     'max' => (string) gw_max($gw),
+                    'daily' => (string) gw_daily_limit($gw),
                     'minfiat' => (string) (int) set_get('pay_' . $gw . '_min_fiat', '0'),
-                    'endpoint' => set_get('pay_' . $gw . '_endpoint',
-                        gw_endpoint_default($gw)),
+                    'endpoint' => set_get('pay_iranpay4_endpoint', ''),
+                    'help' => gw_help($gw),
                     default => (string) gw_cashback($gw),
                 };
                 $shownCurrent = in_array($op, ['key', 'key2'], true)
                     ? ($current !== '' ? '✅ ثبت شده (نمایش داده نمی‌شود)' : '—')
-                    : ($current !== '' ? $current : '—');
+                    : ($current !== '' ? e(mb_substr($current, 0, 250)) : '—');
                 wiz_start($uid, 'gwfield', [
                     step_def('value', $labels[$op] . "
 مقدار فعلی: " . $shownCurrent,
-                        in_array($op, ['key', 'key2', 'endpoint'], true) ? 'text' : 'int', null,
+                        in_array($op, ['key', 'key2', 'endpoint', 'help'], true) ? 'text' : 'int', null,
                         '💳 ' . PAY_GATEWAYS[$gw]['label']),
                 ], ['gw' => $gw, 'field' => $op]);
                 return;
@@ -1635,6 +1664,8 @@ function handle_callback_inner(array $cb): void
                             . "\n\n" . UNLIMITED_ROLE_GUIDE,
                             'text', null, '♾️ پنل نامحدود جدید'),
                         step_def('emoji', 'ایموجی محصول — یا - برای ♾️', 'text', '♾️'),
+                        step_def('note', 'توضیح تکمیلی/نوع تانل را بفرستید — مثلاً: مستقیم + تانل خارج مولتی‌یوزری. برای خالی‌گذاشتن: -',
+                            'text', ''),
                         step_def('panel_id', 'پنل این محصول را انتخاب کنید:', 'pick', 0,
                             '🔌 انتخاب پنل', 'panels'),
                         step_def('role_id', 'نقش این محصول روی همین پنل را انتخاب کنید '
@@ -1644,7 +1675,7 @@ function handle_callback_inner(array $cb): void
                             '💵 نرخ ساعتی هر کاربر'),
                         step_def('hourly_price', 'اجارهٔ ثابت خودِ پنل در هر ساعت (تومان) را بفرستید — 0 مجاز است.',
                             'int', 0, '🏷 اجارهٔ ثابت ساعتی پنل'),
-                        step_def('device_limit', 'تعداد دستگاه برای نمایش محصول را بفرستید — محدودیت نهایی را Role پاسارگارد اعمال می‌کند.',
+                        step_def('device_limit', 'تعداد دستگاه برای هر کاربر را بفرستید — محدودیت نهایی را Role پاسارگارد اعمال می‌کند.',
                             'int', 0, '📱 دستگاه هر کاربر'),
                         step_def('min_users', 'حداقل تعداد کاربر در هر خرید یا شارژ را بفرستید.',
                             'int', 1, '👥 حداقل تعداد کاربر'),

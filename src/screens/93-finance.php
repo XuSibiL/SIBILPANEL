@@ -99,7 +99,7 @@ function screen_finance(int|string $chat, ?int $messageId): void
  */
 function screen_fin_settings(int|string $chat, ?int $messageId): void
 {
-    $expire = set_int('pay_expire_minutes', 30);
+    $expire = set_int('pay_expire_minutes', 1440);
     $disc = set_bool('discount_enabled', true);
     $minTop = set_int('min_topup', 50000);
     $maxTop = set_int('max_topup', 20000000);

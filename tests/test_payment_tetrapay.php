@@ -32,9 +32,17 @@ function okpay(bool $condition, string $label): void
 
 set_put('web_url', 'https://panel.example.test');
 set_put('pay_tetrapay_key', 'test-api-key');
+/* A legacy secret may still secure an optional webhook, but production setup
+   itself needs only the API key. There is intentionally no sandbox setting. */
 set_put('pay_tetrapay_key2', 'test-webhook-secret');
 set_put('pay_tetrapay_on', '1');
-set_put('pay_tetrapay_sandbox', '0');
+
+/* Trusted installation values outrank the legacy configurable web_url. */
+putenv('PANEL_WEB_URL=https://runtime.example.test/sibil');
+putenv('PANEL_DOMAIN=domain.example.test');
+$trustedCallback = tetrapay_callback_url();
+putenv('PANEL_WEB_URL');
+putenv('PANEL_DOMAIN');
 
 $calls = [];
 $GLOBALS['panel_http_mock'] = static function (string $method, string $url, array $headers, ?string $body) use (&$calls): array {
@@ -79,11 +87,17 @@ okpay(($created['url'] ?? '') === 'https://pay.example.test/tp_token_123456', 'h
 okpay(($created['alt_url'] ?? '') === 'https://t.me/TetraBot?start=tp_token_123456', 'Telegram checkout URL is available');
 okpay(($request['amount'] ?? '') === '250000', 'internal toman amount is sent to TetraPay as Rial');
 okpay(str_starts_with((string) ($request['order_id'] ?? ''), 'sibil-'), 'provider order ID is payment-specific');
+okpay(tetrapay_base_url() === 'https://api.tetra98.com/api/v1'
+    && $trustedCallback === 'https://runtime.example.test/sibil/pay/tetrapay',
+    'TetraPay uses fixed production v1 and trusted PANEL_WEB_URL callback priority');
 okpay(($request['callback_url'] ?? '') === 'https://panel.example.test/pay/tetrapay', 'HTTPS callback is generated');
 okpay(($request['webhook_url'] ?? '') === 'https://panel.example.test/pay/tetrapay/webhook', 'signed webhook URL is generated only with a secret');
 okpay(str_contains($headers, 'Authorization: Bearer test-api-key'), 'API authorization header is used');
 okpay(($meta['tetrapay_amount_rial'] ?? '') === '250000', 'Rial amount snapshot is stored with the payment');
-okpay(str_contains(pay_created_notice($order, $payment ?? []), 'هیچ مبلغی به کیف پول اضافه نمی‌شود'), 'created notice never claims an early wallet credit');
+$createdNotice = pay_created_notice($order, $payment ?? []);
+okpay(str_contains($createdNotice, 'Verify/Webhook')
+    && !str_contains($createdNotice, 'به کیف پول شما واریز گردید'),
+    'created notice never claims an early wallet credit');
 
 $again = pay_start($order, 'tetrapay');
 okpay(($again['reused'] ?? false) === true && count($calls) === 1, 'reselecting gateway reuses the same unpaid checkout');
@@ -94,7 +108,10 @@ echo "\n== verify and idempotence ==\n";
 okpay(($verified['ok'] ?? false) === true && ($verified['state'] ?? '') === 'success', 'provider verify settles the payment');
 okpay(($paid['status'] ?? '') === 'paid', 'settlement marks the payment as paid');
 okpay(balance_of($uid) === 25000, 'verified top-up credits exactly once');
-okpay(str_contains((string) (Tg::$outbox[array_key_last(Tg::$outbox)][1]['text'] ?? ''), 'پرداخت با موفقیت و به‌صورت قطعی تأیید شد'), 'success notice is emitted only after verify');
+$outboxText = implode("\n", array_map(static fn(array $row): string => (string) ($row[1]['text'] ?? ''), Tg::$outbox));
+okpay(str_contains($outboxText, 'پرداخت شما با موفقیت و به‌صورت قطعی تأیید شد')
+    && str_contains($outboxText, 'به کیف پول شما واریز گردید'),
+    'success and wallet-credit notices are emitted only after verify');
 $repeat = pay_tetrapay_verify($paid ?? [], ['token' => 'tp_token_123456']);
 okpay(($repeat['state'] ?? '') === 'already' && balance_of($uid) === 25000, 'repeat verify cannot credit the wallet twice');
 
@@ -130,6 +147,15 @@ $safe = gw_live_test('tetrapay');
 echo "\n== safe admin check ==\n";
 okpay(($safe['ok'] ?? false) === true, 'safe admin check validates configured TetraPay endpoints');
 okpay(count($calls) === $beforeCheck, 'safe admin check never contacts or creates a provider payment');
+
+Tg::$outbox = [];
+screen_pay_gateway($uid, null, 'tetrapay');
+$adminUi = json_encode(Tg::$outbox, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) ?: '';
+okpay(str_contains($adminUi, 'کلید اصلی') && !str_contains($adminUi, ':endpoint')
+    && !str_contains($adminUi, ':key2') && !str_contains($adminUi, 'سندباکس'),
+    'TetraPay admin setup exposes one API key with no endpoint, key2, or sandbox control');
+okpay(str_contains(tetrapay_error(['error' => ['code' => 'INVALID_CALLBACK']]), 'نصب'),
+    'provider callback rejection receives a practical installation remedy');
 
 unset($GLOBALS['panel_http_mock']);
 DB::close();

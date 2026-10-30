@@ -134,6 +134,13 @@ final class Tg
     public static ?string $pendingAnswer = null;
     public static int $photoSeq = 500;
     public static array $outbox = [];
+    /**
+     * Test-only call interceptor. It is null in production and is deliberately
+     * never populated from configuration or an update payload.
+     *
+     * @var null|callable(string,array):?array
+     */
+    public static $callStub = null;
     /** جلوگیری از حلقهٔ بی‌پایان وقتی تلگرام حتی با ایموجی استاندارد هم خطا می‌دهد */
     public static bool $plainRetry = false;
     /** برای تست: پاسخ ساختگی getChat در حالت خشک */
@@ -147,6 +154,15 @@ final class Tg
 
     public static function call(string $method, array $params = []): ?array
     {
+        /* The interceptor exists solely for deterministic local regressions
+           (notably Telegram Stars). It is opt-in and unset by default. */
+        if (is_callable(self::$callStub)) {
+            self::$outbox[] = [$method, $params];
+            $stubbed = (self::$callStub)($method, $params);
+            if ($stubbed !== null) {
+                return $stubbed;
+            }
+        }
         if (self::$dry) {
             self::$outbox[] = [$method, $params];
             return ['ok' => true, 'result' => ['message_id' => count(self::$outbox)]];
@@ -822,7 +838,10 @@ function kb_ensure_back(?array $rows): ?array
             if (str_starts_with($data, 'ad:')) {
                 $isAdmin = true;
             }
-            if ($data === 'nav:back' || str_starts_with($data, 'nav:back:')) {
+            if ($data === 'nav:back' || str_starts_with($data, 'nav:back:')
+                || str_starts_with($data, 'inv:back:')) {
+                /* Mirza's payment selector has exactly one «بستن لیست» action;
+                   its invoice-back callback is already the intended way out. */
                 $hasBack = true;
             }
             if (preg_match('/^[«↩🔙]/u', $text) === 1) {

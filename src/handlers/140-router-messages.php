@@ -438,6 +438,22 @@ function handle_message_inner(array $message): void
                 Tg::send($chatId, 'سفارش پیدا نشد.', home_kb($uid));
                 return;
             }
+            /* A card receipt must be submitted before the invoice deadline.
+               Once submitted, the order changes to review and finance may still
+               decide it later; this guard never cancels that manual review. */
+            if ((string) $order['status'] === 'pending' && order_cancel_if_payment_expired($order)) {
+                State::clear($uid);
+                Tg::send($chatId, '⌛️ مهلت ارسال رسید این فاکتور تمام شده است. یک سفارش تازه بسازید.',
+                    home_kb($uid));
+                return;
+            }
+            if ((string) $order['status'] !== 'pending') {
+                State::clear($uid);
+                Tg::send($chatId, (string) $order['status'] === 'review'
+                    ? 'این رسید قبلاً برای بررسی ثبت شده است.'
+                    : 'این سفارش دیگر برای ثبت رسید باز نیست.', home_kb($uid));
+                return;
+            }
             $photoId = '';
             if (isset($message['photo']) && is_array($message['photo'])) {
                 $sizes = $message['photo'];
@@ -452,12 +468,46 @@ function handle_message_inner(array $message): void
                 Tg::send($chatId, '📷 لطفاً <b>عکس رسید</b> را بفرستید (یا فایل تصویری).');
                 return;
             }
+            /* Recheck and claim inside BEGIN IMMEDIATE. The user may have had
+               the receipt screen open when the deadline passed, or may tap
+               twice from two Telegram updates; neither case may create a late
+               or duplicate review record. */
+            $submission = DB::tx(static function () use ($orderId, $uid, $photoId): array {
+                $fresh = order_get($orderId);
+                if ($fresh === null || (int) $fresh['tg_id'] !== $uid) {
+                    return ['state' => 'missing'];
+                }
+                if ((string) $fresh['status'] === 'pending' && order_payment_expired($fresh)) {
+                    DB::update("UPDATE orders SET status='canceled', paid_at=NULL WHERE id=? AND status='pending'",
+                        [$orderId]);
+                    return ['state' => 'expired'];
+                }
+                if ((string) $fresh['status'] !== 'pending') {
+                    return ['state' => 'closed', 'order' => $fresh];
+                }
+                $receiptId = DB::exec('INSERT INTO receipts(tg_id, order_id, amount, photo_id, ref, '
+                    . 'status, created_at) VALUES(?,?,?,?,?,?,?)',
+                    [$uid, $orderId, (int) $fresh['payable'], $photoId, (string) $fresh['ref'],
+                     'pending', now_ts()]);
+                DB::update("UPDATE orders SET status='review' WHERE id=? AND status='pending'", [$orderId]);
+                return ['state' => 'submitted', 'receipt' => $receiptId,
+                    'order' => order_get($orderId) ?? $fresh];
+            });
             State::clear($uid);
-            $receiptId = DB::exec('INSERT INTO receipts(tg_id, order_id, amount, photo_id, ref, '
-                . 'status, created_at) VALUES(?,?,?,?,?,?,?)',
-                [$uid, $orderId, (int) $order['payable'], $photoId, (string) $order['ref'],
-                 'pending', now_ts()]);
-            DB::exec("UPDATE orders SET status='review' WHERE id=?", [$orderId]);
+            if (($submission['state'] ?? '') === 'expired') {
+                Tg::send($chatId, '⌛️ مهلت ارسال رسید این فاکتور تمام شده است. یک سفارش تازه بسازید.',
+                    home_kb($uid));
+                return;
+            }
+            if (($submission['state'] ?? '') !== 'submitted') {
+                $closed = $submission['order'] ?? [];
+                Tg::send($chatId, (string) ($closed['status'] ?? '') === 'review'
+                    ? 'این رسید قبلاً برای بررسی ثبت شده است.'
+                    : 'این سفارش دیگر برای ثبت رسید باز نیست.', home_kb($uid));
+                return;
+            }
+            $receiptId = (int) $submission['receipt'];
+            $order = $submission['order'];
             log_payment('card receipt submitted', [
                 'receipt' => $receiptId, 'order' => $orderId, 'tg' => $uid,
                 'amount' => (int) $order['payable'], 'ref' => (string) $order['ref'],

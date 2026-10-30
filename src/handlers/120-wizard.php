@@ -329,24 +329,29 @@ function wiz_finish(int $uid, array $data): void
             }
             /* مدل جدید فقط برای محصول تازه فعال می‌شود. محصولات/پنل‌های قدیمی
                عمداً legacy می‌مانند تا اقتصاد فروخته‌شده‌شان تغییر نکند. */
-            $productId = DB::exec('INSERT INTO products(name, emoji, category, category_id, '
+            $tagline = trim((string) ($values['note'] ?? ''));
+            if ($tagline === '-') {
+                $tagline = '';
+            }
+            $productId = DB::exec('INSERT INTO products(name, emoji, note, category, category_id, '
                 . 'role_id, group_ids, max_users, device_limit, days, data_cap_gb, per_gb_price, '
                 . 'hourly_price, min_balance, renew_price, slots_needed, panel_prefix, trial, '
                 . 'active, created_at, panel_id, sale_type, per_user_price, min_users, unlimited_billing_mode) '
-                . 'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
-                [trim((string) $values['name']), $values['emoji'] ?: '♾️', 'v2ray', $catId,
-                 $roleId, '[]', 0, $deviceLimit, 0, 0, 0, $fixedHourly, 0, 0, 1, '', 0, 1,
-                 now_ts(), (int) $panelRow['id'], PRODUCT_SALE_UNLIMITED_USERS, $perUser,
-                 $minUsers, UNLIMITED_BILLING_HOURLY]);
+                . 'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                [trim((string) $values['name']), $values['emoji'] ?: '♾️', mb_substr($tagline, 0, 180),
+                 'v2ray', $catId, $roleId, '[]', 0, $deviceLimit, 0, 0, 0, $fixedHourly,
+                 0, 0, 1, '', 0, 1, now_ts(), (int) $panelRow['id'],
+                 PRODUCT_SALE_UNLIMITED_USERS, $perUser, $minUsers, UNLIMITED_BILLING_HOURLY]);
             $text = '✅ محصول نامحدود ساعتی #' . $productId . " ساخته شد.\n\n"
                 . ($values['emoji'] ?: '♾️') . ' <b>' . e((string) $values['name']) . "</b>\n"
                 . '🔌 پنل: ' . e((string) $panelRow['name']) . "\n"
                 . '🎭 نقش: ' . e($roleName !== '' ? $roleName : (string) $roleId) . "\n"
                 . '💵 نرخ هر کاربر / ساعت: <b>' . money($perUser) . "</b>\n"
                 . '🏷 اجارهٔ ثابت پنل / ساعت: <b>' . money($fixedHourly) . "</b>\n"
-                . '📱 دستگاهِ نمایش محصول: <b>' . fa_digits($deviceLimit) . "</b>\n"
+                . ($tagline !== '' ? '🧩 توضیح: ' . e($tagline) . "\n" : '')
+                . '📱 دستگاه هر کاربر: <b>' . fa_digits($deviceLimit) . "</b>\n"
                 . '👥 حداقل تعداد کاربر: <b>' . fa_digits($minUsers) . "</b>\n\n"
-                . 'ساعت اول با خرید پرداخت می‌شود؛ از ساعت بعد کسر خودکار از کیف پول آغاز می‌شود.\n'
+                . 'پرداخت مصرفی است؛ ساعت نخست هنگام فعال‌سازی و ساعت‌های بعد از کیف پول محاسبه می‌شوند.\n'
                 . UNLIMITED_ROLE_GUIDE;
             Tg::send($uid, $text, [
                 [btn('👁 پیش‌نمایش محصول', 'ad:prod:' . $productId)],
@@ -397,21 +402,43 @@ function wiz_finish(int $uid, array $data): void
                 Tg::send($uid, 'درگاه پیدا نشد.', console_kb());
                 return;
             }
-            $value = $values['value'];
-            $settingKey = 'pay_' . $gw . ($field === 'minfiat' ? '_min_fiat' : '_' . $field);
-            set_put($settingKey, (string) $value);
+            $value = trim((string) $values['value']);
+            if ($field === 'endpoint' && $gw !== 'iranpay4') {
+                Tg::send($uid, '❌ فقط آدرس سرویس ابان‌پی قابل تنظیم است.',
+                    [[btn('« درگاه', 'ad:pay:' . $gw, null, 'danger')]]);
+                return;
+            }
+            if ($field === 'endpoint' && $value !== '' && !gw_https_url($value)) {
+                Tg::send($uid, '❌ آدرس سرویس باید یک HTTPS معتبر و بدون اطلاعات ورود باشد.',
+                    [[btn('🌐 دوباره', 'ad:pay:' . $gw . ':endpoint', null, 'primary')]]);
+                return;
+            }
+            if (in_array($field, ['min', 'max', 'daily', 'cashback', 'minfiat'], true) && (int) $value < 0) {
+                Tg::send($uid, '❌ مقدار منفی معتبر نیست.', [[btn('« درگاه', 'ad:pay:' . $gw, null, 'danger')]]);
+                return;
+            }
+            if ($field === 'help' && $value === '-') {
+                $value = '';
+            }
+            $settingKey = match ($field) {
+                'minfiat' => 'pay_' . $gw . '_min_fiat',
+                'daily' => 'pay_' . $gw . '_daily_limit',
+                'endpoint' => 'pay_iranpay4_endpoint',
+                'help' => 'pay_' . $gw . '_help',
+                default => 'pay_' . $gw . '_' . $field,
+            };
+            set_put($settingKey, $value);
             if ($field === 'minfiat') {
                 set_put('pay_' . $gw . '_min_cache', '0');
                 set_put('pay_' . $gw . '_min_at', '0');
             }
-            /* فقط کلید اصلی می‌تواند درگاه را آماده کند؛ secret وب‌هوک به‌تنهایی کافی نیست. */
-            if ($field === 'key' && (string) $value !== ''
-                && set_get('pay_' . $gw . '_on') !== '1' && $gw !== 'card') {
+            /* فقط کلید اصلی می‌تواند درگاه را روشن کند؛ readiness همچنان همهٔ رازها/کال‌بک‌ها را می‌سنجد. */
+            if ($field === 'key' && $value !== '' && set_get('pay_' . $gw . '_on') !== '1' && $gw !== 'card') {
                 set_put('pay_' . $gw . '_on', '1');
             }
             $saved = in_array($field, ['key', 'key2'], true)
                 ? 'کلید محرمانه ثبت شد و نمایش داده نمی‌شود.'
-                : e((string) $value);
+                : ($field === 'help' && $value === '' ? 'راهنمای مشتری پاک شد.' : e($value));
             Tg::send($uid, '✅ ذخیره شد: <b>' . $saved . '</b>',
                 [[btn('« درگاه', 'ad:pay:' . $gw, null, 'success')]]);
             return;

@@ -529,6 +529,7 @@ function screen_product_admin(int|string $chat, ?int $messageId, int $productId)
             [btn('👥 حداقل تعداد کاربر', "ad:pf:$productId:minusers"),
              btn('📱 دستگاه', "ad:pf:$productId:devices")],
             [btn('✏️ نام', "ad:pf:$productId:name"), btn('🎨 ایموجی', "ad:pf:$productId:emoji")],
+            [btn('🧩 توضیح/تانل', "ad:pf:$productId:tagline")],
             [btn('🔌 پنل مقصد', "ad:prod:$productId:sp"),
              btn('🎭 نقش پنل', 'ad:rolep:' . $productId)],
             ...($hourlyUnlimited ? [] : [[btn('⏱ فعال‌سازی مدل ساعتی (فقط فروش جدید)',
@@ -579,6 +580,7 @@ function screen_product_admin(int|string $chat, ?int $messageId, int $productId)
 const PRODUCT_FIELDS = [
     'name'      => ['نام محصول', 'text', 'name'],
     'emoji'     => ['ایموجی', 'text', 'emoji'],
+    'tagline'   => ['توضیح تکمیلی/نوع تانل (خالی = حذف)', 'text', 'note'],
     'hourly'    => ['اجارهٔ ثابت ساعتی پنل (تومان) — 0 = بدون اجارهٔ ثابت', 'int', 'hourly_price'],
     'pergb'     => ['قیمت هر گیگ مصرف (تومان)', 'int', 'per_gb_price'],
     'peruser'   => ['نرخ هر کاربر پنل نامحدود (تومان؛ برای مدل جدید در هر ساعت)', 'int', 'per_user_price'],

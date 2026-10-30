@@ -34,7 +34,7 @@ const SETTING_DEFAULTS = [
     'web_url'              => '',
     'web_port'             => '8080',
     'stars_rate'           => '1000',
-    'pay_expire_minutes'   => '30',
+    'pay_expire_minutes'   => '1440', // یک روز؛ پرداخت تازه باید یک روز فرصت داشته باشد
     'trial_on'             => '1',
     'trial_gb'             => '1',
     'trial_hours'          => '24',
@@ -128,6 +128,14 @@ function settings_bootstrap(): void
         if (DB::one('SELECT key FROM settings WHERE key=?', [$key]) === null) {
             set_put($key, $value);
         }
+    }
+    /* v3.18.3 policy: the historical untouched 30-minute default becomes one
+       day.  Deliberate custom values remain untouched. */
+    if (DB::one("SELECT key FROM settings WHERE key='pay_expiry_policy_24h'") === null) {
+        if (set_get('pay_expire_minutes', '') === '30') {
+            set_put('pay_expire_minutes', '1440');
+        }
+        set_put('pay_expiry_policy_24h', '1');
     }
 }
 

@@ -52,7 +52,42 @@ echo "\n== immutable plan economics ==\n";
 okhu(!product_is_hourly_unlimited($legacyProduct), 'existing/default unlimited product remains legacy');
 okhu(product_is_hourly_unlimited($hourlyProduct), 'explicit new product is hourly');
 okhu(unlimited_initial_hourly_total($hourlyProduct, 3) === 417,
-    'first invoice combines fixed hourly rate plus requested users');
+    'first invoice keeps the per-user price hourly and adds only the configured fixed hourly fee');
+
+/* The buyer-facing card is presentation-only: all labels and amounts come from
+   the actual product, while the hourly price mechanics above stay unchanged. */
+$templateProduct = array_replace($hourlyProduct, [
+    'name' => 'پلن حرفه‌ای',
+    'emoji' => '🟣',
+    'note' => 'مستقیم + تانل اختصاصی',
+    'device_limit' => 4,
+]);
+$template = hourly_unlimited_product_detail_text($templateProduct);
+$alternateTemplate = hourly_unlimited_product_detail_text(array_replace($templateProduct, [
+    'name' => 'پلن دیگر',
+    'note' => '',
+    'min_users' => 9,
+    'device_limit' => 7,
+    'per_user_price' => 210,
+    'hourly_price' => 55,
+]));
+echo "\n== buyer presentation only ==\n";
+okhu(str_contains($template, '<b>پلن حرفه‌ای</b>')
+    && str_contains($template, 'مستقیم + تانل اختصاصی'),
+    'hourly buyer card uses the configured product title and optional description');
+okhu(str_contains($template, '👤 تعداد کاربر: از <b>3</b> کاربر')
+    && str_contains($template, '📱 دستگاه هر کاربر: <b>4</b> دستگاه'),
+    'hourly buyer card uses the configured minimum users and device count');
+okhu(str_contains($template, '💵 قیمت هر کاربر: <b>125 ت</b> در ساعت')
+    && str_contains($template, '⏱ هزینهٔ ثابت پنل: <b>42 ت</b> در ساعت')
+    && str_contains($template, '📅 معادل ماهانه هر کاربر: <b>90,000 ت</b>'),
+    'per-user price remains explicitly hourly and all displayed economics are dynamic');
+okhu(str_contains($alternateTemplate, '<b>پلن دیگر</b>')
+    && str_contains($alternateTemplate, '👤 تعداد کاربر: از <b>9</b> کاربر')
+    && str_contains($alternateTemplate, '📱 دستگاه هر کاربر: <b>7</b> دستگاه')
+    && str_contains($alternateTemplate, '💵 قیمت هر کاربر: <b>210 ت</b> در ساعت')
+    && !str_contains($alternateTemplate, 'پلن حرفه‌ای'),
+    'changing catalog values changes only the displayed template values, never hard-coded plan text');
 
 $now = now_ts();
 $hourlyPanelId = DB::exec('INSERT INTO panels(tg_id, product_id, panel_username, panel_password, '

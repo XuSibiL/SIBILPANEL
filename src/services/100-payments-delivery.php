@@ -356,6 +356,12 @@ function order_product(array $order): ?array
  */
 function settle_payment(array $order, string $source = 'wallet', int $adminId = 0): array
 {
+    /* Direct paths (free orders and wallet) do not have a provider payment row
+       to protect them, so they enforce the same invoice TTL here. A submitted
+       manual receipt has status review and is intentionally left for finance. */
+    if ((string) ($order['status'] ?? '') === 'pending' && order_cancel_if_payment_expired($order)) {
+        return [false, 'مهلت این فاکتور تمام شده است؛ یک سفارش تازه بسازید.'];
+    }
     $kind = (string) $order['kind'];
     $tgId = (int) $order['tg_id'];
     /* یک سفارش فقط یک‌بار انجام می‌شود؛ دوبار زدن دکمه یعنی دوبار پنل ساختن */
@@ -508,6 +514,17 @@ function settle_payment(array $order, string $source = 'wallet', int $adminId = 
 
 function pay_from_wallet(array $order): array
 {
+    $fresh = order_get((int) ($order['id'] ?? 0));
+    if ($fresh === null) {
+        return [false, 'سفارش پیدا نشد.'];
+    }
+    $order = $fresh;
+    if (order_cancel_if_payment_expired($order)) {
+        return [false, 'مهلت پرداخت تمام شد؛ یک سفارش تازه بسازید.'];
+    }
+    if (!in_array((string) $order['status'], ['pending', 'delivered'], true)) {
+        return [false, 'این سفارش دیگر برای پرداخت باز نیست.'];
+    }
     $tgId = (int) $order['tg_id'];
     // کدی که تا لحظهٔ پرداخت منقضی/حذف شده، تخفیفش برداشته می‌شود
     $payload = json_decode((string) ($order['payload'] ?? ''), true) ?: [];

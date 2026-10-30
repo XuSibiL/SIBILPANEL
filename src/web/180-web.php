@@ -97,14 +97,13 @@ function web_handle(): void
         return;
     }
 
-    /* وب‌هوک امضاشدهٔ تتراپی؛ قبل از هر پردازش، HMAC و محیط sandbox بررسی می‌شود. */
+    /* وب‌هوک امضاشدهٔ اختیاری تتراپی؛ پیش از هر پردازش HMAC بررسی می‌شود. */
     if ($gw === 'tetrapay/webhook') {
         $signature = web_header('X-TetraPay-Signature');
         if ($signature === '') {
             $signature = web_header('X-Webhook-Signature'); // سازگاری پراکسی‌های قدیمی
         }
-        $result = pay_tetrapay_webhook($input['json'], $input['raw'], $signature,
-            web_header('X-TetraPay-Sandbox'));
+        $result = pay_tetrapay_webhook($input['json'], $input['raw'], $signature);
         web_json((int) ($result['code'] ?? 200), ['status' => $result['text'] ?? 'ok']);
         return;
     }
@@ -144,7 +143,8 @@ function web_handle(): void
     }
     if ($payment === null && in_array($gw, ['iranpay2', 'iranpay4', 'variza'], true)) {
         $orderRef = (string) ($input['get']['order_id'] ?? $input['post']['order_id']
-            ?? $input['get']['order'] ?? '');
+            ?? $input['get']['order'] ?? $input['post']['order']
+            ?? $input['get']['invoice_id'] ?? $input['post']['invoice_id'] ?? '');
         if ($orderRef !== '') {
             $order = DB::one('SELECT * FROM orders WHERE ref=?', [$orderRef]);
             if ($order !== null) {

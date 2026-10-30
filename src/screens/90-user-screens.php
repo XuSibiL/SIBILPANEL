@@ -144,37 +144,55 @@ function screen_buy_category(int|string $chat, ?int $messageId, int $categoryId)
         $rows);
 }
 
+/** نمایش کوتاه مبلغ به تومان برای کارت محصول؛ مبلغ از تنظیمات مدیر می‌آید. */
+function toman_short(int $amount): string
+{
+    return fa_digits(number_format(max(0, $amount))) . ' ت';
+}
+
+/** قالب محصول نامحدود ساعتی: همهٔ مقادیر از محصول/تنظیمات مدیر خوانده می‌شوند. */
+function hourly_unlimited_product_detail_text(array $product): string
+{
+    $emoji = trim((string) ($product['emoji'] ?? '')) ?: '🟠';
+    $name = trim((string) ($product['name'] ?? '')) ?: 'پنل';
+    $tagline = unlimited_product_tagline($product);
+    $title = '🛒 ' . e($emoji) . ' <b>' . e($name) . '</b>';
+    if ($tagline !== '') {
+        $title .= ' { ' . e($tagline) . ' }';
+    }
+    $minUsers = unlimited_min_users($product);
+    $devices = max(0, (int) ($product['device_limit'] ?? 0));
+    $perUser = unlimited_user_price($product);
+    $fixed = unlimited_fixed_hourly_price($product);
+    $monthly = unlimited_monthly_user_equivalent($product);
+
+    return $title . "\n\n"
+        . '🌐 ترافیک: <b>نامحدود ♾️</b>' . "\n"
+        . '👤 تعداد کاربر: از <b>' . fa_digits($minUsers) . '</b> کاربر (به انتخاب خودت)' . "\n"
+        . '📱 دستگاه هر کاربر: <b>' . fa_digits($devices) . "</b> دستگاه\n"
+        . '⏳ اعتبار پنل: <b>بدون انقضا ♾️</b>' . "\n"
+        . '💵 قیمت هر کاربر: <b>' . toman_short($perUser) . "</b> در ساعت\n"
+        . '⏱ هزینهٔ ثابت پنل: <b>' . toman_short($fixed) . "</b> در ساعت\n"
+        . '📅 معادل ماهانه هر کاربر: <b>' . toman_short($monthly) . "</b>\n\n"
+        . '🔋 <b>پرداخت به‌صورت مصرفی (pay-and-go):</b> پیش‌پرداخت دوره‌ای ندارد؛ '
+        . 'هزینهٔ ساعت اول هنگام فعال‌سازی و سپس هر ساعت، فقط بر اساس تعداد کاربری که '
+        . 'انتخاب می‌کنی از کیف پول کم می‌شود و ترافیک آزاد است.';
+}
+
 function product_detail_text(array $product): string
 {
     if (product_is_unlimited($product)) {
-        $hourly = product_is_hourly_unlimited($product);
-        $rateText = $hourly
-            ? ('💵 نرخ هر کاربر / ساعت: <b>' . money(unlimited_user_price($product)) . "</b>\n"
-                . '🏷 اجارهٔ ثابت پنل / ساعت: <b>' . money(unlimited_fixed_hourly_price($product)) . "</b>\n")
-            : ('💵 قیمت هر کاربر: <b>' . money(unlimited_user_price($product)) . "</b>
-");
-        $flowText = $hourly
-            ? ('ساعت اول با فاکتور خرید پرداخت می‌شود: اجارهٔ ثابت + (تعداد کاربر × نرخ هر کاربر). '
-                . 'از ساعت بعد، همین مبلغ به‌صورت ساعتی از کیف پول کم می‌شود.')
-            : 'تعداد کاربر دلخواهتان را وارد می‌کنید و مبلغ فاکتور برابر است با تعداد کاربر × قیمت هر کاربر.';
-        return $product['emoji'] . ' <b>' . e((string) $product['name']) . "</b>
-
-"
-            . '♾️ <b>پنل نامحدود' . ($hourly ? ' با صورتحساب ساعتی' : '') . '</b>' . "
-"
-            . $rateText
-            . '👥 حداقل تعداد کاربر در هر سفارش: <b>'
-                . fa_digits(unlimited_min_users($product)) . "</b>
-"
-            . '📱 دستگاهِ محصول: ' . fa_digits((int) ($product['device_limit'] ?? 0)) . "
-"
-            . '🧩 اسلات لازم: ' . fa_digits((int) $product['slots_needed']) . "
-
-"
-            . $flowText . "
-
-"
-            . '<i>مدت اعتبار و محدودیت واقعی دستگاه‌ها مستقیماً از تنظیمات نقش در پنل پاسارگارد اعمال می‌شود.</i>';
+        if (product_is_hourly_unlimited($product)) {
+            return hourly_unlimited_product_detail_text($product);
+        }
+        /* محصولات و پنل‌های قدیمی عمداً با توضیح اقتصادی گذشته باقی می‌مانند. */
+        return $product['emoji'] . ' <b>' . e((string) $product['name']) . "</b>\n\n"
+            . '♾️ <b>پنل نامحدود</b>' . "\n"
+            . '💵 قیمت هر کاربر: <b>' . money(unlimited_user_price($product)) . "</b>\n"
+            . '👥 حداقل تعداد کاربر در هر سفارش: <b>' . fa_digits(unlimited_min_users($product)) . "</b>\n"
+            . '📱 دستگاه هر کاربر: ' . fa_digits((int) ($product['device_limit'] ?? 0)) . "\n\n"
+            . 'تعداد کاربر دلخواهتان را وارد می‌کنید و مبلغ فاکتور برابر است با تعداد کاربر × قیمت هر کاربر.'
+            . "\n\n" . '<i>مدت اعتبار و محدودیت واقعی دستگاه‌ها مستقیماً از تنظیمات نقش در پنل پاسارگارد اعمال می‌شود.</i>';
     }
     $cap = (float) $product['data_cap_gb'] > 0
         ? fa_digits((float) $product['data_cap_gb']) . ' گیگ' : 'نامحدود';
@@ -182,7 +200,7 @@ function product_detail_text(array $product): string
     $daily = ((int) $product['hourly_price']) * 24;
     $prepaid = panel_prepaid_amount($product);
     $setup = max(0, set_int('panel_setup_fee', 0));
-    return $product['emoji'] . ' <b>' . e($product['name']) . "</b>\n\n"
+    return $product['emoji'] . ' <b>' . e($product['name']) . "\n\n"
         . '👤 تعداد کاربر: ' . fa_digits((int) $product['max_users']) . "\n"
         . '📦 سقف حجم پنل: ' . $cap . "\n"
         . '📱 دستگاه هر کاربر: ' . fa_digits((int) $product['device_limit']) . "\n"
@@ -224,7 +242,7 @@ function screen_product(int|string $chat, ?int $messageId, int $productId): void
 /** ثانیه‌های باقی‌مانده تا بسته‌شدن فاکتور (۰ = بسته شده) */
 function order_seconds_left(array $order): int
 {
-    $minutes = max(1, set_int('pay_expire_minutes', 30));
+    $minutes = max(1, set_int('pay_expire_minutes', 1440));
     $made = (int) ($order['created_at'] ?? now_ts());
     return max(0, ($made + $minutes * 60) - now_ts());
 }
@@ -238,7 +256,7 @@ function order_expiry_line(array $order): string
     }
     /* شمارش پله‌پله: هر ۱۵ دقیقه یک پله کم می‌شود (۳۰ → ۱۵ → ۰) */
     $step = 15;
-    $minutes = max(1, set_int('pay_expire_minutes', 30));
+    $minutes = max(1, set_int('pay_expire_minutes', 1440));
     $remaining = (int) ceil($left / ($step * 60)) * $step;
     $remaining = min($remaining, $minutes);
     if ($remaining <= 0) {
@@ -332,6 +350,36 @@ function discount_allowed_for(string $orderKind): bool
  * فقط روش‌های پرداختِ روشن و آماده نمایش داده می‌شوند؛
  * برای شارژ کیف پول، «پرداخت از کیف پول» و «کد تخفیف» نمایش داده نمی‌شود.
  */
+/** Captions and sequence are copied from public Mirza's payment selector.
+    TetraPay is inserted immediately after Aban as SIBIL's additional rial method. */
+function mirza_payment_gateway_order(): array
+{
+    return ['card', 'plisio', 'nowpayment', 'trx', 'iranpay1', 'iranpay2', 'iranpay4',
+        'tetrapay', 'aqayepardakht', 'zarinpal', 'variza', 'stars'];
+}
+
+function mirza_payment_button_label(string $gateway, array $meta = []): string
+{
+    return [
+        'card'          => '💳 کارت به کارت',
+        'plisio'        => '💰 پرداخت کریپتو با Plisio',
+        'nowpayment'    => '💰 پرداخت کریپتو با NowPayments',
+        'trx'           => '💵 پرداخت مستقیم ترون (TRX)',
+        'iranpay1'      => '💸 درگاه  پرداخت ریالی',
+        'iranpay2'      => '💸 CubePay',
+        'iranpay4'      => '💳 آبان گیت وی (کارت به کارت)',
+        'tetrapay'      => '🔷 تتراپی',
+        'aqayepardakht' => '🔵 درگاه آقای پرداخت',
+        'zarinpal'      => '🟡 زرین پال',
+        'variza'        => '💳 واریزا (کارت‌به‌کارت خودکار)',
+        'stars'         => '💫 Star Telegram',
+    ][$gateway] ?? trim((string) ($meta['emoji'] ?? '') . ' ' . (string) ($meta['label'] ?? $gateway));
+}
+
+/**
+ * The invoice mirrors Mirza's pre-invoice: payment methods are not scattered
+ * over it. One action opens the exact single-column payment selector below.
+ */
 function invoice_kb(array $order, int $uid): array
 {
     $rows = [];
@@ -347,22 +395,19 @@ function invoice_kb(array $order, int $uid): array
         $rows[] = [btn('💰 پرداخت از کیف پول (' . money($balance) . ')',
             'inv:wallet:' . $order['id'], null, 'primary')];
     }
-    foreach (gw_available($uid) as $gwId => $meta) {
-        $rows[] = [btn($meta['emoji'] . ' ' . $meta['label'],
-            'inv:pay:' . $order['id'] . ':' . $gwId, null, 'primary')];
+    if (gw_available($uid) !== []) {
+        $rows[] = [btn('💰 پرداخت و دریافت سرویس', 'inv:gw:' . $order['id'], null, 'primary')];
     }
     if (discount_allowed_for($kind) && (int) $order['discount'] === 0) {
         $rows[] = [btn('🏷 کد تخفیف', 'inv:code:' . $order['id'], null, 'primary')];
     }
-    $rows[] = [btn('« لغو', 'home', null, 'danger')];
-    if (count($rows) === 1) {
-        $rows = [];
+    if ($rows === []) {
         if (support_username() !== '') {
             $rows[] = [btn('☎️ پشتیبانی', null,
                 'https://t.me/' . support_username(), 'primary')];
         }
-        $rows[] = [btn('« لغو', 'home', null, 'danger')];
     }
+    $rows[] = [btn('« لغو', 'home', null, 'danger')];
     return $rows;
 }
 
@@ -394,6 +439,16 @@ function parse_card_input(string $text): array
 /** صفحهٔ کارت‌به‌کارت: شماره کارت + انتظار برای عکس رسید */
 function screen_card_payment(int|string $chat, ?int $messageId, int $uid, array $order): void
 {
+    $fresh = order_get((int) ($order['id'] ?? 0));
+    if ($fresh === null || order_cancel_if_payment_expired($fresh)
+        || (string) $fresh['status'] !== 'pending') {
+        State::clear($uid);
+        Tg::show($chat, $messageId, '⌛️ <b>مهلت این فاکتور تمام شده</b>' . "\n\n"
+            . 'این فاکتور دیگر برای پرداخت باز نیست. یک سفارش تازه بسازید.',
+            [[btn('« خانه', 'home', null, 'danger')]]);
+        return;
+    }
+    $order = $fresh;
     $card = set_get('card_number');
     if ($card === '') {
         Tg::show($chat, $messageId,
@@ -402,6 +457,17 @@ function screen_card_payment(int|string $chat, ?int $messageId, int $uid, array 
         return;
     }
     $toman = (int) $order['payable'];
+    if ($toman < gw_min('card') || $toman > gw_max('card')) {
+        Tg::show($chat, $messageId, '❌ مبلغ خارج از بازهٔ کارت‌به‌کارت است ('
+            . money(gw_min('card')) . ' تا ' . money(gw_max('card')) . ').',
+            [[btn('« بازگشت', 'inv:gw:' . (int) $order['id'], null, 'danger')]]);
+        return;
+    }
+    if (!gw_daily_allowed('card', $toman)) {
+        Tg::show($chat, $messageId, '❌ سقف تراکنشِ تأییدشدهٔ امروز برای کارت‌به‌کارت پر شده است.',
+            [[btn('« بازگشت', 'inv:gw:' . (int) $order['id'], null, 'danger')]]);
+        return;
+    }
     /* ── گارد KYC: سقف واریز و کارت احرازشده، پیش از ورود به پرداخت ── */
     $kycBlock = kyc_guard($uid, $toman, (int) $order['id']);
     if ($kycBlock !== null) {
@@ -579,35 +645,43 @@ function start_trial_order(int $uid, int|string $chat, ?int $messageId, int $pro
 /** صفحهٔ انتخاب درگاه برای یک سفارش */
 function screen_gateways(int|string $chat, ?int $messageId, array $order, ?string $notice = null): void
 {
-    $uid = (int) ($order['tg_id'] ?? 0);
-    $gateways = gw_available($uid);
+    $fresh = order_get((int) ($order['id'] ?? 0));
+    if ($fresh === null || order_cancel_if_payment_expired($fresh)
+        || (string) $fresh['status'] !== 'pending') {
+        Tg::show($chat, $messageId, '⌛️ <b>مهلت پرداخت تمام شد</b>' . "\n\n"
+            . 'این فاکتور دیگر برای پرداخت باز نیست. یک سفارش تازه بسازید.',
+            [[btn('« خانه', 'home', null, 'danger')]]);
+        return;
+    }
+    $order = $fresh;
+    $uid = (int) $order['tg_id'];
+    $available = gw_available($uid);
+    $gateways = [];
+    foreach (mirza_payment_gateway_order() as $id) {
+        if (isset($available[$id])) {
+            $gateways[$id] = $available[$id];
+        }
+    }
+    /* Keep a newly added compatible method visible after the known Mirza list,
+       while retaining a deterministic one-button-per-row layout. */
+    foreach ($available as $id => $meta) {
+        if (!isset($gateways[$id])) {
+            $gateways[$id] = $meta;
+        }
+    }
     $text = '🌐 <b>انتخاب درگاه پرداخت</b>' . "\n\n"
         . 'مبلغ: <b>' . money((int) $order['payable']) . '</b>' . "\n"
         . 'کد سفارش: <code>' . e((string) $order['ref']) . '</code>' . "\n\n"
         . ($notice !== null ? e($notice) . "\n\n" : '')
         . 'یکی را انتخاب کنید:';
-    /* ترتیب دکمه‌ها: کارت، ارز دیجیتال، کریپتو، استارز، بقیه */
-    $mirzaOrder = ['card' => 0, 'plisio' => 1, 'nowpayment' => 2, 'stars' => 3];
-    uksort($gateways, static function ($a, $b) use ($mirzaOrder) {
-        $pa = $mirzaOrder[$a] ?? 50;
-        $pb = $mirzaOrder[$b] ?? 50;
-        return $pa === $pb ? 0 : ($pa < $pb ? -1 : 1);
-    });
     $rows = [];
-    $line = [];
     foreach ($gateways as $id => $meta) {
-        $label = $meta['emoji'] . ' ' . $meta['label'];
-        $line[] = btn($label, 'inv:pay:' . $order['id'] . ':' . $id);
-        if (count($line) === 2) {
-            $rows[] = $line;
-            $line = [];
-        }
+        $rows[] = [btn(mirza_payment_button_label($id, $meta),
+            'inv:pay:' . $order['id'] . ':' . $id, null, 'primary')];
     }
-    if ($line) {
-        $rows[] = $line;
-    }
-    /* «بستن لیست» آخرین دکمه است */
-    $rows[] = [btn('✖️ بستن لیست', 'inv:back:' . $order['id'], null, 'danger')];
+    /* Public Mirza uses this exact final row; kb_ensure_back recognizes the
+       invoice-back callback and never appends a generic second back row. */
+    $rows[] = [btn('❌ بستن لیست', 'inv:back:' . $order['id'], null, 'danger')];
     Tg::show($chat, $messageId, $text, $rows);
 }
 
@@ -746,7 +820,7 @@ function crypto_links_list(): array
 
 function crypto_invoice_text(array $order, string $label, string $invoiceNo, float $paidUsd = 0.0): string
 {
-    $minutes = max(1, set_int('pay_expire_minutes', 30));
+    $minutes = max(1, set_int('pay_expire_minutes', 1440));
     $links = '';
     $mark = ['🔹', '🔸'];
     foreach (crypto_links_list() as $i => $host) {

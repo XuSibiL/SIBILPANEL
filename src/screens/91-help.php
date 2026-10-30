@@ -69,7 +69,7 @@ function help_body(string $key, array $item): string
     if ($key !== 'pay') {
         return (string) ($item['body'] ?? '');
     }
-    $minutes = max(1, set_int('pay_expire_minutes', 30));
+    $minutes = max(1, set_int('pay_expire_minutes', 1440));
     return "در " . e(bot_name()) . ' جهت رفاه حال شما، روش‌های متنوع و آنی برای پرداخت '
         . 'و خرید سرویس‌ها فراهم شده است:' . "\n\n"
         . "💎 <b>روش اول: شارژ کیف پول (پیشنهادی و آنی)</b>\n"

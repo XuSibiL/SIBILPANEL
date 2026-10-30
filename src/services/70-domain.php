@@ -160,6 +160,19 @@ function product_is_hourly_unlimited(array $product): bool
         && unlimited_billing_mode($product) === UNLIMITED_BILLING_HOURLY;
 }
 
+/** متن تکمیلیِ قابل تنظیم محصول، مثل «مستقیم + تانل خارج». */
+function unlimited_product_tagline(array $product): string
+{
+    return mb_substr(trim((string) ($product['note'] ?? '')), 0, 180);
+}
+
+/** هزینهٔ نمایشی ۳۰ روزهٔ هر کاربر؛ فقط یک برآورد، نه پیش‌پرداخت. */
+function unlimited_monthly_user_equivalent(array $product): int
+{
+    $rate = max(0, unlimited_user_price($product));
+    return $rate > intdiv(PHP_INT_MAX, 24 * 30) ? PHP_INT_MAX : $rate * 24 * 30;
+}
+
 /**
  * سرویس تست فقط برای محصولات متری است. این کنترل مرکزی، ورودی‌های دستی و
  * سفارش‌هایی را که محصولشان پس از ثبت تغییر کرده نیز از ساخت پنل نامحدود بازمی‌دارد.
@@ -298,7 +311,7 @@ function unlimited_billing_next_due(int $panelId): int
 
 function product_update(int $id, string $column, mixed $value): void
 {
-    $allowed = ['name', 'emoji', 'hourly_price', 'per_gb_price', 'per_user_price', 'min_users',
+    $allowed = ['name', 'emoji', 'note', 'hourly_price', 'per_gb_price', 'per_user_price', 'min_users',
                 'min_balance', 'max_users', 'extra_block_size', 'extra_block_price',
                 'device_limit', 'days', 'data_cap_gb', 'slots_needed', 'renew_price',
                 'panel_prefix', 'role_id', 'panel_id', 'active', 'trial'];
@@ -330,6 +343,32 @@ function create_order(int $tgId, string $kind, int $price, ?int $productId = nul
 function order_get(int $id): ?array
 {
     return DB::one('SELECT * FROM orders WHERE id=?', [$id]);
+}
+
+/**
+ * The payment deadline belongs to the order, not to an individual provider
+ * checkout. A provider link therefore cannot revive an old pending order.
+ */
+function order_payment_expired(array $order, ?int $at = null): bool
+{
+    $created = (int) ($order['created_at'] ?? 0);
+    if ($created <= 0) {
+        return true;
+    }
+    $minutes = max(1, set_int('pay_expire_minutes', 1440));
+    return $created + $minutes * 60 <= ($at ?? now_ts());
+}
+
+/** Cancel only an open order. A submitted card receipt is deliberately kept
+    in review for a human decision, even if its original invoice deadline has
+    since passed. */
+function order_cancel_if_payment_expired(array $order): bool
+{
+    if ((string) ($order['status'] ?? '') !== 'pending' || !order_payment_expired($order)) {
+        return false;
+    }
+    return DB::update("UPDATE orders SET status='canceled', paid_at=NULL WHERE id=? AND status='pending'",
+        [(int) $order['id']]) === 1;
 }
 
 function order_mark(int $id, string $status): void
