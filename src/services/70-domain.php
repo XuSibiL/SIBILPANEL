@@ -129,6 +129,10 @@ function product_get(int $id): ?array
 const PRODUCT_SALE_METERED = 'metered';
 const PRODUCT_SALE_UNLIMITED_USERS = 'unlimited_users';
 const UNLIMITED_USERS_MAX = 1000000;
+/* `legacy` is deliberately the migration default.  A sold plan must never be
+   re-priced merely because its catalog product later changes. */
+const UNLIMITED_BILLING_LEGACY = 'legacy';
+const UNLIMITED_BILLING_HOURLY = 'hourly';
 const UNLIMITED_ROLE_GUIDE = 'ℹ️ راهنما: تعداد روز (مدت اعتبار) و محدودیت تعداد دستگاه در پنل‌های نامحدود، مستقیماً از روی تنظیمات نقش (Role) در پنل پاسارگاد اعمال می‌شود. ربات فقط وظیفه ساخت تعداد یوزر/کلاینت درخواستی را بر عهده دارد.';
 
 /** نوع فروش فقط روی محصول تازه اثر دارد؛ پنل فروخته‌شده snapshot خودش را دارد. */
@@ -141,6 +145,19 @@ function product_sale_type(array $product): string
 function product_is_unlimited(array $product): bool
 {
     return product_sale_type($product) === PRODUCT_SALE_UNLIMITED_USERS;
+}
+
+/** Billing is a product choice at purchase time, then copied to the sold panel. */
+function unlimited_billing_mode(array $row): string
+{
+    return (string) ($row['unlimited_billing_mode'] ?? '') === UNLIMITED_BILLING_HOURLY
+        ? UNLIMITED_BILLING_HOURLY : UNLIMITED_BILLING_LEGACY;
+}
+
+function product_is_hourly_unlimited(array $product): bool
+{
+    return product_is_unlimited($product)
+        && unlimited_billing_mode($product) === UNLIMITED_BILLING_HOURLY;
 }
 
 /**
@@ -159,6 +176,12 @@ function panel_is_unlimited(array $panel): bool
     return (int) ($panel['is_unlimited'] ?? 0) === 1;
 }
 
+function panel_is_hourly_unlimited(array $panel): bool
+{
+    return panel_is_unlimited($panel)
+        && unlimited_billing_mode($panel) === UNLIMITED_BILLING_HOURLY;
+}
+
 /** قیمت و حداقلِ پنل فروخته‌شده snapshot هستند، نه تنظیمات قابل‌تغییر محصول امروز. */
 function panel_unlimited_user_price(array $panel): int
 {
@@ -168,6 +191,17 @@ function panel_unlimited_user_price(array $panel): int
 function panel_unlimited_min_users(array $panel): int
 {
     return max(1, (int) ($panel['unlimited_min_users'] ?? 1));
+}
+
+/** Fixed hourly rent is stored in the normal hourly_price snapshot for new plans. */
+function panel_unlimited_fixed_hourly_price(array $panel): int
+{
+    return panel_is_hourly_unlimited($panel) ? max(0, (int) ($panel['hourly_price'] ?? 0)) : 0;
+}
+
+function unlimited_fixed_hourly_price(array $product): int
+{
+    return product_is_hourly_unlimited($product) ? max(0, (int) ($product['hourly_price'] ?? 0)) : 0;
 }
 
 function panel_unlimited_user_count_check(array $panel, int $count): array
@@ -221,6 +255,45 @@ function unlimited_user_count_check(array $product, int $count): array
 function unlimited_user_order_total(array $product, int $count): int
 {
     return $count * unlimited_user_price($product);
+}
+
+/** First hour is paid with the purchase; later hours are wallet-metered. */
+function unlimited_initial_hourly_total(array $product, int $count): int
+{
+    $users = unlimited_user_order_total($product, $count);
+    $fixed = unlimited_fixed_hourly_price($product);
+    return $users > PHP_INT_MAX - $fixed ? PHP_INT_MAX : $users + $fixed;
+}
+
+function panel_unlimited_users_hourly_total(array $panel, int $count): int
+{
+    $unit = panel_unlimited_user_price($panel);
+    if ($count < 0 || ($unit > 0 && $count > intdiv(PHP_INT_MAX, $unit))) {
+        return PHP_INT_MAX;
+    }
+    return $count * $unit;
+}
+
+/**
+ * Immutable hourly components: a new user block starts at its own paid-through
+ * time, avoiding a charge for hours before that block existed.
+ */
+function unlimited_billing_unit_add(int $panelId, ?int $sourceOrderId, string $component,
+                                    int $units, int $hourlyPrice, int $paidUntil): void
+{
+    if ($panelId <= 0 || $units < 0 || $hourlyPrice < 0 || $paidUntil <= 0) {
+        throw new InvalidArgumentException('invalid unlimited hourly billing component');
+    }
+    DB::exec('INSERT OR IGNORE INTO unlimited_billing_units(panel_id, source_order_id, component, '
+        . 'units, hourly_price, paid_until, active, created_at) VALUES(?,?,?,?,?,?,1,?)',
+        [$panelId, $sourceOrderId, mb_substr($component, 0, 20), $units, $hourlyPrice,
+         $paidUntil, now_ts()]);
+}
+
+function unlimited_billing_next_due(int $panelId): int
+{
+    return (int) DB::val('SELECT MIN(paid_until) FROM unlimited_billing_units '
+        . 'WHERE panel_id=? AND active=1 AND (units * hourly_price) > 0', [$panelId], 0);
 }
 
 function product_update(int $id, string $column, mixed $value): void

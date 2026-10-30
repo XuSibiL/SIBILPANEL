@@ -147,15 +147,34 @@ function screen_buy_category(int|string $chat, ?int $messageId, int $categoryId)
 function product_detail_text(array $product): string
 {
     if (product_is_unlimited($product)) {
-        return $product['emoji'] . ' <b>' . e((string) $product['name']) . "</b>\n\n"
-            . '♾️ <b>پنل نامحدود</b>' . "\n"
-            . '💵 قیمت هر کاربر: <b>' . money(unlimited_user_price($product)) . "</b>\n"
+        $hourly = product_is_hourly_unlimited($product);
+        $rateText = $hourly
+            ? ('💵 نرخ هر کاربر / ساعت: <b>' . money(unlimited_user_price($product)) . "</b>\n"
+                . '🏷 اجارهٔ ثابت پنل / ساعت: <b>' . money(unlimited_fixed_hourly_price($product)) . "</b>\n")
+            : ('💵 قیمت هر کاربر: <b>' . money(unlimited_user_price($product)) . "</b>
+");
+        $flowText = $hourly
+            ? ('ساعت اول با فاکتور خرید پرداخت می‌شود: اجارهٔ ثابت + (تعداد کاربر × نرخ هر کاربر). '
+                . 'از ساعت بعد، همین مبلغ به‌صورت ساعتی از کیف پول کم می‌شود.')
+            : 'تعداد کاربر دلخواهتان را وارد می‌کنید و مبلغ فاکتور برابر است با تعداد کاربر × قیمت هر کاربر.';
+        return $product['emoji'] . ' <b>' . e((string) $product['name']) . "</b>
+
+"
+            . '♾️ <b>پنل نامحدود' . ($hourly ? ' با صورتحساب ساعتی' : '') . '</b>' . "
+"
+            . $rateText
             . '👥 حداقل تعداد کاربر در هر سفارش: <b>'
-                . fa_digits(unlimited_min_users($product)) . "</b>\n"
-            . '🧩 اسلات لازم: ' . fa_digits((int) $product['slots_needed']) . "\n\n"
-            . 'تعداد کاربر دلخواهتان را وارد می‌کنید و مبلغ فاکتور برابر است با تعداد کاربر × قیمت هر کاربر.'
-            . "\n\n"
-            . '<i>مدت اعتبار و محدودیت دستگاه‌ها مستقیماً از تنظیمات نقش در پنل پاسارگارد اعمال می‌شود.</i>';
+                . fa_digits(unlimited_min_users($product)) . "</b>
+"
+            . '📱 دستگاهِ محصول: ' . fa_digits((int) ($product['device_limit'] ?? 0)) . "
+"
+            . '🧩 اسلات لازم: ' . fa_digits((int) $product['slots_needed']) . "
+
+"
+            . $flowText . "
+
+"
+            . '<i>مدت اعتبار و محدودیت واقعی دستگاه‌ها مستقیماً از تنظیمات نقش در پنل پاسارگارد اعمال می‌شود.</i>';
     }
     $cap = (float) $product['data_cap_gb'] > 0
         ? fa_digits((float) $product['data_cap_gb']) . ' گیگ' : 'نامحدود';
@@ -414,13 +433,18 @@ function screen_unlimited_initial_users(int|string $chat, ?int $messageId, int $
             [[btn('« بازگشت', 'menu:buy', null, 'danger')]]);
         return;
     }
+    $hourly = product_is_hourly_unlimited($product);
     State::set($uid, 'unlimited_initial_users', ['product' => $productId]);
     Tg::show($chat, $messageId,
         '👥 <b>تعداد کاربر دلخواه</b>' . "\n\n"
         . 'تعداد کاربر موردنیاز را فقط به‌صورت عدد بفرستید.' . "\n"
         . 'حداقل مجاز: <b>' . fa_digits(unlimited_min_users($product)) . '</b> کاربر' . "\n"
-        . 'قیمت هر کاربر: <b>' . money(unlimited_user_price($product)) . '</b>' . "\n\n"
-        . '<i>مثال: ' . fa_digits(unlimited_min_users($product)) . '</i>' . "\n"
+        . ($hourly
+            ? ('💵 نرخ هر کاربر / ساعت: <b>' . money(unlimited_user_price($product)) . "</b>\n"
+                . '🏷 اجارهٔ ثابت پنل / ساعت: <b>' . money(unlimited_fixed_hourly_price($product)) . "</b>\n"
+                . '<i>فاکتور، ساعت اول را پوشش می‌دهد؛ سپس کسر ساعتی از کیف پول انجام می‌شود.</i>')
+            : ('قیمت هر کاربر: <b>' . money(unlimited_user_price($product)) . '</b>'))
+        . "\n\n" . '<i>مثال: ' . fa_digits(unlimited_min_users($product)) . '</i>' . "\n"
         . 'برای لغو: <code>لغو</code>',
         [[btn('« بازگشت', 'buy:p:' . $productId, null, 'danger')]]);
 }
@@ -461,23 +485,35 @@ function start_panel_order(int $uid, int|string $chat, ?int $messageId, int $pro
                  [btn('« بازگشت', 'buy:p:' . $productId, null, 'danger')]]);
             return;
         }
-        $price = unlimited_user_order_total($product, $unlimitedUsers);
+        $hourly = product_is_hourly_unlimited($product);
+        $usersRate = unlimited_user_order_total($product, $unlimitedUsers);
+        $fixedRate = unlimited_fixed_hourly_price($product);
+        $price = $hourly ? unlimited_initial_hourly_total($product, $unlimitedUsers) : $usersRate;
         $payload = [
             'product' => $productId,
             'panel_username' => $username,
             'sale_type' => PRODUCT_SALE_UNLIMITED_USERS,
             'unlimited_users' => true,
+            'unlimited_billing_mode' => $hourly ? UNLIMITED_BILLING_HOURLY : UNLIMITED_BILLING_LEGACY,
             'user_count' => $unlimitedUsers,
             'per_user_price' => unlimited_user_price($product),
+            'panel_hourly_price' => $fixedRate,
             'min_users' => unlimited_min_users($product),
         ];
         $order = create_order($uid, 'panel', $price, $productId, $payload);
+        $breakdown = '♾️ ' . e((string) $product['name']) . "\n"
+            . '👥 تعداد کاربر: <b>' . fa_digits($unlimitedUsers) . "</b>\n";
+        if ($hourly) {
+            $breakdown .= '💵 ساعت اول: ' . fa_digits($unlimitedUsers) . ' × '
+                . money(unlimited_user_price($product)) . ' + اجارهٔ ثابت ' . money($fixedRate)
+                . ' = <b>' . money($price) . "</b>\n"
+                . '<i>از ساعت بعد، همین نرخ از کیف پول کم می‌شود.</i>' . "\n";
+        } else {
+            $breakdown .= '💵 ' . fa_digits($unlimitedUsers) . ' × '
+                . money(unlimited_user_price($product)) . ' = <b>' . money($price) . "</b>\n";
+        }
         Tg::show($chat, $messageId,
-            invoice_text($order, 'خرید پنل نامحدود',
-                '♾️ ' . e((string) $product['name']) . "\n"
-                . '👥 تعداد کاربر: <b>' . fa_digits($unlimitedUsers) . "</b>\n"
-                . '💵 ' . fa_digits($unlimitedUsers) . ' × '
-                    . money(unlimited_user_price($product)) . ' = <b>' . money($price) . "</b>\n"
+            invoice_text($order, 'خرید پنل نامحدود', $breakdown
                 . '👤 نام کاربری پنل: <code>' . e($username) . '</code>'),
             invoice_kb($order, $uid));
         return;
@@ -725,8 +761,8 @@ function crypto_invoice_text(array $order, string $label, string $invoiceNo, flo
         . '🧾 شماره فاکتور : <code>' . e($invoiceNo) . '</code>' . "\n"
         . '💰 مبلغ فاکتور : <b>' . money((int) $order['payable']) . '</b>' . "\n"
         . '📊 قیمت دلار: در این لحظه ' . money(usd_toman_rate()) . "\n\n"
-        . '> ⚠️ پس از پرداخت، در صورتی که مبلغ تراکنش به‌درستی واریز شده باشد، '
-        . 'کیف پول شما حداکثر تا ۱۵ دقیقه آینده به‌صورت خودکار شارژ خواهد شد.' . "\n\n"
+        . '> ⚠️ پس از پرداخت، درگاه باید تراکنش را به‌صورت قطعی تأیید کند؛ '
+        . 'تا پیش از Verify/Webhook معتبر، کیف پول شارژ نمی‌شود.' . "\n\n"
         . 'جهت پرداخت از دکمه زیر استفاده کنید 👇🏻';
     if ($paidUsd > 0) {
         $lines .= "\n\n" . 'مبلغ دقیق این فاکتور: <b>'
@@ -1357,14 +1393,30 @@ function screen_panel_detail(int|string $chat, ?int $messageId, int $panelId): v
     }
     $text .= "\n" . 'وضعیت: ' . $status . "\n";
     if ($isUnlimited) {
-        $text .= '♾️ نوع پنل: <b>نامحدود</b>' . "\n"
+        $hourlyUnlimited = panel_is_hourly_unlimited($panel);
+        $text .= '♾️ نوع پنل: <b>نامحدود' . ($hourlyUnlimited ? ' با صورتحساب ساعتی' : '') . '</b>' . "\n"
             . '⏳ اعتبار: طبق تنظیمات نقش در پاسارگارد' . "\n"
             . '📱 محدودیت دستگاه: طبق تنظیمات نقش در پاسارگارد' . "\n"
             . '👥 کاربر: ' . fa_digits((int) $panel['last_users']) . ' از '
-                . fa_digits($cap) . "\n"
-            . '💵 قیمت هر کاربر برای شارژ: ' . money(panel_unlimited_user_price($panel)) . "\n"
-            . '🔻 حداقل شارژ: ' . fa_digits(panel_unlimited_min_users($panel)) . " کاربر\n"
-            . '<i>ربات کنترل دستگاه، حجم و اعتبار این پنل را اعمال نمی‌کند.</i>' . "\n";
+                . fa_digits($cap) . "\n";
+        if ($hourlyUnlimited) {
+            $nextDue = unlimited_billing_next_due((int) $panel['id']);
+            $fixedHourly = panel_unlimited_fixed_hourly_price($panel);
+            $usersHourly = panel_unlimited_users_hourly_total($panel, $cap);
+            $hourlyTotal = $usersHourly > PHP_INT_MAX - $fixedHourly
+                ? PHP_INT_MAX : $usersHourly + $fixedHourly;
+            $text .= '💵 نرخ هر کاربر / ساعت: ' . money(panel_unlimited_user_price($panel)) . "\n"
+                . '🏷 اجارهٔ ثابت / ساعت: ' . money(panel_unlimited_fixed_hourly_price($panel)) . "\n"
+                . '⏱ نرخ فعلی با سقف ' . fa_digits($cap) . ' کاربر: <b>' . money($hourlyTotal)
+                    . '</b> / ساعت' . "\n"
+                . ($nextDue > 0 ? '🕒 کسر بعدی: ' . fa_ts($nextDue) . "\n" : '')
+                . '🔻 حداقل شارژ: ' . fa_digits(panel_unlimited_min_users($panel)) . " کاربر\n"
+                . '<i>ساعت اول هر بخش هنگام خرید آن پرداخت می‌شود؛ پس از آن کسر ساعتی از کیف پول است.</i>' . "\n";
+        } else {
+            $text .= '💵 قیمت هر کاربر برای شارژ: ' . money(panel_unlimited_user_price($panel)) . "\n"
+                . '🔻 حداقل شارژ: ' . fa_digits(panel_unlimited_min_users($panel)) . " کاربر\n";
+        }
+        $text .= '<i>ربات کنترل دستگاه، حجم و اعتبار این پنل را اعمال نمی‌کند.</i>' . "\n";
     } else {
         $text .= 'اعتبار تا: ' . fa_ts((int) ($panel['expires_at'] ?? 0)) . "\n"
             . '👥 کاربر: ' . fa_digits((int) $panel['last_users']) . ' از ' . fa_digits($cap) . "\n"

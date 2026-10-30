@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Panel Service · CLI   (PHP edition)
+#  Sibil · CLI   (PHP edition)
 #  Terminal control panel: status, update, backup, restore, logs, doctor, ssl
 #
 #  Run:             sibil
@@ -23,6 +23,7 @@ export PANEL_WEB_PORT="${PANEL_WEB_PORT:-${SIBIL_WEB_PORT:-}}"
 export PANEL_DOMAIN="${PANEL_DOMAIN:-${SIBIL_DOMAIN:-}}"
 export PANEL_PHP_BIN="${PANEL_PHP_BIN:-${SIBIL_PHP_BIN:-}}"
 PANEL="${PANEL_HOME}"
+CLI_BRAND="Sibil"
 # نسخه از خودِ ربات خوانده می‌شود؛ هیچ عددی در این اسکریپت هاردکد نیست
 detect_version() {
     local v=""
@@ -48,15 +49,19 @@ SERVICE="sibil"
 WEB_SERVICE="sibil-web"
 PID_FILE="$PANEL_HOME/sibil.pid"
 CLI_PATH="${PANEL_CLI_PATH:-/usr/local/bin/sibil}"
+# Path overrides keep the operational commands testable without ever pointing
+# at host configuration; production defaults remain the standard system paths.
+SYSTEMD_DIR="${SIBIL_SYSTEMD_DIR:-/etc/systemd/system}"
 UPDATE_URL_FILE="$PANEL_HOME/.installer-url"
 DEFAULT_UPDATE_URL="${PANEL_UPDATE_URL:-}"
+OFFICIAL_INSTALL_URL="https://raw.githubusercontent.com/XuSibiL/SIBILPANEL/main/install.sh"
 
 # نام نمایشی از .env خوانده می‌شود؛ هیچ نام برندی در کد نیست
 brand_name() {
     local n=""
     [[ -f "$ENV_FILE" ]] && n="$(grep -E '^PANEL_BOT_NAME=' "$ENV_FILE" 2>/dev/null \
         | head -1 | cut -d= -f2- | tr -d '"')"
-    [[ -n "$n" ]] || n="Panel Service"
+    [[ -n "$n" ]] || n="$CLI_BRAND"
     printf '%s' "$n"
 }
 
@@ -85,7 +90,7 @@ line() { printf '%s\n' "  ──────────────────
 is_root() { [[ ${EUID:-$(id -u)} -eq 0 ]]; }
 # آیا می‌توان از کاربر ورودی گرفت؟ (اسکریپت/CI نه)
 have_tty() { [[ -e /dev/tty ]] && { [[ -t 0 ]] || [[ -t 1 ]]; }; }
-has_systemd() { command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; }
+has_systemd() { [[ "${SIBIL_DISABLE_SYSTEMD:-0}" != "1" ]] && command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; }
 
 db_query() {
     # db_query "<SQL>"  → هر خط یک ردیف (ستون‌ها با | جدا می‌شوند)
@@ -121,6 +126,87 @@ env_set() {
     fi
 }
 
+# Match the database that the PHP application itself will use.  A relative
+# legacy value remains relative to this installation, never to the caller CWD.
+_configured_db="${PANEL_DB:-$(env_get PANEL_DB)}"
+if [[ -n "$_configured_db" ]]; then
+    [[ "$_configured_db" == /* ]] || _configured_db="$PANEL_HOME/$_configured_db"
+    DB_FILE="$_configured_db"
+    export PANEL_DB="$DB_FILE"
+fi
+unset _configured_db
+
+db_file_is_under_home() { [[ "$DB_FILE" == "$PANEL_HOME"/* ]]; }
+
+# Explicit ownership model.  Uninstall and TLS tooling may only touch files
+# marked by Sibil or units whose WorkingDirectory/ExecStart prove they belong to
+# this exact PANEL_HOME.  A matching domain name alone is never ownership.
+SIBIL_OWNER_MARKER='SIBILPANEL-OWNED'
+SIBIL_CADDY_IMPORT_BEGIN='# BEGIN SIBILPANEL-OWNED IMPORT'
+SIBIL_CADDY_IMPORT_END='# END SIBILPANEL-OWNED IMPORT'
+
+valid_domain() {
+    local dom="${1,,}"
+    [[ ${#dom} -le 253 ]] || return 1
+    [[ "$dom" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$ ]]
+}
+
+normalize_domain() {
+    local dom="${1,,}"
+    dom="${dom#http://}"; dom="${dom#https://}"; dom="${dom%%/*}"; dom="${dom%.}"
+    printf '%s' "$dom"
+}
+
+panel_home_owned() {
+    [[ -d "$PANEL_HOME" && "$PANEL_HOME" != / && "$PANEL_HOME" != /opt ]] || return 1
+    if [[ -f "$PANEL_HOME/.sibil-owned" ]] && grep -qx "$SIBIL_OWNER_MARKER" "$PANEL_HOME/.sibil-owned" 2>/dev/null; then
+        return 0
+    fi
+    # Compatible ownership proof for releases before the marker existed.
+    [[ -f "$APP" && -f "$ENV_FILE" ]] \
+        && grep -q 'PANEL_VERSION' "$APP" 2>/dev/null \
+        && grep -qE "^PANEL_HOME=[\"']?$(printf '%s' "$PANEL_HOME" | sed 's/[][\\.^$*+?{}|()]/\\&/g')" "$ENV_FILE" 2>/dev/null
+}
+
+unit_is_owned() {
+    local unit="$1"
+    [[ -f "$unit" ]] || return 1
+    grep -q "$SIBIL_OWNER_MARKER" "$unit" 2>/dev/null && return 0
+    grep -qF "WorkingDirectory=$PANEL_HOME" "$unit" 2>/dev/null \
+        && grep -qF "$PANEL_HOME/sibil.php" "$unit" 2>/dev/null
+}
+
+bot_unit_file() { printf '%s/%s.service' "$SYSTEMD_DIR" "$SERVICE"; }
+web_unit_file() { printf '%s/%s.service' "$SYSTEMD_DIR" "$WEB_SERVICE"; }
+bot_unit_is_owned() { unit_is_owned "$(bot_unit_file)"; }
+web_unit_is_owned() { unit_is_owned "$(web_unit_file)"; }
+
+cli_is_owned() {
+    local path="$1" target="" quoted_home
+    [[ -e "$path" || -L "$path" ]] || return 1
+    target="$(readlink -f "$path" 2>/dev/null || printf '%s' "$path")"
+    quoted_home="PANEL_HOME_DEFAULT=\"$PANEL_HOME\""
+    [[ "$target" == "$PANEL_HOME"/* ]] && return 0
+    grep -qF "$SIBIL_OWNER_MARKER" "$path" 2>/dev/null && return 0
+    grep -qF "$quoted_home" "$path" 2>/dev/null && return 0
+    grep -qF "PANEL_HOME_DEFAULT=$PANEL_HOME" "$path" 2>/dev/null && return 0
+    grep -qF "$PANEL_HOME/sibil.php" "$path" 2>/dev/null
+}
+
+caddy_conf_dir() { printf '%s' "${SIBIL_CADDY_CONF_DIR:-/etc/caddy/conf.d}"; }
+caddy_main_file() { printf '%s' "${SIBIL_CADDYFILE:-/etc/caddy/Caddyfile}"; }
+caddy_site_file() { printf '%s/sibil-%s.caddy' "$(caddy_conf_dir)" "$1"; }
+nginx_sites_enabled_dir() { printf '%s' "${SIBIL_NGINX_SITES_ENABLED_DIR:-/etc/nginx/sites-enabled}"; }
+nginx_sites_available_dir() { printf '%s' "${SIBIL_NGINX_SITES_AVAILABLE_DIR:-/etc/nginx/sites-available}"; }
+nginx_conf_dir() { printf '%s' "${SIBIL_NGINX_CONF_DIR:-/etc/nginx/conf.d}"; }
+cron_dir() { printf '%s' "${SIBIL_CRON_DIR:-/etc/cron.d}"; }
+
+caddy_site_is_owned() {
+    local file="$1"
+    [[ -f "$file" ]] && grep -q "$SIBIL_OWNER_MARKER" "$file" 2>/dev/null
+}
+
+
 # نخستین شناسهٔ عددی قابل استفاده از PANEL_ADMINS.
 first_admin_id() {
     local raw="$1" item
@@ -154,7 +240,7 @@ ensure_primary_owner_anchor() {
 }
 
 banner() {
-    local title="$(brand_name) · v$VERSION"
+    local title="$CLI_BRAND · v$VERSION"
     local width=38 len pad_l pad_r inner
     len=${#title}
     pad_l=$(( (width - len) / 2 ))
@@ -332,14 +418,35 @@ update_marker() {
 
 service_active() {
     if has_systemd; then
-        systemctl is-active --quiet "$SERVICE" 2>/dev/null
+        bot_unit_is_owned && systemctl is-active --quiet "$SERVICE" 2>/dev/null
     else
         [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null
     fi
 }
 
-bot_pids() {
-    pgrep -fa "php.*$APP" 2>/dev/null | grep -v pgrep | awk '{print $1}'
+# Never use a path-derived pgrep/ pkill pattern: PANEL_HOME can contain regex
+# characters, and a broad match could stop another customer's process.  /proc
+# lets us compare the exact application path as literal text.
+app_pids() {
+    local proc pid cmd
+    [[ -d /proc ]] || return 0
+    for proc in /proc/[0-9]*; do
+        [[ -r "$proc/cmdline" ]] || continue
+        pid="${proc##*/}"
+        cmd="$(tr '\000' ' ' <"$proc/cmdline" 2>/dev/null || true)"
+        [[ "$cmd" == *"$APP"* ]] && printf '%s\n' "$pid"
+    done
+}
+
+bot_pids() { app_pids; }
+
+stop_our_app_processes() {
+    local pid stopped=0
+    while IFS= read -r pid; do
+        [[ "$pid" =~ ^[0-9]+$ && "$pid" != "$$" && "$pid" != "${PPID:-0}" ]] || continue
+        kill "$pid" 2>/dev/null && stopped=1 || true
+    done < <(app_pids)
+    [[ "$stopped" == "1" ]]
 }
 
 check_env() {
@@ -362,9 +469,14 @@ cmd_start() {
         return 0
     fi
     if has_systemd && is_root; then
+        bot_unit_is_owned || { bad "refusing to start unowned systemd unit: $(bot_unit_file)"; return 1; }
         systemctl reset-failed "$SERVICE" >/dev/null 2>&1 || true
         systemctl start "$SERVICE" && ok "bot service started"
-        systemctl start "$WEB_SERVICE" 2>/dev/null && ok "payment web endpoint started"
+        if web_unit_is_owned; then
+            systemctl start "$WEB_SERVICE" 2>/dev/null && ok "payment web endpoint started"
+        elif [[ -f "$(web_unit_file)" ]]; then
+            warn "preserved unowned web unit: $(web_unit_file)"
+        fi
     else
         ( cd "$PANEL_HOME" && nohup "$PHP_BIN" "$APP" --poll >>"$LOG_FILE" 2>&1 & echo $! >"$PID_FILE" )
         ok "bot started (pid $(cat "$PID_FILE" 2>/dev/null))"
@@ -372,14 +484,14 @@ cmd_start() {
 }
 
 cmd_stop() {
+    local stopped=0
     if has_systemd && is_root; then
-        systemctl stop "$SERVICE" 2>/dev/null && ok "bot service stopped"
-        systemctl stop "$WEB_SERVICE" 2>/dev/null && ok "web endpoint stopped"
-    else
-        local pids; pids="$(bot_pids)"
-        [[ -n "$pids" ]] && kill $pids 2>/dev/null && ok "bot stopped" || ok "was not running"
-        rm -f "$PID_FILE"
+        if bot_unit_is_owned; then systemctl stop "$SERVICE" 2>/dev/null && { ok "bot service stopped"; stopped=1; }; elif [[ -f "$(bot_unit_file)" ]]; then warn "preserved unowned systemd unit: $(bot_unit_file)"; fi
+        if web_unit_is_owned; then systemctl stop "$WEB_SERVICE" 2>/dev/null && { ok "web endpoint stopped"; stopped=1; }; elif [[ -f "$(web_unit_file)" ]]; then warn "preserved unowned systemd unit: $(web_unit_file)"; fi
     fi
+    if stop_our_app_processes; then ok "local Sibil process stopped"; stopped=1; fi
+    rm -f "$PID_FILE"
+    [[ "$stopped" == "1" ]] || ok "was not running"
 }
 
 # حذف وبهوک تلگرام — این ربات با long polling کار می‌کند
@@ -408,12 +520,18 @@ cmd_migrate() {
 
 cmd_restart() {
     check_env || return 1
-    if has_systemd && is_root; then
+    if has_systemd && is_root && bot_unit_is_owned; then
         systemctl reset-failed "$SERVICE" >/dev/null 2>&1 || true
         systemctl restart "$SERVICE" && ok "bot service restarted"
-        systemctl reset-failed "$WEB_SERVICE" >/dev/null 2>&1 || true
-        systemctl restart "$WEB_SERVICE" 2>/dev/null && ok "payment web endpoint restarted"
+        if web_unit_is_owned; then
+            systemctl reset-failed "$WEB_SERVICE" >/dev/null 2>&1 || true
+            systemctl restart "$WEB_SERVICE" 2>/dev/null && ok "payment web endpoint restarted"
+        fi
     else
+        if has_systemd && is_root && [[ -f "$(bot_unit_file)" ]]; then
+            bad "refusing to restart unowned systemd unit: $(bot_unit_file)"
+            return 1
+        fi
         cmd_stop; sleep 1; cmd_start
     fi
     # وبهوک قبلی پاک می‌شود تا هیچ آپدیتی گم نشود
@@ -428,14 +546,16 @@ cmd_status() {
     banner
     step "Service"
     if service_active; then ok "bot: running"; else bad "bot: stopped"; fi
-    if has_systemd; then
+    if has_systemd && bot_unit_is_owned; then
         local enabled since
         enabled="$(systemctl is-enabled "$SERVICE" 2>/dev/null | head -1)"
         case "$enabled" in not-found|"") enabled="service not installed" ;; esac
         since="$(systemctl show -p ActiveEnterTimestamp --value "$SERVICE" 2>/dev/null)"
         say "  ${enabled:-not installed}${since:+ · active since $since}"
+    elif has_systemd && [[ -f "$(bot_unit_file)" ]]; then
+        warn "preserved unowned systemd unit: $(bot_unit_file)"
     fi
-    if has_systemd && systemctl is-active --quiet "$WEB_SERVICE" 2>/dev/null; then
+    if has_systemd && web_unit_is_owned && systemctl is-active --quiet "$WEB_SERVICE" 2>/dev/null; then
         ok "web endpoint: running ($(env_get PANEL_WEB_URL))"
     else
         warn "web endpoint: stopped (payment callbacks need it)"
@@ -569,6 +689,26 @@ backup_dir() {
     printf '%s' "$dir"
 }
 
+
+# Make a consistent SQLite snapshot without trusting a raw WAL-sidecar copy.
+# It is used before irreversible removal; a plain copy is the last fallback.
+db_snapshot_to() {
+    local src="$1" dest="$2"
+    [[ -f "$src" ]] || return 1
+    rm -f "$dest"
+    "$PHP_BIN" -r '
+        try { $p=new PDO("sqlite:".$argv[1]);
+            $p->exec("VACUUM INTO " . $p->quote($argv[2])); }
+        catch (Throwable $e) { exit(1); }
+    ' "$src" "$dest" 2>/dev/null && [[ -s "$dest" ]] && return 0
+    rm -f "$dest"
+    "$PHP_BIN" -r '
+        try { $p=new PDO("sqlite:".$argv[1]); $p->exec("PRAGMA wal_checkpoint(TRUNCATE)"); }
+        catch (Throwable $e) { exit(1); }
+    ' "$src" 2>/dev/null || true
+    cp -f "$src" "$dest" 2>/dev/null && [[ -s "$dest" ]]
+}
+
 cmd_backup_create() {
     check_env || return 1
     local dir ext stamp jstamp day out raw envout
@@ -620,62 +760,101 @@ cmd_backup_create() {
 }
 
 cmd_backup_import() {
-    local file="${1:-}" ext tmp keep was_running=0
+    local file="${1:-}" ext tmp keep validation_err was_running=0 had_db=0 imported_counts restored_counts
+    check_env || return 1
     ext="$(backup_ext)"
     service_active && was_running=1
     if [[ -z "$file" ]]; then
-        say "  path of the backup file to import:"
+        say "  path of the SQLite backup/database to import:"
         read -r -p "  > " file </dev/tty || return 1
         file="$(printf '%s' "$file" | tr -d '\r' | tr -d '\042' | tr -d "\047" | sed -e 's/^ *//' -e 's/ *$//')"
         file="${file/#\~/$HOME}"
     fi
     [[ -n "$file" ]] || { warn "no file given"; return 1; }
     [[ -f "$file" ]] || { bad "file not found: $file"; return 1; }
-    local fext fname
-    fname="$(basename "$file")"
+    local fext
     fext="$(printf '%s' "${file##*.}" | tr '[:upper:]' '[:lower:]')"
-    case "$fname" in
-        *.sql.gz) fext="sql.gz" ;;
-    esac
-    if [[ "$fext" != "$ext" && "$fext" != "sql.gz" && "$fext" != "sqlite3" && "$fext" != "db" ]]; then
-        bad "wrong file type: .$fext — accepted: .sqlite3, .db, .$ext"
+    if [[ "$fext" != "$ext" && "$fext" != "sqlite3" && "$fext" != "db" ]]; then
+        bad "wrong file type: .$fext — import accepts SQLite .sqlite3, .db or .$ext files"
         return 1
     fi
-    step "Reading $file"
-    tmp="$(mktemp)"
+    step "Validating the import file"
+    tmp="$(mktemp "$PANEL_HOME/.sibil-import.XXXXXX")"
     if head -c 2 "$file" | od -An -tx1 | tr -d ' \n' | grep -q '^1f8b'; then
-        gzip -dc "$file" > "$tmp" 2>/dev/null || { bad "cannot unpack the backup"; rm -f "$tmp"; return 1; }
+        gzip -dc "$file" >"$tmp" 2>/dev/null || { bad "cannot unpack the backup"; rm -f "$tmp"; return 1; }
     else
         cp -f "$file" "$tmp"
     fi
     if ! head -c 15 "$tmp" | grep -q 'SQLite format 3'; then
-        bad "this file is not a database of this bot"
+        bad "this is not a SQLite database; SQL text dumps are intentionally not executed"
         rm -f "$tmp"
         return 1
     fi
-    local q
-    q="$("$PHP_BIN" -r '$p=new PDO("sqlite:".$argv[1]);echo (int)$p->query("SELECT COUNT(*) FROM users")->fetchColumn();' "$tmp" 2>/dev/null)"
-    [[ -n "$q" ]] || { bad "wrong file type — the database inside this backup is unreadable"; rm -f "$tmp"; return 1; }
+    validation_err="$(mktemp "${TMPDIR:-/tmp}/sibil-import-check.XXXXXX")" || { rm -f "$tmp"; return 1; }
+    imported_counts="$("$PHP_BIN" -r '
+        $p=new PDO("sqlite:".$argv[1], null, null,[PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION]);
+        $integrity=(string)$p->query("PRAGMA integrity_check")->fetchColumn();
+        if ($integrity!=="ok") { fwrite(STDERR,"integrity=".$integrity); exit(2); }
+        $tables=[]; foreach($p->query("SELECT name FROM sqlite_master WHERE type=\"table\"") as $r){$tables[$r[0]]=true;}
+        if (!isset($tables["users"])) { fwrite(STDERR,"users table missing"); exit(3); }
+        $out=[]; foreach(["users","panels","orders","wallet_tx"] as $t){ if(isset($tables[$t])) $out[$t]=(int)$p->query("SELECT COUNT(*) FROM ".$t)->fetchColumn(); }
+        echo json_encode($out);
+    ' "$tmp" 2>"$validation_err")" || {
+        bad "database validation failed: $(cat "$validation_err" 2>/dev/null)"
+        rm -f "$tmp" "$validation_err"
+        return 1
+    }
+    rm -f "$validation_err"
+    [[ -n "$imported_counts" ]] || { bad "could not read users from the database"; rm -f "$tmp"; return 1; }
+    ok "SQLite integrity check passed; import summary: $imported_counts"
 
     step "Safety copy of the current data"
-    cmd_backup_create >/dev/null 2>&1 && ok "current data saved to $PANEL_HOME/backups" || warn "could not save a safety copy"
-
-    step "Importing the old bot data into this bot"
+    cmd_backup_create >/dev/null 2>&1 && ok "current data saved to $PANEL_HOME/backups" || warn "could not save a named safety copy"
     cmd_stop >/dev/null 2>&1 || true
-    keep="$(mktemp)"; [[ -f "$DB_FILE" ]] && cp -f "$DB_FILE" "$keep" || true
+    keep="$(mktemp "$PANEL_HOME/.sibil-pre-import.XXXXXX")"
+    if [[ -f "$DB_FILE" ]]; then
+        had_db=1
+        "$PHP_BIN" -r '
+            try { $p=new PDO("sqlite:".$argv[1]); $p->exec("PRAGMA wal_checkpoint(TRUNCATE)"); }
+            catch(Throwable $e) { exit(1); }
+        ' "$DB_FILE" 2>/dev/null || warn "could not checkpoint the old database before import"
+        # The service is stopped and WAL is checkpointed, so this is a complete rollback image.
+        cp -f "$DB_FILE" "$keep" 2>/dev/null || true
+    fi
+
+    step "Importing and migrating data"
     cp -f "$tmp" "$DB_FILE" || { bad "could not replace the database"; rm -f "$tmp" "$keep"; return 1; }
-    rm -f "$tmp"
-    if ! "$PHP_BIN" "$APP" --migrate >/dev/null 2>&1; then
-        warn "database upgrade failed — rolling back"
-        [[ -s "$keep" ]] && cp -f "$keep" "$DB_FILE"
-        rm -f "$keep"
+    rm -f "$tmp" "$DB_FILE-wal" "$DB_FILE-shm"
+    chmod 600 "$DB_FILE" 2>/dev/null || true
+    if ! PANEL_HOME="$PANEL_HOME" PANEL_ENV="$ENV_FILE" PANEL_DB="$DB_FILE" "$PHP_BIN" "$APP" --migrate >/dev/null 2>&1; then
+        warn "database migration failed — rolling back"
+        if [[ "$had_db" == "1" && -s "$keep" ]]; then cp -f "$keep" "$DB_FILE"; else rm -f "$DB_FILE"; fi
+        rm -f "$DB_FILE-wal" "$DB_FILE-shm" "$keep"
         [[ "$was_running" == "1" ]] && cmd_start >/dev/null 2>&1
-        bad "import cancelled"
+        bad "import cancelled; the previous database state was restored"
+        return 1
+    fi
+    restored_counts="$("$PHP_BIN" -r '
+        $p=new PDO("sqlite:".$argv[1]); $out=[];
+        foreach(["users","panels","orders","wallet_tx"] as $t){
+          $ok=$p->query("SELECT 1 FROM sqlite_master WHERE type=\"table\" AND name=".$p->quote($t))->fetchColumn();
+          if($ok!==false) $out[$t]=(int)$p->query("SELECT COUNT(*) FROM ".$t)->fetchColumn();
+        } echo json_encode($out);
+    ' "$DB_FILE" 2>/dev/null || true)"
+    if [[ -z "$restored_counts" ]] || ! "$PHP_BIN" -r '
+        $a=json_decode($argv[1],true)?:[]; $b=json_decode($argv[2],true)?:[];
+        foreach($a as $k=>$v){ if(!array_key_exists($k,$b) || (int)$b[$k] < (int)$v) exit(1); }' \
+        "$imported_counts" "$restored_counts" 2>/dev/null; then
+        warn "post-import count verification failed — rolling back"
+        if [[ "$had_db" == "1" && -s "$keep" ]]; then cp -f "$keep" "$DB_FILE"; else rm -f "$DB_FILE"; fi
+        rm -f "$DB_FILE-wal" "$DB_FILE-shm" "$keep"
+        [[ "$was_running" == "1" ]] && cmd_start >/dev/null 2>&1
+        bad "import cancelled; source counts were not preserved"
         return 1
     fi
     rm -f "$keep"
-    ok "imported $q user account(s) and all their data"
-    say "  bot token / domain of THIS server were kept (see sibil config)"
+    ok "imported and migrated safely: $restored_counts"
+    say "  bot token, domain and this server's .env were preserved"
     if reset_webhook; then
         ok "telegram webhook cleared (no updates will be lost)"
     else
@@ -685,7 +864,7 @@ cmd_backup_import() {
         cmd_start >/dev/null 2>&1 || true
         ok "bot restarted with the imported data"
     else
-        ok "start the bot when you are ready:  sibil start"
+        ok "start the bot when ready: sibil start"
     fi
 }
 
@@ -908,17 +1087,244 @@ cmd_check() {
     ok "you are on the latest version"
 }
 
-cmd_domain() {
-    check_env || return 1
-    local dom="${1:-$(env_get PANEL_DOMAIN)}"
-    if [[ -z "$dom" ]]; then
-        say "usage: sibil domain <your-domain.com>"
-        say "  current: $(env_get PANEL_DOMAIN)"
+domain_dns_check() {
+    local dom="$1" ips=""
+    if command -v getent >/dev/null 2>&1; then
+        ips="$(getent ahosts "$dom" 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' ')"
+    fi
+    if [[ -z "$ips" ]] && command -v dig >/dev/null 2>&1; then
+        ips="$(dig +short A "$dom" 2>/dev/null; dig +short AAAA "$dom" 2>/dev/null | head -10 | tr '\n' ' ')"
+    fi
+    if [[ -z "${ips// /}" ]]; then
+        bad "DNS: $dom does not resolve from this server"
         return 1
     fi
+    ok "DNS: $dom → ${ips%% }"
+    return 0
+}
+
+cert_expiry_status() {
+    local dom="$1" cert="" end="" days=""
+    local le="/etc/letsencrypt/live/$dom/cert.pem"
+    if [[ -f "$le" ]]; then
+        cert="$le"
+    elif command -v timeout >/dev/null 2>&1 && command -v openssl >/dev/null 2>&1; then
+        end="$(timeout 12 bash -c "echo | openssl s_client -servername '$dom' -connect '$dom:443' 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null" | cut -d= -f2)"
+    fi
+    if [[ -n "$cert" && -x "$(command -v openssl 2>/dev/null)" ]]; then
+        end="$(openssl x509 -enddate -noout -in "$cert" 2>/dev/null | cut -d= -f2)"
+    fi
+    if [[ -z "$end" ]]; then
+        warn "certificate: not visible yet for $dom"
+        return 1
+    fi
+    days="$(( ( $(date -d "$end" +%s 2>/dev/null || echo 0) - $(date +%s) ) / 86400 ))"
+    if (( days > 14 )); then
+        ok "certificate: valid for $days day(s)"
+    else
+        warn "certificate: expires in $days day(s)"
+    fi
+    return 0
+}
+
+caddy_ensure_owned_import() {
+    local main dir backup
+    main="$(caddy_main_file)"; dir="$(caddy_conf_dir)"
+    [[ -f "$main" ]] || { bad "Caddyfile not found: $main"; return 1; }
+    mkdir -p "$dir" || { bad "cannot create $dir"; return 1; }
+    if grep -qF "$SIBIL_CADDY_IMPORT_BEGIN" "$main" 2>/dev/null; then
+        grep -qF "$SIBIL_CADDY_IMPORT_END" "$main" 2>/dev/null || {
+            bad "Caddyfile has an incomplete Sibil-owned import section; refusing to edit it"
+            return 1
+        }
+        return 0
+    fi
+    backup="$main.sibil-backup-$(date +%Y%m%d%H%M%S)"
+    cp -fp "$main" "$backup" || { bad "cannot back up $main"; return 1; }
+    {
+        printf '\n%s\n' "$SIBIL_CADDY_IMPORT_BEGIN"
+        printf '# %s — managed import for Sibil only\n' "$SIBIL_OWNER_MARKER"
+        printf 'import %s/sibil-*.caddy\n' "$dir"
+        printf '%s\n' "$SIBIL_CADDY_IMPORT_END"
+    } >>"$main" || { cp -fp "$backup" "$main"; bad "cannot add Sibil import to Caddyfile"; return 1; }
+    ok "Sibil-owned Caddy import installed (backup: ${backup##*/})"
+}
+
+caddy_write_owned_site() {
+    local dom="$1" port file tmp
+    port="$(env_get PANEL_WEB_PORT)"; port="${port:-8080}"
+    file="$(caddy_site_file "$dom")"
+    if [[ -e "$file" ]] && ! caddy_site_is_owned "$file"; then
+        bad "refusing to overwrite unowned Caddy file: $file"
+        return 1
+    fi
+    tmp="$(mktemp "${file}.tmp.XXXXXX")" || return 1
+    cat >"$tmp" <<EOF
+# $SIBIL_OWNER_MARKER
+# Sibil payment callback proxy for $dom
+$dom {
+    reverse_proxy 127.0.0.1:$port
+}
+EOF
+    chmod 644 "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$file" || { rm -f "$tmp"; return 1; }
+    ok "Sibil-owned proxy written: $file"
+}
+
+caddy_validate_reload() {
+    local main
+    main="$(caddy_main_file)"
+    command -v caddy >/dev/null 2>&1 || { bad "Caddy is not installed"; return 1; }
+    if ! caddy validate --config "$main" --adapter caddyfile >/dev/null 2>&1; then
+        bad "Caddy validation failed; configuration was not reloaded"
+        return 1
+    fi
+    if has_systemd && is_root; then
+        systemctl reload caddy 2>/dev/null || systemctl restart caddy 2>/dev/null \
+            || { bad "Caddy could not be reloaded"; return 1; }
+        ok "Caddy reloaded; it will obtain/renew certificates automatically"
+    else
+        warn "configuration is valid; reload Caddy as root to apply it"
+    fi
+}
+
+
+# Delete the exact marked import only when its directory is empty.  If another
+# .caddy file remains, the import could be serving it, so preservation wins.
+caddy_remove_owned_import_if_unused() {
+    local main dir tmp leftover
+    main="$(caddy_main_file)"; dir="$(caddy_conf_dir)"
+    [[ -f "$main" ]] || return 0
+    grep -qFx "$SIBIL_CADDY_IMPORT_BEGIN" "$main" 2>/dev/null || return 0
+    grep -qFx "$SIBIL_CADDY_IMPORT_END" "$main" 2>/dev/null || {
+        warn "preserved incomplete Sibil import section in $main"
+        return 1
+    }
+    local glob='sibil-*.caddy'
+    # Older marked imports used *.caddy; preserve that import if any fragment
+    # remains because it could be serving a non-Sibil Caddy fragment.
+    grep -qF "import $dir/*.caddy" "$main" 2>/dev/null && glob='*.caddy'
+    leftover="$(find "$dir" -maxdepth 1 -type f -name "$glob" -print -quit 2>/dev/null || true)"
+    if [[ -n "$leftover" ]]; then
+        warn "preserved Sibil import; Caddy fragments still exist in $dir"
+        return 0
+    fi
+    tmp="$(mktemp "${main}.sibil-remove.XXXXXX")" || return 1
+    if ! awk -v begin="$SIBIL_CADDY_IMPORT_BEGIN" -v end="$SIBIL_CADDY_IMPORT_END" '
+        $0 == begin { skipping=1; found=1; next }
+        skipping && $0 == end { skipping=0; next }
+        !skipping { print }
+        END { if (!found || skipping) exit 2 }
+    ' "$main" >"$tmp"; then
+        rm -f "$tmp"
+        warn "preserved Sibil import; could not safely isolate its marker section"
+        return 1
+    fi
+    mv -f "$tmp" "$main" || { rm -f "$tmp"; return 1; }
+    ok "removed unused Sibil-owned Caddy import from $main"
+}
+
+cmd_domain_status() {
+    local dom
+    dom="$(normalize_domain "$(env_get PANEL_DOMAIN)")"
+    step "Domain and TLS status"
+    if [[ -z "$dom" ]]; then
+        warn "no Sibil domain is configured"
+        return 1
+    fi
+    say "  domain   : $dom"
+    say "  callback : $(env_get PANEL_WEB_URL)"
+    domain_dns_check "$dom" || true
+    local site; site="$(caddy_site_file "$dom")"
+    if caddy_site_is_owned "$site"; then
+        ok "proxy: Sibil-owned Caddy site $site"
+    elif [[ -e "$site" ]]; then
+        warn "proxy file exists but is not Sibil-owned: $site"
+    else
+        warn "no Sibil-owned Caddy site yet (run: sudo sibil ssl issue)"
+    fi
+    cert_expiry_status "$dom" || true
+}
+
+cmd_domain_health() {
+    local dom
+    dom="$(normalize_domain "${1:-$(env_get PANEL_DOMAIN)}")"
+    [[ -n "$dom" ]] && valid_domain "$dom" || { bad "a valid domain is required"; return 1; }
+    step "Domain health: $dom"
+    domain_dns_check "$dom" || return 1
+    if command -v curl >/dev/null 2>&1; then
+        local code
+        code="$(curl -ksSIL --max-time 12 -o /dev/null -w '%{http_code}' "https://$dom/" 2>/dev/null || true)"
+        [[ "$code" =~ ^[1-5][0-9][0-9]$ ]] && ok "HTTPS responds with HTTP $code" \
+            || warn "HTTPS endpoint did not answer yet (DNS/TLS/proxy may still be propagating)"
+    fi
+    cert_expiry_status "$dom" || true
+}
+
+cmd_domain_change() {
+    local raw="${1:-}" dom old flag yes=0 force=0
+    shift || true
+    for flag in "$@"; do
+        case "$flag" in
+            "") ;;
+            --yes|-y) yes=1 ;;
+            --force) force=1 ;;
+            *) bad "unknown domain-change option: $flag"; return 2 ;;
+        esac
+    done
+    dom="$(normalize_domain "$raw")"
+    valid_domain "$dom" || { bad "invalid domain: $raw"; return 1; }
+    old="$(normalize_domain "$(env_get PANEL_DOMAIN)")"
+    if [[ "$dom" == "$old" ]]; then
+        ok "domain is already $dom"
+        return 0
+    fi
+    if ! domain_dns_check "$dom"; then
+        [[ "$force" == "1" ]] || { bad "DNS is not ready; fix it first or explicitly pass --force"; return 1; }
+        warn "DNS check bypassed explicitly; certificate issue may fail until propagation completes"
+    fi
+    if [[ "$yes" != "1" ]]; then
+        local answer=""
+        if have_tty; then
+            read -r -p "  Change Sibil callback domain from ${old:-<unset>} to $dom? [y/N] " answer </dev/tty || true
+        fi
+        [[ "${answer,,}" =~ ^(y|yes)$ ]] || { ok "cancelled — domain was not changed"; return 0; }
+    fi
     env_set PANEL_DOMAIN "$dom"
+    env_set PANEL_WEB_URL "https://$dom"
     ok "domain saved: $dom"
-    say "  now run:  sudo sibil ssl"
+    say "  next safe step: sudo sibil ssl issue"
+}
+
+cmd_domain() {
+    check_env || return 1
+    local sub="${1:-}" value="${2:-}" yes="${3:-}"
+    case "$sub" in
+        '' )
+            if ! have_tty; then cmd_domain_status; return $?; fi
+            while true; do
+                cmd_domain_status || true
+                say ""
+                say "  [1] change domain   [2] DNS / HTTPS health   [3] issue certificate"
+                say "  [4] renew certificate [0] return"
+                local pick
+                read -r -p "  choose: " pick </dev/tty || return 0
+                case "$pick" in
+                    1) read -r -p "  new domain: " value </dev/tty || value=""; [[ -n "$value" ]] && cmd_domain_change "$value" ;;
+                    2) cmd_domain_health ;;
+                    3) cmd_ssl issue ;;
+                    4) cmd_ssl renew ;;
+                    0|q|return|'') return 0 ;;
+                    *) warn "unknown choice" ;;
+                esac
+            done
+            ;;
+        status) cmd_domain_status ;;
+        check|health) cmd_domain_health "$value" ;;
+        change) cmd_domain_change "$value" "$yes" "${4:-}" ;;
+        issue|renew) cmd_ssl "$sub" ;;
+        *) cmd_domain_change "$sub" "$value" "$yes" ;;
+    esac
 }
 
 cmd_config() {
@@ -982,6 +1388,39 @@ cmd_deps() {
     [[ -x "$(command -v curl 2>/dev/null)" ]] && ok "curl binary" || warn "curl missing (needed for Telegram)"
 }
 
+cmd_php_update() {
+    local assume_yes="${1:-}"
+    step "PHP runtime update"
+    if ! command -v "$PHP_BIN" >/dev/null 2>&1; then
+        bad "PHP is not available; run: sudo sibil deps"
+        return 1
+    fi
+    say "  current: $("$PHP_BIN" -v 2>/dev/null | head -1)"
+    if [[ "$assume_yes" == "--check" ]]; then
+        return 0
+    fi
+    if ! command -v apt-get >/dev/null 2>&1; then
+        warn "no apt-get; update PHP using this platform's package manager, then run: sibil doctor"
+        return 1
+    fi
+    is_root || { warn "run as root: sudo sibil php"; return 1; }
+    if [[ "$assume_yes" != "--yes" && "$assume_yes" != "-y" ]]; then
+        local answer=""
+        if have_tty; then
+            read -r -p "  Update installed PHP packages from the configured OS repositories? [y/N] " answer </dev/tty || true
+        fi
+        [[ "${answer,,}" =~ ^(y|yes)$ ]] || { ok "cancelled — PHP was not changed"; return 0; }
+    fi
+    local -a pkgs=(php-cli php-common php-sqlite3 php-curl php-mbstring php-xml php-zip)
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq \
+        && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${pkgs[@]}" \
+        && ok "PHP packages updated" || { bad "PHP package update failed"; return 1; }
+    PHP_BIN="$(command -v php || printf '%s' "$PHP_BIN")"
+    env_set PANEL_PHP_BIN "$PHP_BIN"
+    say "  now: $("$PHP_BIN" -v 2>/dev/null | head -1)"
+    cmd_restart
+}
+
 cmd_doctor() {
     banner
     step "Checks"
@@ -1018,10 +1457,12 @@ cmd_doctor() {
     else
         bad "no bot token in config"
     fi
-    if has_systemd; then
+    if has_systemd && web_unit_is_owned; then
         systemctl is-active --quiet "$WEB_SERVICE" 2>/dev/null \
             && ok "payment web endpoint is running" \
             || bad "payment web endpoint is down — online gateways cannot confirm"
+    elif has_systemd && [[ -f "$(web_unit_file)" ]]; then
+        warn "preserved unowned web unit: $(web_unit_file)"
     fi
     local procs; procs="$(bot_pids | wc -l)"
     [[ "$procs" -le 1 ]] && ok "bot processes: $procs" || bad "$procs bot processes are running (409 conflicts) — fix: sudo sibil fix"
@@ -1097,13 +1538,54 @@ cmd_doctor() {
 }
 
 cmd_ssl() {
-    command -v caddy >/dev/null 2>&1 || { bad "caddy is not installed (the installer sets it up)"; return 1; }
-    if has_systemd && is_root; then
-        systemctl reload caddy 2>/dev/null || systemctl restart caddy
-        ok "caddy reloaded — certificates are issued automatically"
-    else
-        warn "run as root: sudo sibil ssl"
+    local action="${1:-}" dom
+    dom="$(normalize_domain "$(env_get PANEL_DOMAIN)")"
+    if [[ "$action" == "status" ]]; then
+        cmd_domain_status
+        return $?
     fi
+    [[ -n "$dom" ]] && valid_domain "$dom" || { bad "set a valid domain first: sibil domain change example.com"; return 1; }
+    if [[ "$action" == "" ]] && have_tty; then
+        say "  [1] status   [2] issue / repair certificate   [3] renew now   [0] return"
+        local pick
+        read -r -p "  SSL choice: " pick </dev/tty || return 0
+        case "$pick" in 1) action=status ;; 2) action=issue ;; 3) action=renew ;; *) return 0 ;; esac
+        [[ "$action" == status ]] && { cmd_domain_status; return $?; }
+    fi
+    [[ -n "$action" ]] || action=status
+    case "$action" in
+        issue|renew)
+            # System Caddy paths require root.  A deliberately overridden, writable
+            # Caddy configuration may be managed by an unprivileged local install.
+            if ! is_root && { [[ "$(caddy_main_file)" == "/etc/caddy/Caddyfile" ]] || [[ "$(caddy_conf_dir)" == "/etc/caddy/conf.d" ]]; }; then
+                bad "run as root: sudo sibil ssl $action"
+                return 1
+            fi
+            domain_dns_check "$dom" || { bad "fix DNS before issuing a certificate"; return 1; }
+            command -v caddy >/dev/null 2>&1 || { bad "Caddy is not installed; run: sudo sibil deps"; return 1; }
+            local main site main_backup site_backup="" site_existed=0
+            main="$(caddy_main_file)"; site="$(caddy_site_file "$dom")"
+            [[ -f "$main" ]] || { bad "Caddyfile not found: $main"; return 1; }
+            main_backup="$(mktemp "${main}.sibil-rollback.XXXXXX")" || return 1
+            cp -fp "$main" "$main_backup" || { rm -f "$main_backup"; return 1; }
+            if [[ -f "$site" ]]; then
+                site_existed=1
+                site_backup="$(mktemp "${site}.sibil-rollback.XXXXXX")" || { rm -f "$main_backup"; return 1; }
+                cp -fp "$site" "$site_backup" || { rm -f "$main_backup" "$site_backup"; return 1; }
+            fi
+            if ! caddy_ensure_owned_import || ! caddy_write_owned_site "$dom" || ! caddy_validate_reload; then
+                cp -fp "$main_backup" "$main" 2>/dev/null || true
+                if [[ "$site_existed" == "1" ]]; then cp -fp "$site_backup" "$site" 2>/dev/null || true; else rm -f "$site"; fi
+                rm -f "$main_backup" "$site_backup"
+                warn "Caddy changes did not validate; restored the previous configuration"
+                return 1
+            fi
+            rm -f "$main_backup" "$site_backup"
+            [[ "$action" == issue ]] && say "  certificate issuance is asynchronous; run 'sibil domain health' in a moment"
+            cert_expiry_status "$dom" || true
+            ;;
+        *) bad "usage: sibil ssl [status|issue|renew]"; return 2 ;;
+    esac
 }
 
 cmd_fix() {
@@ -1112,11 +1594,13 @@ cmd_fix() {
     chmod 750 "$PANEL_HOME/logs" "$PANEL_HOME/backups" 2>/dev/null || true
     install_htaccess
     if is_root; then
-        pkill -f "$APP" 2>/dev/null && warn "stray bot processes killed"
+        stop_our_app_processes && warn "stray Sibil processes stopped"
         [[ -d "$PANEL_HOME" ]] && chown -R sibil:sibil "$PANEL_HOME" 2>/dev/null && ok "ownership fixed"
-        if has_systemd; then
+        if has_systemd && bot_unit_is_owned; then
             systemctl reset-failed "$SERVICE" >/dev/null 2>&1 || true
             systemctl restart "$SERVICE" && ok "service restarted"
+        elif has_systemd && [[ -f "$(bot_unit_file)" ]]; then
+            warn "preserved unowned systemd unit: $(bot_unit_file)"
         fi
         [[ -f "$LOG_FILE" ]] && { tail -n 15 "$LOG_FILE" | sed 's/^/  /'; }
     else
@@ -1125,25 +1609,35 @@ cmd_fix() {
 }
 
 cmd_install() {
-    local url="${1:-$DEFAULT_UPDATE_URL}"
-    step "Installing ${APP_NAME} (PHP $VERSION)"
+    local url="${1:-${DEFAULT_UPDATE_URL:-$OFFICIAL_INSTALL_URL}}"
+    step "Installing $CLI_BRAND (PHP $VERSION)"
     local tmp; tmp="$(mktemp -d)/installer.sh"
     curl -fsSL --max-time 60 "$url" -o "$tmp" || { bad "download failed"; return 1; }
     sudo bash "$tmp"
 }
 
 cmd_remove() {
-    step "Removing the service"
-    if has_systemd && is_root; then
-        systemctl stop "$SERVICE" 2>/dev/null
-        systemctl disable "$SERVICE" 2>/dev/null
-        rm -f "/etc/systemd/system/$SERVICE.service"
-        systemctl daemon-reload
+    step "Removing the Sibil service (data and CLI are kept)"
+    local unit="$SYSTEMD_DIR/$SERVICE.service" webunit="$SYSTEMD_DIR/$WEB_SERVICE.service"
+    if ! panel_home_owned; then
+        bad "refusing service removal: $PANEL_HOME is not proven to be Sibil-owned"
+        return 1
     fi
-    pkill -f "$APP" 2>/dev/null || true
-    rm -f "$CLI_PATH" 2>/dev/null
-    ok "service removed · data kept in $PANEL_HOME"
-    say "  to delete everything:  sudo rm -rf $PANEL_HOME"
+    for unit in "$unit" "$webunit"; do
+        if unit_is_owned "$unit"; then
+            if has_systemd && is_root; then
+                systemctl stop "$(basename "$unit" .service)" 2>/dev/null || true
+                systemctl disable "$(basename "$unit" .service)" 2>/dev/null || true
+            fi
+            rm -f "$unit" && ok "removed $(basename "$unit")"
+        elif [[ -f "$unit" ]]; then
+            warn "preserved unowned systemd unit: $unit"
+        fi
+    done
+    if has_systemd && is_root && [[ -d "$SYSTEMD_DIR" ]]; then systemctl daemon-reload 2>/dev/null || true; fi
+    stop_our_app_processes || true
+    ok "Sibil service removed; data, source and CLI remain in $PANEL_HOME"
+    say "  to remove all proven Sibil resources: sudo sibil uninstall"
 }
 
 # ── حذف کامل (uninstall) ─────────────────────────────────────────────────────
@@ -1151,67 +1645,117 @@ cmd_remove() {
 # بلوک دامنه در کانفیگ وب‌سرور. قبل از هر کار یک بکاپ امن در /root گرفته می‌شود
 # تا حذف تصادفی دیتابیس جبران‌پذیر باشد.
 remove_caddy_block() {
-    local domain="$1"
-    [[ -z "$domain" ]] && return 0
-    local file="/etc/caddy/Caddyfile"
-    [[ -f "$file" ]] || return 0
-    grep -q "$domain" "$file" 2>/dev/null || return 0
-    local backup="$file.bak-$(date +%Y%m%d%H%M%S)"
-    cp -f "$file" "$backup" 2>/dev/null || return 0
-    # حذف فقط بلوک «domain { … }» و نگه‌داشتن بقیهٔ سایت‌ها
-    awk -v d="$domain" '
-        skip == 0 && index($0, d) > 0 && $0 ~ /\{[[:space:]]*$/ { skip = 1; depth = 1; next }
-        skip == 1 {
-            opens = gsub(/\{/, "{")
-            closes = gsub(/\}/, "}")
-            depth += opens - closes
-            if (depth <= 0) { skip = 0 }
-            next
+    local domain="$1" file main main_backup site_backup="" site_existed=0
+    [[ -n "$domain" ]] || return 0
+    file="$(caddy_site_file "$domain")"; main="$(caddy_main_file)"
+    if caddy_site_is_owned "$file"; then
+        # Save exact files before a removal that could make a hand-edited Caddyfile
+        # invalid.  The backup is removed once validation succeeds.
+        [[ -f "$main" ]] && {
+            main_backup="$(mktemp "${main}.sibil-remove-rollback.XXXXXX")" || return 1
+            cp -fp "$main" "$main_backup" || { rm -f "$main_backup"; return 1; }
         }
-        { print }
-    ' "$backup" >"$file" 2>/dev/null || cp -f "$backup" "$file" 2>/dev/null || true
-    systemctl reload caddy 2>/dev/null || systemctl restart caddy 2>/dev/null || true
-    ok "web server entry removed for $domain (backup: ${backup##*/})"
-}
-
-remove_nginx_block() {
-    local domain="$1"
-    [[ -z "$domain" ]] && return 0
-    local removed=0 f
-    for f in /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf; do
-        [[ -f "$f" ]] || continue
-        if grep -q "$domain" "$f" 2>/dev/null; then
-            rm -f "$f" 2>/dev/null && removed=1
+        site_existed=1
+        site_backup="$(mktemp "${file}.sibil-remove-rollback.XXXXXX")" || { rm -f "$main_backup"; return 1; }
+        cp -fp "$file" "$site_backup" || { rm -f "$main_backup" "$site_backup"; return 1; }
+        rm -f "$file" || { rm -f "$main_backup" "$site_backup"; return 1; }
+        ok "removed Sibil-owned Caddy site: $file"
+        caddy_remove_owned_import_if_unused || true
+        if command -v caddy >/dev/null 2>&1 && [[ -f "$main" ]] && ! caddy validate --config "$main" --adapter caddyfile >/dev/null 2>&1; then
+            [[ -n "$main_backup" ]] && cp -fp "$main_backup" "$main" 2>/dev/null || true
+            [[ "$site_existed" == "1" ]] && cp -fp "$site_backup" "$file" 2>/dev/null || true
+            rm -f "$main_backup" "$site_backup"
+            warn "Caddy validation failed after cleanup; restored the Sibil files"
+            return 1
         fi
-    done
-    if [[ $removed -eq 1 ]]; then
-        systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null || true
-        ok "web server entry removed for $domain"
+        rm -f "$main_backup" "$site_backup"
+        if command -v caddy >/dev/null 2>&1 && [[ -f "$main" ]] && has_systemd && is_root; then
+            systemctl reload caddy 2>/dev/null || true
+        fi
+    elif [[ -e "$file" ]]; then
+        warn "preserved unowned Caddy file: $file"
+    elif [[ -f "$main" ]] && grep -qF "$domain" "$main" 2>/dev/null; then
+        warn "preserved legacy/unmarked Caddy entry for $domain (not safe to delete automatically)"
     fi
 }
 
+remove_nginx_block() {
+    local domain="$1" f removed=0 i
+    local -a files=() backups=()
+    [[ -n "$domain" ]] || return 0
+    # Only Sibil-named, explicitly marked files are ours.  A server_name match
+    # is deliberately insufficient: it could belong to another application.
+    for f in "$(nginx_sites_enabled_dir)/sibil-$domain" "$(nginx_sites_available_dir)/sibil-$domain" \
+             "$(nginx_conf_dir)/sibil-$domain.conf"; do
+        [[ -f "$f" ]] || continue
+        if ! grep -q "$SIBIL_OWNER_MARKER" "$f" 2>/dev/null; then
+            warn "preserved unowned nginx file: $f"
+            continue
+        fi
+        local backup
+        backup="$(mktemp "${f}.sibil-remove-rollback.XXXXXX")" || return 1
+        cp -fp "$f" "$backup" || { rm -f "$backup"; return 1; }
+        rm -f "$f" || { rm -f "$backup"; return 1; }
+        files+=("$f"); backups+=("$backup"); removed=1
+        ok "removed Sibil-owned nginx file: $f"
+    done
+    if [[ $removed -eq 1 ]] && command -v nginx >/dev/null 2>&1; then
+        if ! nginx -t >/dev/null 2>&1; then
+            for i in "${!files[@]}"; do cp -fp "${backups[$i]}" "${files[$i]}" 2>/dev/null || true; done
+            rm -f "${backups[@]}"
+            warn "nginx validation failed after cleanup; restored the Sibil files"
+            return 1
+        fi
+        if has_systemd && is_root; then systemctl reload nginx 2>/dev/null || true; fi
+    fi
+    [[ ${#backups[@]} -gt 0 ]] && rm -f "${backups[@]}"
+}
+
+
+# Sibil itself uses systemd, but old installs may have left a /etc/cron.d file.
+# Only explicitly marked files—or conservative exact-home legacy proof—are touched.
+remove_owned_cron_files() {
+    local dir f failed=0
+    dir="$(cron_dir)"
+    for f in "$dir/sibil" "$dir/sibilpanel" "$dir/sibil-panel"; do
+        [[ -f "$f" ]] || continue
+        if grep -q "$SIBIL_OWNER_MARKER" "$f" 2>/dev/null \
+           || { grep -qF "$PANEL_HOME/sibil.php" "$f" 2>/dev/null && grep -qF "$PANEL_HOME" "$f" 2>/dev/null; }; then
+            if rm -f "$f"; then ok "removed Sibil-owned cron file: $f"; else warn "could not remove owned cron file: $f"; failed=1; fi
+        else
+            warn "preserved unowned cron file: $f"
+        fi
+    done
+    return "$failed"
+}
+
 cmd_uninstall() {
-    local assume_yes="${1:-}"
-    local domain
-    domain="$(env_get PANEL_DOMAIN)"
-    [[ -z "$domain" ]] && domain="$(env_get PANEL_WEB_DOMAIN)"
+    local assume_yes="${1:-}" domain unit removed_units=0 keep
+    domain="$(normalize_domain "$(env_get PANEL_DOMAIN)")"
+    [[ -n "$domain" ]] || domain="$(normalize_domain "$(env_get PANEL_WEB_DOMAIN)")"
+    if ! panel_home_owned; then
+        bad "refusing uninstall: $PANEL_HOME is not proven to be Sibil-owned"
+        say "  expected .sibil-owned, or matching .env + sibil.php ownership proof"
+        return 1
+    fi
 
     banner
     say ""
-    warn "this deletes the bot, its service, its files and its data"
+    warn "this removes only resources proven to belong to this Sibil installation"
     say "  install dir : ${B}$PANEL_HOME${R}"
     say "  database    : ${B}$DB_FILE${R}"
     say "  command     : ${B}$CLI_PATH${R}"
     [[ -n "$domain" ]] && say "  domain      : ${B}$domain${R}"
+    say "  preserved   : unmarked web-server files, unrelated services and other app data"
+    if [[ -f "$DB_FILE" ]] && ! db_file_is_under_home; then
+        warn "configured database is outside the Sibil home and will be preserved: $DB_FILE"
+    fi
     say ""
 
     if [[ "$assume_yes" != "-y" && "$assume_yes" != "--yes" ]]; then
         local answer=""
-        # اول ترمینال؛ اگر ترمینال نبود (اسکریپت/CI) تأیید از stdin خوانده می‌شود
-        if ! read -r -p "  Are you sure you want to completely uninstall SIBILPANEL? [y/N] " \
-            answer </dev/tty 2>/dev/null; then
-            read -r -p "  Are you sure you want to completely uninstall SIBILPANEL? [y/N] " \
-                answer 2>/dev/null || answer=""
+        if ! read -r -p "  Remove this Sibil installation and its data? [y/N] " answer </dev/tty 2>/dev/null; then
+            read -r -p "  Remove this Sibil installation and its data? [y/N] " answer 2>/dev/null || answer=""
         fi
         case "${answer,,}" in
             y|yes) ;;
@@ -1219,67 +1763,82 @@ cmd_uninstall() {
         esac
     fi
 
-    step "1/6 stopping and disabling the services"
-    if has_systemd; then
-        systemctl stop "$SERVICE" 2>/dev/null || true
-        systemctl disable "$SERVICE" 2>/dev/null || true
-        systemctl stop "$WEB_SERVICE" 2>/dev/null || true
-        systemctl disable "$WEB_SERVICE" 2>/dev/null || true
-        ok "systemd services stopped and disabled"
-    else
-        warn "no systemd — skipping the service step"
-    fi
-    pkill -f "$APP" 2>/dev/null || true
-    pkill -f "sibil.php --poll" 2>/dev/null || true
-    pkill -f "sibil.php --broadcast" 2>/dev/null || true
+    step "1/6 stopping Sibil-owned services"
+    for unit in "$SYSTEMD_DIR/$SERVICE.service" "$SYSTEMD_DIR/$WEB_SERVICE.service"; do
+        if unit_is_owned "$unit"; then
+            if has_systemd && is_root; then
+                systemctl stop "$(basename "$unit" .service)" 2>/dev/null || true
+            fi
+            ok "stopped $(basename "$unit")"
+        elif [[ -f "$unit" ]]; then
+            warn "preserved unowned systemd unit: $unit"
+        fi
+    done
+    # Only this installation's executable is targeted; broad sibil/process-name
+    # kills could terminate a different customer's service.
+    stop_our_app_processes || true
 
-    step "2/6 removing the service files"
-    rm -f "/etc/systemd/system/$SERVICE.service" \
-          "/etc/systemd/system/$WEB_SERVICE.service" 2>/dev/null || true
-    [[ -d /etc/systemd/system ]] && systemctl daemon-reload 2>/dev/null || true
-    systemctl reset-failed "$SERVICE" 2>/dev/null || true
-    ok "service files removed"
-
-    step "3/6 removing the installation directory"
-    # یک نسخهٔ ایمن از دیتابیس و .env بیرون از پوشه نگه داشته می‌شود
+    step "2/6 preserving a recoverable data copy"
     if [[ -f "$DB_FILE" ]]; then
-        local keep="/root/sibil-uninstall-$(date +%Y%m%d-%H%M%S)"
-        mkdir -p "$keep" 2>/dev/null && {
-            cp -f "$DB_FILE" "$keep/" 2>/dev/null || true
-            [[ -f "$ENV_FILE" ]] && cp -f "$ENV_FILE" "$keep/.env" 2>/dev/null || true
-            chmod 600 "$keep"/* 2>/dev/null || true
-            ok "a safety copy was kept in $keep"
-        }
-    fi
-    if [[ -d "$PANEL_HOME" && "$PANEL_HOME" != "/" && "$PANEL_HOME" != "/opt" ]]; then
-        rm -rf "$PANEL_HOME" 2>/dev/null || sudo -n rm -rf "$PANEL_HOME" 2>/dev/null || true
-        ok "installation directory removed: $PANEL_HOME"
-    else
-        warn "refusing to delete a suspicious install path: $PANEL_HOME"
+        if [[ -n "${SIBIL_UNINSTALL_BACKUP_DIR:-}" ]]; then
+            keep="$SIBIL_UNINSTALL_BACKUP_DIR/sibil-uninstall-$(date +%Y%m%d-%H%M%S)"
+        elif is_root; then keep="/root/sibil-uninstall-$(date +%Y%m%d-%H%M%S)"; else keep="$HOME/sibil-uninstall-$(date +%Y%m%d-%H%M%S)"; fi
+        if ! mkdir -p "$keep" 2>/dev/null || ! db_snapshot_to "$DB_FILE" "$keep/sibil.sqlite3"; then
+            rm -rf -- "$keep" 2>/dev/null || true
+            bad "could not make a recoverable database snapshot; refusing to delete the Sibil home"
+            return 1
+        fi
+        [[ -f "$ENV_FILE" ]] && cp -f "$ENV_FILE" "$keep/.env" 2>/dev/null || true
+        chmod 600 "$keep"/* 2>/dev/null || true
+        ok "data copy kept in $keep"
     fi
 
-    step "4/6 removing the terminal command"
-    rm -f "$CLI_PATH" 2>/dev/null || sudo -n rm -f "$CLI_PATH" 2>/dev/null || true
-    rm -f /usr/local/bin/sibil /usr/bin/sibil 2>/dev/null || true
-    ok "command removed: sibil"
+    step "3/6 removing Sibil-owned service units"
+    for unit in "$SYSTEMD_DIR/$SERVICE.service" "$SYSTEMD_DIR/$WEB_SERVICE.service"; do
+        if unit_is_owned "$unit"; then
+            if has_systemd && is_root; then systemctl disable "$(basename "$unit" .service)" 2>/dev/null || true; fi
+            rm -f "$unit" && { removed_units=$((removed_units + 1)); ok "removed $unit"; }
+        fi
+    done
+    if [[ $removed_units -gt 0 ]] && has_systemd && is_root && [[ -d "$SYSTEMD_DIR" ]]; then
+        systemctl daemon-reload 2>/dev/null || true
+        systemctl reset-failed "$SERVICE" 2>/dev/null || true
+        systemctl reset-failed "$WEB_SERVICE" 2>/dev/null || true
+    fi
 
-    step "5/6 cleaning the web server entries"
-    remove_caddy_block "$domain"
-    remove_nginx_block "$domain"
-    ok "web server entries cleaned"
+    step "4/6 removing Sibil-owned commands and web proxy files"
+    local cli cleanup_failed=0
+    for cli in "$CLI_PATH" /usr/local/bin/sibil /usr/bin/sibil; do
+        if cli_is_owned "$cli"; then
+            rm -f -- "$cli" && ok "removed Sibil command: $cli"
+        elif [[ -e "$cli" || -L "$cli" ]]; then
+            warn "preserved unowned command: $cli"
+        fi
+    done
+    remove_caddy_block "$domain" || cleanup_failed=1
+    remove_nginx_block "$domain" || cleanup_failed=1
+    remove_owned_cron_files || cleanup_failed=1
+    if [[ "$cleanup_failed" == "1" ]]; then
+        bad "web/cron cleanup was rolled back or incomplete; Sibil source and data were preserved"
+        return 1
+    fi
 
-    step "6/6 final check"
+    step "5/6 removing the proven Sibil home"
+    rm -rf -- "$PANEL_HOME" 2>/dev/null || { bad "could not remove $PANEL_HOME"; return 1; }
+    ok "installation directory removed: $PANEL_HOME"
+
+    step "6/6 final ownership check"
     local leftovers=0
-    [[ -f "/etc/systemd/system/$SERVICE.service" ]] && leftovers=$((leftovers+1))
     [[ -d "$PANEL_HOME" ]] && leftovers=$((leftovers+1))
-    [[ -e "$CLI_PATH" ]] && leftovers=$((leftovers+1))
+    for unit in "$SYSTEMD_DIR/$SERVICE.service" "$SYSTEMD_DIR/$WEB_SERVICE.service"; do
+        unit_is_owned "$unit" && leftovers=$((leftovers+1))
+    done
     if [[ $leftovers -gt 0 ]]; then
-        warn "$leftovers item(s) are still on disk — remove them manually if needed"
+        warn "$leftovers owned resource(s) remain; review permissions manually"
         return 1
     fi
     say ""
-    printf '  %s✓ SIBILPANEL was successfully uninstalled from your server.%s\n' \
-        "$GRN$B" "$R"
+    printf '  %s✓ Sibil was safely uninstalled; unrelated server resources were preserved.%s\n' "$GRN$B" "$R"
     say ""
 }
 
@@ -1309,29 +1868,43 @@ cmd_help() {
     say ""
     say "  ${B}usage:${R} sibil [command]"
     say ""
-    say "    ${B}status${R}     service, config and data summary"
-    say "    ${B}update${R}     fetch the latest release and restart (data kept)"
-    say "    ${B}update --force${R}  reinstall from github even if versions match"
-    say "    ${B}restart${R}    restart the bot        ${B}start${R} / ${B}stop${R}"
-    say "    ${B}logs${R}       follow bot_error.log / payments.log / device_guard.log"
-    say "    ${B}backup${R}     create a snapshot, or import a backup .$(backup_ext)"
-    say "    ${B}restore${R}    alias of: backup <file>"
-    say "    ${B}domain${R}     set the domain       ${B}ssl${R}   reload Caddy/TLS"
-    say "    ${B}config${R}     edit token/admins/domain"
-    say "    ${B}web${R}        payment callback endpoint status"
-    say "    ${B}doctor${R}     full health check     ${B}deps${R}  install PHP modules"
-    say "    ${B}fix${R}        repair permissions/processes"
-    say "    ${B}migrate${R}    upgrade the database schema (safe, repeatable)"
-    say "    ${B}install${R}    fresh install        ${B}remove${R}  remove the service"
-    say "    ${B}uninstall${R}  delete everything (asks first, keeps a DB copy in /root)"
-    say "    ${B}version${R}    print the version    ${B}check${R}   latest release check"
-    say "    ${B}help${R}       this screen"
+    say "  ${B}Operational${R}"
+    say "    ${B}install${R}          install / repair from the official source"
+    say "    ${B}update${R}           update code safely (keeps .env and database)"
+    say "    ${B}remove${R}           remove only proven Sibil services; keep data"
+    say "    ${B}uninstall${R}        remove all proven Sibil resources (asks first)"
+    say "    ${B}php${R}              update PHP runtime packages (asks first)"
+    say "    ${B}start${R} / ${B}stop${R} / ${B}restart${R}    service controls"
     say ""
+    say "  ${B}Domain and TLS${R}"
+    say "    ${B}domain status|change <name>|health${R}"
+    say "    ${B}ssl status|issue|renew${R}    owned Caddy proxy/certificate actions"
+    say ""
+    say "  ${B}Data and support${R}"
+    say "    ${B}backup${R}           create a database snapshot"
+    say "    ${B}import <file>${R}    validate, safety-copy and restore a database"
+    say "    ${B}migrate${R}          run compatible database migrations"
+    say "    ${B}status${R} / ${B}doctor${R} / ${B}web${R} / ${B}logs${R}"
+    say "    ${B}config${R} / ${B}deps${R} / ${B}fix${R} / ${B}check${R}"
+    say ""
+    say "  Safety: uninstall and proxy cleanup only remove files with explicit Sibil"
+    say "  ownership proof; unrelated server resources are preserved."
+    say ""
+}
+
+dashboard_health_row() {
+    local bot='● stopped' web='● down' db='● missing' tls='● unset' dom
+    service_active && bot='● running'
+    if has_systemd && web_unit_is_owned && systemctl is-active --quiet "$WEB_SERVICE" 2>/dev/null; then web='● online'; fi
+    [[ -f "$DB_FILE" ]] && db='● ready'
+    dom="$(normalize_domain "$(env_get PANEL_DOMAIN)")"
+    [[ -n "$dom" ]] && tls="● $dom"
+    printf '  %sBOT %s  %sWEB %s  %sDB %s  %sTLS %s%s\n' \
+        "$DIM" "$bot" "$DIM" "$web" "$DIM" "$db" "$DIM" "$tls" "$R"
 }
 
 cmd_menu() {
     local choice remote
-    # در شل غیرتعاملی (اسکریپت/CI) منو کار نمی‌کند؛ راهنما چاپ می‌شود
     if [[ ! -e /dev/tty ]] || { [[ ! -t 0 ]] && [[ ! -t 1 ]]; }; then
         banner
         warn "no interactive terminal — run: sibil help"
@@ -1340,32 +1913,31 @@ cmd_menu() {
     while true; do
         clear 2>/dev/null || true
         banner
+        dashboard_health_row
         remote="$(remote_version)"
         if [[ -n "$remote" ]] && version_gt "$remote" "$VERSION"; then
-            printf '\n  %s● Update v%s is available. You have v%s.%s\n' \
-                "$YEL$B" "$remote" "$VERSION" "$R"
+            printf '\n  %s● Update v%s is available. You have v%s.%s\n' "$YEL$B" "$remote" "$VERSION" "$R"
         fi
         say ""
-        say "  ${B}1${R}) status         ${B}2${R}) update$(update_label)"
-        say "  ${B}3${R}) backup / import  ${B}4${R}) dependencies   ${B}5${R}) doctor"
-        say "  ${B}6${R}) ssl / domain   ${B}7${R}) logs           ${B}8${R}) restart"
-        say "  ${B}9${R}) config         ${B}10${R}) uninstall"
-        say "  ${B}0${R}) exit"
+        say "  ${B}[1]${R} Install / repair       ${B}[2]${R} Update              ${B}[3]${R} Remove service"
+        say "  ${B}[4]${R} PHP update             ${B}[5]${R} Domain / SSL        ${B}[6]${R} Backup / DB import"
+        say "  ${B}[7]${R} Database migration     ${B}[8]${R} Status / health     ${B}[9]${R} Help / parameters"
+        say "  ${B}[10]${R} Config / logs          ${B}[0]${R} Exit"
         say ""
         read -r -p "  choose: " choice </dev/tty || return 0
         say ""
         case "$choice" in
-            1) cmd_status ;;
+            1) cmd_install ;;
             2) cmd_update ;;
-            3) cmd_backup "" ;;
-            4) cmd_deps ;;
-            5) cmd_doctor ;;
-            6) cmd_domain ""; cmd_ssl ;;
-            7) cmd_logs "" ;;
-            8) cmd_restart ;;
-            9) cmd_config ;;
-            10|uninstall) cmd_uninstall ;;
-            0|q|exit|"") exit 0 ;;
+            3) cmd_remove ;;
+            4) cmd_php_update ;;
+            5) cmd_domain ;;
+            6) cmd_backup "" ;;
+            7) cmd_migrate ;;
+            8) cmd_status; cmd_doctor ;;
+            9) cmd_help ;;
+            10) cmd_config ; cmd_logs "" ;;
+            0|q|exit|'') return 0 ;;
             *) warn "unknown choice: $choice" ;;
         esac
         [[ -n "${PANEL_NO_PAUSE:-}" ]] && continue
@@ -1383,12 +1955,14 @@ case "${1:-menu}" in
     logs)    shift; cmd_logs "${1:-60}" ;;
     backup)  shift; cmd_backup "${1:-}" ;;
     restore) shift; cmd_restore "${1:-}" ;;
-    domain)  shift; cmd_domain "${1:-}" ;;
+    import|db-import) shift; cmd_backup_import "${1:-}" ;;
+    domain)  shift; cmd_domain "$@" ;;
     config)  cmd_config ;;
     doctor)  cmd_doctor ;;
     deps)    cmd_deps ;;
+    php|php-update) shift; cmd_php_update "${1:-}" ;;
     migrate|migration) shift; cmd_migrate "$@" ;;
-    ssl)     cmd_ssl ;;
+    ssl)     shift; cmd_ssl "$@" ;;
     fix)     cmd_fix ;;
     install) shift; cmd_install "${1:-}" ;;
     remove)  cmd_remove ;;
@@ -1399,9 +1973,10 @@ case "${1:-menu}" in
         say "callback base: $(env_get PANEL_WEB_URL)"
         say "gateways     : ${PANEL_WEB_URL:-<unset>}/pay/<gateway>"
         say "variza hook  : ${PANEL_WEB_URL:-<unset>}/pay/variza/webhook"
-        if has_systemd; then systemctl status "$WEB_SERVICE" --no-pager -n 5 2>/dev/null; fi
+        say "tetrapay hook: ${PANEL_WEB_URL:-<unset>}/pay/tetrapay/webhook"
+        if has_systemd && web_unit_is_owned; then systemctl status "$WEB_SERVICE" --no-pager -n 5 2>/dev/null; fi
         ;;
-    version) say "panel-service $VERSION (PHP edition)" ;;
+    version) say "$CLI_BRAND $VERSION (PHP edition)" ;;
     check|update-check) cmd_check ;;
     help|-h|--help) cmd_help ;;
     menu)    cmd_menu ;;

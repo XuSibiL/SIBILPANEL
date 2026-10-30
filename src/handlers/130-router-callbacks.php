@@ -528,32 +528,32 @@ function handle_callback_inner(array $cb): void
                     return;
                 }
                 if (($result['url'] ?? '') !== '') {
-                    $gwType = PAY_GATEWAYS[$gw]['type'] ?? 'online';
                     $paymentRow = DB::one('SELECT * FROM payments WHERE order_id=? AND method=? '
                         . "AND status='unpaid' ORDER BY id DESC LIMIT 1", [(int) $order['id'], $gw]);
-                    $invoiceNo = (string) ($paymentRow['authority'] ?? '');
-                    pay_note_message((int) $order['id'], $gw, (int) $messageId);
-                    if ($gwType === 'crypto') {
-                        /* قالب پیام تأیید */
-                        $meta = $paymentRow ? pay_meta($paymentRow) : [];
-                        Tg::show($chatId, $messageId,
-                            crypto_invoice_header($order, (string) ($result['text'] ?: $gw))
-                            . "\n\n" . crypto_invoice_text($order, (string) $gw, $invoiceNo,
-                                (float) ($meta['fiat_amount'] ?? 0)),
-                            [[btn('💳 پرداخت', null, (string) $result['url'], 'success')],
-                             [btn('« بازگشت', 'inv:gw:' . $order['id'], null, 'danger')]]);
+                    if ($paymentRow === null) {
+                        Tg::answer($cbId, 'ثبت فاکتور درگاه کامل نشد', true);
+                        screen_gateways($chatId, $messageId, $order, 'فاکتور درگاه پیدا نشد؛ دوباره تلاش کنید.');
                         return;
                     }
                     pay_note_message((int) $order['id'], $gw, (int) $messageId);
-                    Tg::show($chatId, $messageId,
-                        '🌐 <b>پرداخت ' . e($result['text']) . "</b>\n\n"
-                        . 'مبلغ: <b>' . money((int) $order['payable']) . "</b>\n"
-                        . 'کد سفارش: <code>' . e((string) $order['ref']) . "</code>\n\n"
-                        . 'روی دکمهٔ زیر بزنید و پرداخت را کامل کنید. ' .
-                        'بعد از پرداخت خودکار به همین‌جا برمی‌گردی.',
-                        [[btn('💳 پرداخت ' . money((int) $order['payable']),
-                            null, $result['url'], 'success')],
-                         [btn('« بازگشت', 'inv:gw:' . $order['id'], null, 'danger')]]);
+                    $rows = [[btn('💳 پرداخت ' . money((int) $order['payable']),
+                        null, (string) $result['url'], 'success')]];
+                    $alternate = trim((string) ($result['alt_url'] ?? ''));
+                    if ($alternate !== '' && preg_match('~^https://~i', $alternate) === 1) {
+                        $rows[] = [btn('🤖 پرداخت در ربات درگاه', null, $alternate, 'primary')];
+                    }
+                    $rows[] = [btn('« بازگشت', 'inv:gw:' . $order['id'], null, 'danger')];
+                    $pendingNotice = pay_created_notice($order, $paymentRow);
+                    /* NowPayments/Plisio keep their useful invoice guidance, but its
+                       wording is strictly pending until provider verification. */
+                    if ((PAY_GATEWAYS[$gw]['type'] ?? '') === 'crypto') {
+                        $meta = pay_meta($paymentRow);
+                        $pendingNotice .= "\n\n" . crypto_invoice_text($order,
+                            (string) ($result['text'] ?? $gw),
+                            (string) ($paymentRow['authority'] ?? ''),
+                            (float) ($meta['fiat_amount'] ?? 0));
+                    }
+                    Tg::show($chatId, $messageId, $pendingNotice, $rows);
                     return;
                 }
             }
@@ -605,13 +605,17 @@ function handle_callback_inner(array $cb): void
                 screen_panel_detail($chatId, $messageId, $panelId);
                 return;
             }
+            $hourlyUnlimited = panel_is_hourly_unlimited($panel);
             State::set($uid, 'unlimited_add_users', ['panel_id' => $panelId]);
             Tg::show($chatId, $messageId,
                 '➕ <b>شارژ / افزودن کاربر</b>' . "\n\n"
                 . 'تعداد کاربری را که می‌خواهید اضافه شود فقط به‌صورت عدد بفرستید.' . "\n"
                 . 'حداقل: <b>' . fa_digits(panel_unlimited_min_users($panel)) . "</b> کاربر\n"
-                . 'قیمت هر کاربر: <b>' . money(panel_unlimited_user_price($panel)) . "</b>\n\n"
-                . 'برای لغو: <code>لغو</code>',
+                . ($hourlyUnlimited
+                    ? ('نرخ هر کاربر / ساعت: <b>' . money(panel_unlimited_user_price($panel))
+                        . "</b>\n<i>فاکتور، فقط ساعت اول کاربران تازه را پوشش می‌دهد.</i>")
+                    : ('قیمت هر کاربر: <b>' . money(panel_unlimited_user_price($panel)) . '</b>'))
+                . "\n\n" . 'برای لغو: <code>لغو</code>',
                 [[btn('« بازگشت', 'pn:' . $panelId, null, 'danger')]]);
             return;
         }
@@ -1171,19 +1175,21 @@ function handle_callback_inner(array $cb): void
                 screen_pay_gateway($chatId, $messageId, $gw);
                 return;
             }
+            if ($op === 'sandbox' && $gw === 'tetrapay') {
+                set_put('pay_tetrapay_sandbox', tetrapay_sandbox() ? '0' : '1');
+                screen_pay_gateway($chatId, $messageId, $gw);
+                return;
+            }
             if ($op === 'test') {
                 $test = gw_live_test($gw);
-                $text = '🧪 <b>تست زندهٔ ' . e(PAY_GATEWAYS[$gw]['label']) . "</b>\n\n"
+                $text = '🛡 <b>بررسی امن پیکربندی ' . e(PAY_GATEWAYS[$gw]['label']) . "</b>\n\n"
                     . 'آدرس: <code>' . e((string) ($test['endpoint'] ?? '—')) . "</code>\n"
-                    . 'مبلغ تست: ' . money((int) ($test['amount'] ?? 0)) . "\n"
                     . 'نتیجه: ' . ($test['ok'] ? '🟢 ' : '🔴 ') . e((string) $test['title']) . "\n\n"
-                    . '<b>پاسخ درگاه:</b>' . "\n<code>"
-                    . e(mb_substr((string) $test['body'], 0, 400)) . '</code>';
-                if (!empty($test['url'])) {
-                    $text .= "\n\nلینک پرداخت تست:" . "\n" . e((string) $test['url']);
-                }
+                    . '<b>جزئیات:</b>' . "\n<code>"
+                    . e(mb_substr((string) $test['body'], 0, 400)) . '</code>'
+                    . "\n\n<i>این بررسی هیچ فاکتور یا پرداخت واقعی ایجاد نمی‌کند.</i>";
                 Tg::show($chatId, null, $text,
-                    [[btn('🔄 دوباره تست', 'ad:pay:' . $gw . ':test', null, 'success')],
+                    [[btn('🔄 بررسی دوباره', 'ad:pay:' . $gw . ':test', null, 'success')],
                      [btn('« ' . PAY_GATEWAYS[$gw]['label'], 'ad:pay:' . $gw, null, 'danger')]]);
                 return;
             }
@@ -1205,9 +1211,12 @@ function handle_callback_inner(array $cb): void
                         gw_endpoint_default($gw)),
                     default => (string) gw_cashback($gw),
                 };
+                $shownCurrent = in_array($op, ['key', 'key2'], true)
+                    ? ($current !== '' ? '✅ ثبت شده (نمایش داده نمی‌شود)' : '—')
+                    : ($current !== '' ? $current : '—');
                 wiz_start($uid, 'gwfield', [
                     step_def('value', $labels[$op] . "
-مقدار فعلی: " . ($current !== '' ? $current : '—'),
+مقدار فعلی: " . $shownCurrent,
                         in_array($op, ['key', 'key2', 'endpoint'], true) ? 'text' : 'int', null,
                         '💳 ' . PAY_GATEWAYS[$gw]['label']),
                 ], ['gw' => $gw, 'field' => $op]);
@@ -1631,8 +1640,12 @@ function handle_callback_inner(array $cb): void
                         step_def('role_id', 'نقش این محصول روی همین پنل را انتخاب کنید '
                             . "(فقط نقش‌های همان پنل):\n<i>اگر نقشی نمی‌بینی، «🔄 خواندن نقش‌های این پنل» را بزنید.</i>",
                             'pick', 0, '🎭 انتخاب نقش', 'roles'),
-                        step_def('per_user_price', 'قیمت هر کاربر (تومان) را بفرستید.', 'int', 0,
-                            '💵 قیمت هر کاربر'),
+                        step_def('per_user_price', 'نرخ ساعتی هر کاربر (تومان) را بفرستید.', 'int', 0,
+                            '💵 نرخ ساعتی هر کاربر'),
+                        step_def('hourly_price', 'اجارهٔ ثابت خودِ پنل در هر ساعت (تومان) را بفرستید — 0 مجاز است.',
+                            'int', 0, '🏷 اجارهٔ ثابت ساعتی پنل'),
+                        step_def('device_limit', 'تعداد دستگاه برای نمایش محصول را بفرستید — محدودیت نهایی را Role پاسارگارد اعمال می‌کند.',
+                            'int', 0, '📱 دستگاه هر کاربر'),
                         step_def('min_users', 'حداقل تعداد کاربر در هر خرید یا شارژ را بفرستید.',
                             'int', 1, '👥 حداقل تعداد کاربر'),
                     ], ['cat_id' => $catId, 'role_page' => 1]);
@@ -1725,6 +1738,33 @@ function handle_callback_inner(array $cb): void
                 screen_roles($chatId, $messageId, $newPanel, $productId);
                 return;
             }
+            if ($op === 'hourlymode') {
+                $product = product_get($productId);
+                if ($product === null || !product_is_unlimited($product)) {
+                    Tg::answer($cbId, 'این محصول نامحدود نیست.', true);
+                    return;
+                }
+                if (product_is_hourly_unlimited($product)) {
+                    Tg::answer($cbId, 'مدل ساعتی این محصول از قبل فعال است.', false);
+                    screen_product_admin($chatId, $messageId, $productId);
+                    return;
+                }
+                if (($parts[4] ?? '') !== 'yes') {
+                    Tg::show($chatId, $messageId,
+                        '⏱ <b>فعال‌سازی مدل ساعتی برای فروش‌های تازه</b>' . "\n\n"
+                        . 'از این لحظه، فاکتور ساعت اول را شامل می‌شود و ادامهٔ سرویس از کیف پول کسر ساعتی دارد.' . "\n"
+                        . '<b>پنل‌ها و سفارش‌های قبلی تغییر نمی‌کنند.</b>' . "\n\n"
+                        . 'نرخ هر کاربر و اجارهٔ ثابت را سپس از صفحهٔ محصول تنظیم کنید.',
+                        [[btn('✅ فعال‌سازی فقط برای فروش جدید', 'ad:prod:' . $productId . ':hourlymode:yes', null, 'success')],
+                         [btn('« انصراف', 'ad:prod:' . $productId, null, 'danger')]]);
+                    return;
+                }
+                DB::exec('UPDATE products SET unlimited_billing_mode=? WHERE id=?',
+                    [UNLIMITED_BILLING_HOURLY, $productId]);
+                Tg::answer($cbId, 'مدل ساعتی برای فروش‌های جدید فعال شد.', false);
+                screen_product_admin($chatId, $messageId, $productId);
+                return;
+            }
             if ($op === 'toggle') {
                 DB::exec('UPDATE products SET active = 1 - active WHERE id=?', [$productId]);
             }
@@ -1761,7 +1801,7 @@ function handle_callback_inner(array $cb): void
                 return;
             }
             if (product_is_unlimited($product)
-                && !in_array($field, ['name', 'emoji', 'peruser', 'minusers'], true)) {
+                && !in_array($field, ['name', 'emoji', 'peruser', 'hourly', 'minusers', 'devices'], true)) {
                 Tg::answer($cbId, 'این تنظیم برای پنل نامحدود با نقش پاسارگارد مدیریت می‌شود.', true);
                 screen_product_admin($chatId, $messageId, $productId);
                 return;

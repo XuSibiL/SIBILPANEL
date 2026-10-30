@@ -237,6 +237,129 @@ function panel_charge_once(array $panel, int $usedBytes, bool $hourlyEnabled,
     return $out;
 }
 
+/**
+ * Meter the immutable components of an hourly unlimited panel.
+ *
+ * A component is either the fixed panel rent or one purchased user-cap block.
+ * Its paid_until clock means capacity added later cannot be billed backwards.
+ * The full decision and wallet debit live under one SQLite write lock, so two
+ * cron invocations cannot charge the same hour twice.
+ */
+function unlimited_hourly_charge_once(array $panel, ?int $at = null): array
+{
+    $out = ['charged' => 0, 'hours' => 0, 'insufficient' => false,
+            'suspended' => false, 'resumed' => false, 'skipped' => false];
+    if (!panel_is_hourly_unlimited($panel)) {
+        return $out;
+    }
+    $at = $at ?? now_ts();
+    $panelId = (int) $panel['id'];
+    $decision = db_tx(static function () use ($panelId, $at): array {
+        $fresh = DB::one('SELECT * FROM panels WHERE id=?', [$panelId]);
+        if ($fresh === null || !panel_is_hourly_unlimited($fresh)) {
+            return ['skip' => true, 'charged' => 0, 'hours' => 0, 'insufficient' => false,
+                    'tg' => 0, 'username' => '', 'balance' => 0, 'status' => '', 'reason' => ''];
+        }
+        $units = DB::all('SELECT * FROM unlimited_billing_units WHERE panel_id=? AND active=1 '
+            . 'AND paid_until<=? AND (units * hourly_price)>0 ORDER BY paid_until, id',
+            [$panelId, $at]);
+        if ($units === []) {
+            return ['skip' => false, 'charged' => 0, 'hours' => 0, 'insufficient' => false,
+                    'tg' => (int) $fresh['tg_id'], 'username' => (string) $fresh['panel_username'],
+                    'balance' => balance_of((int) $fresh['tg_id']), 'status' => (string) $fresh['status'],
+                    'reason' => (string) ($fresh['suspended_reason'] ?? '')];
+        }
+        $tgId = (int) $fresh['tg_id'];
+        $balance = balance_of($tgId);
+        $startingBalance = $balance;
+        $charged = 0;
+        $hours = 0;
+        $insufficient = false;
+        foreach ($units as $unit) {
+            $paidUntil = (int) $unit['paid_until'];
+            $unitCount = max(0, (int) $unit['units']);
+            $price = max(0, (int) $unit['hourly_price']);
+            if ($paidUntil > $at || $unitCount === 0 || $price === 0
+                || $unitCount > intdiv(PHP_INT_MAX, $price)) {
+                continue;
+            }
+            $rate = $unitCount * $price;
+            $periods = intdiv($at - $paidUntil, 3600) + 1;
+            /* Each period needs a whole rate; partial hours are never silently
+               booked, so an unpaid clock remains due for the next run. */
+            $canPay = min($periods, intdiv(max(0, $balance), $rate));
+            if ($canPay > 0) {
+                $amount = $canPay * $rate;
+                DB::exec('UPDATE unlimited_billing_units SET paid_until=? WHERE id=? AND paid_until=?',
+                    [$paidUntil + $canPay * 3600, (int) $unit['id'], $paidUntil]);
+                $charged += $amount;
+                $balance -= $amount;
+                $hours += $canPay;
+            }
+            if ($canPay < $periods) {
+                $insufficient = true;
+            }
+        }
+        if ($charged > 0) {
+            $changed = DB::update('UPDATE users SET balance=balance-? WHERE tg_id=? AND balance>=?',
+                [$charged, $tgId, $charged]);
+            if ($changed !== 1) {
+                throw new RuntimeException('hourly unlimited balance changed during locked debit');
+            }
+            $newBalance = $startingBalance - $charged;
+            DB::exec('INSERT INTO wallet_tx(tg_id, amount, kind, ref, note, balance, created_at) '
+                . 'VALUES(?,?,?,?,?,?,?)', [$tgId, -$charged, 'unlimited-hourly', (string) $panelId,
+                'صورتحساب ساعتی پنل نامحدود', $newBalance, now_ts()]);
+            DB::exec('INSERT INTO usage_charges(panel_id, tg_id, bytes, hours, amount, kind, created_at) '
+                . 'VALUES(?,?,?,?,?,?,?)', [$panelId, $tgId, 0, $hours, $charged,
+                'unlimited-hourly', now_ts()]);
+            DB::exec('UPDATE panels SET spent_total=spent_total+?, last_meter_at=? WHERE id=?',
+                [$charged, $at, $panelId]);
+        }
+        return ['skip' => false, 'charged' => $charged, 'hours' => $hours,
+                'insufficient' => $insufficient, 'tg' => $tgId,
+                'username' => (string) $fresh['panel_username'], 'balance' => $balance,
+                'status' => (string) $fresh['status'],
+                'reason' => (string) ($fresh['suspended_reason'] ?? '')];
+    });
+    if (($decision['skip'] ?? false) === true) {
+        $out['skipped'] = true;
+        return $out;
+    }
+    $out['charged'] = (int) $decision['charged'];
+    $out['hours'] = (int) $decision['hours'];
+    $out['insufficient'] = (bool) $decision['insufficient'];
+    if ($out['charged'] > 0) {
+        post_report('♾️ <b>صورتحساب ساعتی پنل نامحدود</b>' . "\n"
+            . '👤 کاربر <code>' . (int) $decision['tg'] . "</code>\n"
+            . '📦 پنل <code>' . e((string) $decision['username']) . "</code>\n"
+            . '⏱ دورهٔ ثبت‌شده: ' . fa_digits($out['hours']) . " ساعت\n"
+            . '💵 کسر شد: ' . money($out['charged']) . "\n"
+            . '👛 موجودی: ' . money((int) $decision['balance']), 'usage');
+    }
+    $fresh = DB::one('SELECT * FROM panels WHERE id=?', [$panelId]);
+    if ($fresh === null) {
+        return $out;
+    }
+    if ($out['insufficient']) {
+        if ((string) $fresh['status'] === 'active'
+            && suspend_panel($fresh, 'کمبود موجودی برای صورتحساب ساعتی پنل نامحدود')) {
+            DB::exec('UPDATE panels SET suspended_reason=? WHERE id=?', ['hourly_balance', $panelId]);
+            $out['suspended'] = true;
+        }
+        return $out;
+    }
+    /* Only a suspension caused by this billing model is auto-resumed. */
+    if ((string) $fresh['status'] === 'suspended'
+        && (string) ($fresh['suspended_reason'] ?? '') === 'hourly_balance') {
+        DB::exec('UPDATE panels SET suspended_reason=NULL WHERE id=?', [$panelId]);
+        if (resume_panel($fresh)) {
+            $out['resumed'] = true;
+        }
+    }
+    return $out;
+}
+
 function panels_meter(bool $verbose = false): array
 {
     $grace = set_int('meter_grace', 0);
@@ -249,6 +372,19 @@ function panels_meter(bool $verbose = false): array
     /* پنل‌های معلق: صورتحساب متوقف است و فقط شرط بازگشت بررسی می‌شود */
     foreach (DB::all("SELECT * FROM panels WHERE status='suspended'") as $held) {
         if (panel_is_unlimited($held)) {
+            if (panel_is_hourly_unlimited($held)) {
+                if ($hourlyEnabled && (string) ($held['suspended_reason'] ?? '') === 'hourly_balance') {
+                    $hourly = unlimited_hourly_charge_once($held);
+                    if ($hourly['charged'] > 0) {
+                        $stats['charges']++;
+                        $stats['charged'] += $hourly['charged'];
+                    }
+                    if ($hourly['resumed']) {
+                        $stats['resumed']++;
+                    }
+                }
+                continue;
+            }
             /* اگر نسخهٔ قبلی ربات به‌علت موجودی این پنل را بسته باشد، واگذار کردن
                اختیار به Role مستلزم برداشتن همان محدودیت محلی است. */
             if (($held['suspended_reason'] ?? '') === 'balance') {
@@ -275,7 +411,22 @@ function panels_meter(bool $verbose = false): array
     $rows = DB::all("SELECT * FROM panels WHERE status='active'");
     foreach ($rows as $panel) {
         if (panel_is_unlimited($panel)) {
-            /* هیچ خواندن مصرف، پایان اعتبار، حجم یا صورتحساب محلی برای این نوع نیست. */
+            if (panel_is_hourly_unlimited($panel) && $hourlyEnabled) {
+                $hourly = unlimited_hourly_charge_once($panel);
+                if ($hourly['charged'] > 0) {
+                    $stats['charges']++;
+                    $stats['charged'] += $hourly['charged'];
+                }
+                if ($hourly['suspended']) {
+                    $stats['suspended']++;
+                }
+                if ($verbose && ($hourly['charged'] > 0 || $hourly['insufficient'])) {
+                    echo '· unlimited ' . $panel['panel_username'] . ' — hours=' . $hourly['hours']
+                        . ' charge=' . money($hourly['charged'])
+                        . ($hourly['insufficient'] ? ' (insufficient)' : '') . "\n";
+                }
+            }
+            /* No usage/traffic/expiry meter for either unlimited model. */
             continue;
         }
         $panelRow = $panel['pg_panel_id']
@@ -414,13 +565,17 @@ function panels_balance_enforce(bool $verbose = false): array
             continue; // پنل تست رایگان است و به موجودی کاری ندارد
         }
         if (panel_is_unlimited($panel)) {
+            if (panel_is_hourly_unlimited($panel)) {
+                /* Its own component meter decides when this service may resume. */
+                continue;
+            }
             if ($panel['status'] === 'suspended' && ($panel['suspended_reason'] ?? '') === 'balance') {
                 DB::exec('UPDATE panels SET suspended_reason=NULL WHERE id=?', [(int) $panel['id']]);
                 if (resume_panel($panel)) {
                     $out['resumed']++;
                 }
             }
-            continue; // اعتبار، دستگاه و موجودی پنل نامحدود فقط با Role است
+            continue; // legacy unlimited: اعتبار/دستگاه فقط با Role است
         }
         $balance = balance_of((int) $panel['tg_id']);
         /* پول ۲۴ ساعت اول در فاکتور اولیه تسویه شده است؛ تا عبور صریح زمان

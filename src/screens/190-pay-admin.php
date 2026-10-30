@@ -171,8 +171,9 @@ function screen_pay_gateway(int|string $chat, ?int $messageId, string $gw): void
             : ($state['on'] ? '🟢 روشن' : '🔴 خاموش')) . "\n";
     if ($gw !== 'wallet' && $gw !== 'card' && $gw !== 'stars') {
         $text .= 'کلید: <code>' . e($mask($key)) . "</code>\n";
-        if (in_array($gw, ['iranpay4', 'iranpay2', 'variza', 'trx', 'nowpayment'], true)) {
-            $labels2 = ['iranpay4' => 'آدرس درگاه', 'nowpayment' => 'IPN secret'];
+        if (in_array($gw, ['iranpay4', 'iranpay2', 'variza', 'trx', 'nowpayment', 'tetrapay'], true)) {
+            $labels2 = ['iranpay4' => 'آدرس درگاه', 'nowpayment' => 'IPN secret',
+                        'tetrapay' => 'کلید وب‌هوک (اختیاری)'];
             $text .= ($labels2[$gw] ?? 'کلید دوم') . ': ' . e($mask($key2)) . "\n";
         }
         if (gw_is_fiat($gw)) {
@@ -187,8 +188,14 @@ function screen_pay_gateway(int|string $chat, ?int $messageId, string $gw): void
         $text .= 'محدوده: ' . money(gw_min($gw)) . ' تا ' . money(gw_max($gw)) . "\n"
             . 'کش‌بک: ' . (string) gw_cashback($gw) . "٪\n"
             . '🌐 آدرس سرویس: <code>'
-            . e(gw_endpoint($gw, gw_endpoint_default($gw)) !== ''
-                ? gw_endpoint($gw, gw_endpoint_default($gw)) : 'ثبت نشده') . "</code>\n";
+            . e($gw === 'tetrapay' ? tetrapay_base_url() :
+                (gw_endpoint($gw, gw_endpoint_default($gw)) !== ''
+                    ? gw_endpoint($gw, gw_endpoint_default($gw)) : 'ثبت نشده')) . "</code>\n";
+        if ($gw === 'tetrapay') {
+            $text .= 'محیط: ' . (tetrapay_sandbox() ? '🟡 سندباکس (بدون پول واقعی)' : '🟢 تولید') . "\n"
+                . 'کال‌بک: <code>' . e(tetrapay_callback_url() ?: 'دامنهٔ HTTPS تنظیم نشده') . "</code>\n"
+                . 'وب‌هوک: <code>' . e(tetrapay_webhook_url() ?: 'اختیاری / تنظیم نشده') . "</code>\n";
+        }
     }
     if ($gw === 'card') {
         /* فقط تنظیم‌های لازم؛ بدون کلید خام */
@@ -214,16 +221,21 @@ function screen_pay_gateway(int|string $chat, ?int $messageId, string $gw): void
     }
     if ($gw !== 'wallet' && $gw !== 'card' && $gw !== 'stars') {
         $rows[] = [btn('🔑 کلید', 'ad:pay:' . $gw . ':key')];
-        if (in_array($gw, ['iranpay4', 'iranpay2', 'variza', 'trx', 'nowpayment'], true)) {
+        if (in_array($gw, ['iranpay4', 'iranpay2', 'variza', 'trx', 'nowpayment', 'tetrapay'], true)) {
             $rows[] = [btn($gw === 'iranpay4' ? '🌐 آدرس درگاه'
-                : ($gw === 'nowpayment' ? '🔐 IPN secret' : '🔐 کلید دوم'),
+                : ($gw === 'nowpayment' ? '🔐 IPN secret'
+                : ($gw === 'tetrapay' ? '🔐 کلید وب‌هوک (اختیاری)' : '🔐 کلید دوم')),
                 'ad:pay:' . $gw . ':key2')];
+        }
+        if ($gw === 'tetrapay') {
+            $rows[] = [btn(tetrapay_sandbox() ? '🟡 خروج از سندباکس' : '🧪 فعال‌سازی سندباکس',
+                'ad:pay:tetrapay:sandbox', null, tetrapay_sandbox() ? 'danger' : 'primary')];
         }
         if (gw_is_fiat($gw)) {
             $rows[] = [btn('📉 حداقل دلاری درگاه', 'ad:pay:' . $gw . ':minfiat')];
         }
         $rows[] = [btn('🌐 آدرس سرویس', 'ad:pay:' . $gw . ':endpoint')];
-        $rows[] = [btn('🧪 تست زندهٔ درگاه', 'ad:pay:' . $gw . ':test', null, 'success')];
+        $rows[] = [btn('🛡 بررسی امن پیکربندی', 'ad:pay:' . $gw . ':test', null, 'success')];
         $rows[] = [btn('⬇️ حداقل', 'ad:pay:' . $gw . ':min'),
                    btn('⬆️ حداکثر', 'ad:pay:' . $gw . ':max')];
         $rows[] = [btn('🎁 کش‌بک ٪', 'ad:pay:' . $gw . ':cashback')];
@@ -253,6 +265,7 @@ function screen_pay_web(int|string $chat, ?int $messageId): void
         . "<code>https://panel.example.com</code>\n\n"
         . 'کال‌بک هر درگاه می‌شود: <code>آدرس/pay/نام‌درگاه</code>' . "\n"
         . 'وبهوک واریزا: <code>آدرس/pay/variza/webhook</code>' . "\n"
+        . 'وب‌هوک تتراپی: <code>آدرس/pay/tetrapay/webhook</code>' . "\n"
         . 'IPN نواپی‌منت: <code>آدرس/pay/nowpayment</code>';
     Tg::show($chat, $messageId, $text, [
         [btn('✏️ تغییر آدرس', 'ad:set:web_url', null, 'success')],

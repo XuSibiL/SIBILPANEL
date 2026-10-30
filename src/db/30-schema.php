@@ -161,7 +161,9 @@ CREATE TABLE IF NOT EXISTS products (
     panel_id       INTEGER,
     sale_type      TEXT    NOT NULL DEFAULT 'metered',
     per_user_price INTEGER NOT NULL DEFAULT 0,
-    min_users      INTEGER NOT NULL DEFAULT 1
+    min_users      INTEGER NOT NULL DEFAULT 1,
+    /* legacy records retain their up-front model; new hourly products opt in explicitly. */
+    unlimited_billing_mode TEXT NOT NULL DEFAULT 'legacy'
 );
 
 CREATE TABLE IF NOT EXISTS panels (
@@ -191,6 +193,8 @@ CREATE TABLE IF NOT EXISTS panels (
     is_unlimited    INTEGER NOT NULL DEFAULT 0,
     unlimited_user_price INTEGER NOT NULL DEFAULT 0,
     unlimited_min_users  INTEGER NOT NULL DEFAULT 1,
+    /* immutable sale snapshot: legacy stays unbilled, hourly is metered by unit rows. */
+    unlimited_billing_mode TEXT NOT NULL DEFAULT 'legacy',
     hourly_paused   INTEGER NOT NULL DEFAULT 0,
     violation_until INTEGER,
     violation_count INTEGER NOT NULL DEFAULT 0,
@@ -308,6 +312,24 @@ CREATE TABLE IF NOT EXISTS usage_charges (
     kind       TEXT    NOT NULL DEFAULT 'usage',
     created_at INTEGER NOT NULL
 );
+
+/* Each hourly-unlimited component gets its own paid-through clock.  A later
+   capacity increase begins billing from its own purchase time, never retroactively. */
+CREATE TABLE IF NOT EXISTS unlimited_billing_units (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    panel_id        INTEGER NOT NULL,
+    source_order_id INTEGER,
+    component       TEXT NOT NULL DEFAULT 'users',
+    units           INTEGER NOT NULL DEFAULT 0,
+    hourly_price    INTEGER NOT NULL DEFAULT 0,
+    paid_until      INTEGER NOT NULL DEFAULT 0,
+    active          INTEGER NOT NULL DEFAULT 1,
+    created_at      INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS unlimited_billing_source_component_uq
+    ON unlimited_billing_units(panel_id, source_order_id, component);
+CREATE INDEX IF NOT EXISTS unlimited_billing_due_idx
+    ON unlimited_billing_units(panel_id, active, paid_until);
 
 CREATE TABLE IF NOT EXISTS discounts (
     code       TEXT PRIMARY KEY,
@@ -430,7 +452,8 @@ function db_bootstrap(): void
                         'extra_block_price' => 'INTEGER DEFAULT 0',
                         'sale_type' => "TEXT NOT NULL DEFAULT 'metered'",
                         'per_user_price' => 'INTEGER NOT NULL DEFAULT 0',
-                        'min_users' => 'INTEGER NOT NULL DEFAULT 1'],
+                        'min_users' => 'INTEGER NOT NULL DEFAULT 1',
+                        'unlimited_billing_mode' => "TEXT NOT NULL DEFAULT 'legacy'"],
         'pg_panels' => ['category_id' => 'INTEGER', 'api_key' => 'TEXT'],
         'discounts' => ['per_user' => 'INTEGER DEFAULT 1', 'first_only' => 'INTEGER DEFAULT 0',
                         'days' => 'INTEGER DEFAULT 30', 'hours' => 'INTEGER DEFAULT 0',
@@ -451,6 +474,7 @@ function db_bootstrap(): void
                         'is_unlimited' => 'INTEGER DEFAULT 0',
                         'unlimited_user_price' => 'INTEGER NOT NULL DEFAULT 0',
                         'unlimited_min_users' => 'INTEGER NOT NULL DEFAULT 1',
+                        'unlimited_billing_mode' => "TEXT NOT NULL DEFAULT 'legacy'",
                         'hourly_paused' => 'INTEGER DEFAULT 0',
                         'violation_until' => 'INTEGER', 'violation_count' => 'INTEGER DEFAULT 0',
                         'last_devices' => 'INTEGER DEFAULT 0',
@@ -481,6 +505,25 @@ function db_bootstrap(): void
             }
         }
     }
+    /* Compatibility snapshot migration for the hourly-unlimited model.
+       Existing catalog entries and all sold panels remain legacy, independently
+       of any later product edit.  Only explicitly created/converted products
+       can enter the new hourly route. */
+    try {
+        $hourlyMigration = (string) DB::val("SELECT value FROM settings WHERE key='migration_unlimited_hourly_v1'", [], '');
+        if ($hourlyMigration !== 'done') {
+            DB::exec("UPDATE products SET unlimited_billing_mode='legacy' "
+                . "WHERE COALESCE(unlimited_billing_mode, '') NOT IN ('legacy','hourly')");
+            DB::exec("UPDATE panels SET unlimited_billing_mode='legacy' "
+                . "WHERE COALESCE(unlimited_billing_mode, '') NOT IN ('legacy','hourly')");
+            DB::exec("INSERT INTO settings(key,value) VALUES('migration_unlimited_hourly_v1','done') "
+                . "ON CONFLICT(key) DO UPDATE SET value='done'");
+            log_line('info', 'migration: hourly-unlimited compatibility snapshots preserved');
+        }
+    } catch (Throwable $ex) {
+        log_line('warning', 'migration hourly-unlimited failed: ' . $ex->getMessage());
+    }
+
     /* مهاجرت: جدول قدیمی device_cuts (قطع کل کانفیگ) → temp_restricted_users
        (محدودسازی فقط همان کاربر). ردیف‌های زنده حفظ می‌شوند. */
     try {

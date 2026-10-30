@@ -21,7 +21,7 @@
 
 declare(strict_types=1);
 
-const PANEL_VERSION = '3.18.1';
+const PANEL_VERSION = '3.18.2';
 const IRAN_OFFSET   = 3.5 * 3600;
 const DAY           = 86400;
 
@@ -693,7 +693,9 @@ CREATE TABLE IF NOT EXISTS products (
     panel_id       INTEGER,
     sale_type      TEXT    NOT NULL DEFAULT 'metered',
     per_user_price INTEGER NOT NULL DEFAULT 0,
-    min_users      INTEGER NOT NULL DEFAULT 1
+    min_users      INTEGER NOT NULL DEFAULT 1,
+    /* legacy records retain their up-front model; new hourly products opt in explicitly. */
+    unlimited_billing_mode TEXT NOT NULL DEFAULT 'legacy'
 );
 
 CREATE TABLE IF NOT EXISTS panels (
@@ -723,6 +725,8 @@ CREATE TABLE IF NOT EXISTS panels (
     is_unlimited    INTEGER NOT NULL DEFAULT 0,
     unlimited_user_price INTEGER NOT NULL DEFAULT 0,
     unlimited_min_users  INTEGER NOT NULL DEFAULT 1,
+    /* immutable sale snapshot: legacy stays unbilled, hourly is metered by unit rows. */
+    unlimited_billing_mode TEXT NOT NULL DEFAULT 'legacy',
     hourly_paused   INTEGER NOT NULL DEFAULT 0,
     violation_until INTEGER,
     violation_count INTEGER NOT NULL DEFAULT 0,
@@ -840,6 +844,24 @@ CREATE TABLE IF NOT EXISTS usage_charges (
     kind       TEXT    NOT NULL DEFAULT 'usage',
     created_at INTEGER NOT NULL
 );
+
+/* Each hourly-unlimited component gets its own paid-through clock.  A later
+   capacity increase begins billing from its own purchase time, never retroactively. */
+CREATE TABLE IF NOT EXISTS unlimited_billing_units (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    panel_id        INTEGER NOT NULL,
+    source_order_id INTEGER,
+    component       TEXT NOT NULL DEFAULT 'users',
+    units           INTEGER NOT NULL DEFAULT 0,
+    hourly_price    INTEGER NOT NULL DEFAULT 0,
+    paid_until      INTEGER NOT NULL DEFAULT 0,
+    active          INTEGER NOT NULL DEFAULT 1,
+    created_at      INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS unlimited_billing_source_component_uq
+    ON unlimited_billing_units(panel_id, source_order_id, component);
+CREATE INDEX IF NOT EXISTS unlimited_billing_due_idx
+    ON unlimited_billing_units(panel_id, active, paid_until);
 
 CREATE TABLE IF NOT EXISTS discounts (
     code       TEXT PRIMARY KEY,
@@ -962,7 +984,8 @@ function db_bootstrap(): void
                         'extra_block_price' => 'INTEGER DEFAULT 0',
                         'sale_type' => "TEXT NOT NULL DEFAULT 'metered'",
                         'per_user_price' => 'INTEGER NOT NULL DEFAULT 0',
-                        'min_users' => 'INTEGER NOT NULL DEFAULT 1'],
+                        'min_users' => 'INTEGER NOT NULL DEFAULT 1',
+                        'unlimited_billing_mode' => "TEXT NOT NULL DEFAULT 'legacy'"],
         'pg_panels' => ['category_id' => 'INTEGER', 'api_key' => 'TEXT'],
         'discounts' => ['per_user' => 'INTEGER DEFAULT 1', 'first_only' => 'INTEGER DEFAULT 0',
                         'days' => 'INTEGER DEFAULT 30', 'hours' => 'INTEGER DEFAULT 0',
@@ -983,6 +1006,7 @@ function db_bootstrap(): void
                         'is_unlimited' => 'INTEGER DEFAULT 0',
                         'unlimited_user_price' => 'INTEGER NOT NULL DEFAULT 0',
                         'unlimited_min_users' => 'INTEGER NOT NULL DEFAULT 1',
+                        'unlimited_billing_mode' => "TEXT NOT NULL DEFAULT 'legacy'",
                         'hourly_paused' => 'INTEGER DEFAULT 0',
                         'violation_until' => 'INTEGER', 'violation_count' => 'INTEGER DEFAULT 0',
                         'last_devices' => 'INTEGER DEFAULT 0',
@@ -1013,6 +1037,25 @@ function db_bootstrap(): void
             }
         }
     }
+    /* Compatibility snapshot migration for the hourly-unlimited model.
+       Existing catalog entries and all sold panels remain legacy, independently
+       of any later product edit.  Only explicitly created/converted products
+       can enter the new hourly route. */
+    try {
+        $hourlyMigration = (string) DB::val("SELECT value FROM settings WHERE key='migration_unlimited_hourly_v1'", [], '');
+        if ($hourlyMigration !== 'done') {
+            DB::exec("UPDATE products SET unlimited_billing_mode='legacy' "
+                . "WHERE COALESCE(unlimited_billing_mode, '') NOT IN ('legacy','hourly')");
+            DB::exec("UPDATE panels SET unlimited_billing_mode='legacy' "
+                . "WHERE COALESCE(unlimited_billing_mode, '') NOT IN ('legacy','hourly')");
+            DB::exec("INSERT INTO settings(key,value) VALUES('migration_unlimited_hourly_v1','done') "
+                . "ON CONFLICT(key) DO UPDATE SET value='done'");
+            log_line('info', 'migration: hourly-unlimited compatibility snapshots preserved');
+        }
+    } catch (Throwable $ex) {
+        log_line('warning', 'migration hourly-unlimited failed: ' . $ex->getMessage());
+    }
+
     /* مهاجرت: جدول قدیمی device_cuts (قطع کل کانفیگ) → temp_restricted_users
        (محدودسازی فقط همان کاربر). ردیف‌های زنده حفظ می‌شوند. */
     try {
@@ -2782,6 +2825,10 @@ function product_get(int $id): ?array
 const PRODUCT_SALE_METERED = 'metered';
 const PRODUCT_SALE_UNLIMITED_USERS = 'unlimited_users';
 const UNLIMITED_USERS_MAX = 1000000;
+/* `legacy` is deliberately the migration default.  A sold plan must never be
+   re-priced merely because its catalog product later changes. */
+const UNLIMITED_BILLING_LEGACY = 'legacy';
+const UNLIMITED_BILLING_HOURLY = 'hourly';
 const UNLIMITED_ROLE_GUIDE = 'ℹ️ راهنما: تعداد روز (مدت اعتبار) و محدودیت تعداد دستگاه در پنل‌های نامحدود، مستقیماً از روی تنظیمات نقش (Role) در پنل پاسارگاد اعمال می‌شود. ربات فقط وظیفه ساخت تعداد یوزر/کلاینت درخواستی را بر عهده دارد.';
 
 /** نوع فروش فقط روی محصول تازه اثر دارد؛ پنل فروخته‌شده snapshot خودش را دارد. */
@@ -2794,6 +2841,19 @@ function product_sale_type(array $product): string
 function product_is_unlimited(array $product): bool
 {
     return product_sale_type($product) === PRODUCT_SALE_UNLIMITED_USERS;
+}
+
+/** Billing is a product choice at purchase time, then copied to the sold panel. */
+function unlimited_billing_mode(array $row): string
+{
+    return (string) ($row['unlimited_billing_mode'] ?? '') === UNLIMITED_BILLING_HOURLY
+        ? UNLIMITED_BILLING_HOURLY : UNLIMITED_BILLING_LEGACY;
+}
+
+function product_is_hourly_unlimited(array $product): bool
+{
+    return product_is_unlimited($product)
+        && unlimited_billing_mode($product) === UNLIMITED_BILLING_HOURLY;
 }
 
 /**
@@ -2812,6 +2872,12 @@ function panel_is_unlimited(array $panel): bool
     return (int) ($panel['is_unlimited'] ?? 0) === 1;
 }
 
+function panel_is_hourly_unlimited(array $panel): bool
+{
+    return panel_is_unlimited($panel)
+        && unlimited_billing_mode($panel) === UNLIMITED_BILLING_HOURLY;
+}
+
 /** قیمت و حداقلِ پنل فروخته‌شده snapshot هستند، نه تنظیمات قابل‌تغییر محصول امروز. */
 function panel_unlimited_user_price(array $panel): int
 {
@@ -2821,6 +2887,17 @@ function panel_unlimited_user_price(array $panel): int
 function panel_unlimited_min_users(array $panel): int
 {
     return max(1, (int) ($panel['unlimited_min_users'] ?? 1));
+}
+
+/** Fixed hourly rent is stored in the normal hourly_price snapshot for new plans. */
+function panel_unlimited_fixed_hourly_price(array $panel): int
+{
+    return panel_is_hourly_unlimited($panel) ? max(0, (int) ($panel['hourly_price'] ?? 0)) : 0;
+}
+
+function unlimited_fixed_hourly_price(array $product): int
+{
+    return product_is_hourly_unlimited($product) ? max(0, (int) ($product['hourly_price'] ?? 0)) : 0;
 }
 
 function panel_unlimited_user_count_check(array $panel, int $count): array
@@ -2874,6 +2951,45 @@ function unlimited_user_count_check(array $product, int $count): array
 function unlimited_user_order_total(array $product, int $count): int
 {
     return $count * unlimited_user_price($product);
+}
+
+/** First hour is paid with the purchase; later hours are wallet-metered. */
+function unlimited_initial_hourly_total(array $product, int $count): int
+{
+    $users = unlimited_user_order_total($product, $count);
+    $fixed = unlimited_fixed_hourly_price($product);
+    return $users > PHP_INT_MAX - $fixed ? PHP_INT_MAX : $users + $fixed;
+}
+
+function panel_unlimited_users_hourly_total(array $panel, int $count): int
+{
+    $unit = panel_unlimited_user_price($panel);
+    if ($count < 0 || ($unit > 0 && $count > intdiv(PHP_INT_MAX, $unit))) {
+        return PHP_INT_MAX;
+    }
+    return $count * $unit;
+}
+
+/**
+ * Immutable hourly components: a new user block starts at its own paid-through
+ * time, avoiding a charge for hours before that block existed.
+ */
+function unlimited_billing_unit_add(int $panelId, ?int $sourceOrderId, string $component,
+                                    int $units, int $hourlyPrice, int $paidUntil): void
+{
+    if ($panelId <= 0 || $units < 0 || $hourlyPrice < 0 || $paidUntil <= 0) {
+        throw new InvalidArgumentException('invalid unlimited hourly billing component');
+    }
+    DB::exec('INSERT OR IGNORE INTO unlimited_billing_units(panel_id, source_order_id, component, '
+        . 'units, hourly_price, paid_until, active, created_at) VALUES(?,?,?,?,?,?,1,?)',
+        [$panelId, $sourceOrderId, mb_substr($component, 0, 20), $units, $hourlyPrice,
+         $paidUntil, now_ts()]);
+}
+
+function unlimited_billing_next_due(int $panelId): int
+{
+    return (int) DB::val('SELECT MIN(paid_until) FROM unlimited_billing_units '
+        . 'WHERE panel_id=? AND active=1 AND (units * hourly_price) > 0', [$panelId], 0);
 }
 
 function product_update(int $id, string $column, mixed $value): void
@@ -4061,15 +4177,34 @@ function screen_buy_category(int|string $chat, ?int $messageId, int $categoryId)
 function product_detail_text(array $product): string
 {
     if (product_is_unlimited($product)) {
-        return $product['emoji'] . ' <b>' . e((string) $product['name']) . "</b>\n\n"
-            . '♾️ <b>پنل نامحدود</b>' . "\n"
-            . '💵 قیمت هر کاربر: <b>' . money(unlimited_user_price($product)) . "</b>\n"
+        $hourly = product_is_hourly_unlimited($product);
+        $rateText = $hourly
+            ? ('💵 نرخ هر کاربر / ساعت: <b>' . money(unlimited_user_price($product)) . "</b>\n"
+                . '🏷 اجارهٔ ثابت پنل / ساعت: <b>' . money(unlimited_fixed_hourly_price($product)) . "</b>\n")
+            : ('💵 قیمت هر کاربر: <b>' . money(unlimited_user_price($product)) . "</b>
+");
+        $flowText = $hourly
+            ? ('ساعت اول با فاکتور خرید پرداخت می‌شود: اجارهٔ ثابت + (تعداد کاربر × نرخ هر کاربر). '
+                . 'از ساعت بعد، همین مبلغ به‌صورت ساعتی از کیف پول کم می‌شود.')
+            : 'تعداد کاربر دلخواهتان را وارد می‌کنید و مبلغ فاکتور برابر است با تعداد کاربر × قیمت هر کاربر.';
+        return $product['emoji'] . ' <b>' . e((string) $product['name']) . "</b>
+
+"
+            . '♾️ <b>پنل نامحدود' . ($hourly ? ' با صورتحساب ساعتی' : '') . '</b>' . "
+"
+            . $rateText
             . '👥 حداقل تعداد کاربر در هر سفارش: <b>'
-                . fa_digits(unlimited_min_users($product)) . "</b>\n"
-            . '🧩 اسلات لازم: ' . fa_digits((int) $product['slots_needed']) . "\n\n"
-            . 'تعداد کاربر دلخواهتان را وارد می‌کنید و مبلغ فاکتور برابر است با تعداد کاربر × قیمت هر کاربر.'
-            . "\n\n"
-            . '<i>مدت اعتبار و محدودیت دستگاه‌ها مستقیماً از تنظیمات نقش در پنل پاسارگارد اعمال می‌شود.</i>';
+                . fa_digits(unlimited_min_users($product)) . "</b>
+"
+            . '📱 دستگاهِ محصول: ' . fa_digits((int) ($product['device_limit'] ?? 0)) . "
+"
+            . '🧩 اسلات لازم: ' . fa_digits((int) $product['slots_needed']) . "
+
+"
+            . $flowText . "
+
+"
+            . '<i>مدت اعتبار و محدودیت واقعی دستگاه‌ها مستقیماً از تنظیمات نقش در پنل پاسارگارد اعمال می‌شود.</i>';
     }
     $cap = (float) $product['data_cap_gb'] > 0
         ? fa_digits((float) $product['data_cap_gb']) . ' گیگ' : 'نامحدود';
@@ -4328,13 +4463,18 @@ function screen_unlimited_initial_users(int|string $chat, ?int $messageId, int $
             [[btn('« بازگشت', 'menu:buy', null, 'danger')]]);
         return;
     }
+    $hourly = product_is_hourly_unlimited($product);
     State::set($uid, 'unlimited_initial_users', ['product' => $productId]);
     Tg::show($chat, $messageId,
         '👥 <b>تعداد کاربر دلخواه</b>' . "\n\n"
         . 'تعداد کاربر موردنیاز را فقط به‌صورت عدد بفرستید.' . "\n"
         . 'حداقل مجاز: <b>' . fa_digits(unlimited_min_users($product)) . '</b> کاربر' . "\n"
-        . 'قیمت هر کاربر: <b>' . money(unlimited_user_price($product)) . '</b>' . "\n\n"
-        . '<i>مثال: ' . fa_digits(unlimited_min_users($product)) . '</i>' . "\n"
+        . ($hourly
+            ? ('💵 نرخ هر کاربر / ساعت: <b>' . money(unlimited_user_price($product)) . "</b>\n"
+                . '🏷 اجارهٔ ثابت پنل / ساعت: <b>' . money(unlimited_fixed_hourly_price($product)) . "</b>\n"
+                . '<i>فاکتور، ساعت اول را پوشش می‌دهد؛ سپس کسر ساعتی از کیف پول انجام می‌شود.</i>')
+            : ('قیمت هر کاربر: <b>' . money(unlimited_user_price($product)) . '</b>'))
+        . "\n\n" . '<i>مثال: ' . fa_digits(unlimited_min_users($product)) . '</i>' . "\n"
         . 'برای لغو: <code>لغو</code>',
         [[btn('« بازگشت', 'buy:p:' . $productId, null, 'danger')]]);
 }
@@ -4375,23 +4515,35 @@ function start_panel_order(int $uid, int|string $chat, ?int $messageId, int $pro
                  [btn('« بازگشت', 'buy:p:' . $productId, null, 'danger')]]);
             return;
         }
-        $price = unlimited_user_order_total($product, $unlimitedUsers);
+        $hourly = product_is_hourly_unlimited($product);
+        $usersRate = unlimited_user_order_total($product, $unlimitedUsers);
+        $fixedRate = unlimited_fixed_hourly_price($product);
+        $price = $hourly ? unlimited_initial_hourly_total($product, $unlimitedUsers) : $usersRate;
         $payload = [
             'product' => $productId,
             'panel_username' => $username,
             'sale_type' => PRODUCT_SALE_UNLIMITED_USERS,
             'unlimited_users' => true,
+            'unlimited_billing_mode' => $hourly ? UNLIMITED_BILLING_HOURLY : UNLIMITED_BILLING_LEGACY,
             'user_count' => $unlimitedUsers,
             'per_user_price' => unlimited_user_price($product),
+            'panel_hourly_price' => $fixedRate,
             'min_users' => unlimited_min_users($product),
         ];
         $order = create_order($uid, 'panel', $price, $productId, $payload);
+        $breakdown = '♾️ ' . e((string) $product['name']) . "\n"
+            . '👥 تعداد کاربر: <b>' . fa_digits($unlimitedUsers) . "</b>\n";
+        if ($hourly) {
+            $breakdown .= '💵 ساعت اول: ' . fa_digits($unlimitedUsers) . ' × '
+                . money(unlimited_user_price($product)) . ' + اجارهٔ ثابت ' . money($fixedRate)
+                . ' = <b>' . money($price) . "</b>\n"
+                . '<i>از ساعت بعد، همین نرخ از کیف پول کم می‌شود.</i>' . "\n";
+        } else {
+            $breakdown .= '💵 ' . fa_digits($unlimitedUsers) . ' × '
+                . money(unlimited_user_price($product)) . ' = <b>' . money($price) . "</b>\n";
+        }
         Tg::show($chat, $messageId,
-            invoice_text($order, 'خرید پنل نامحدود',
-                '♾️ ' . e((string) $product['name']) . "\n"
-                . '👥 تعداد کاربر: <b>' . fa_digits($unlimitedUsers) . "</b>\n"
-                . '💵 ' . fa_digits($unlimitedUsers) . ' × '
-                    . money(unlimited_user_price($product)) . ' = <b>' . money($price) . "</b>\n"
+            invoice_text($order, 'خرید پنل نامحدود', $breakdown
                 . '👤 نام کاربری پنل: <code>' . e($username) . '</code>'),
             invoice_kb($order, $uid));
         return;
@@ -4639,8 +4791,8 @@ function crypto_invoice_text(array $order, string $label, string $invoiceNo, flo
         . '🧾 شماره فاکتور : <code>' . e($invoiceNo) . '</code>' . "\n"
         . '💰 مبلغ فاکتور : <b>' . money((int) $order['payable']) . '</b>' . "\n"
         . '📊 قیمت دلار: در این لحظه ' . money(usd_toman_rate()) . "\n\n"
-        . '> ⚠️ پس از پرداخت، در صورتی که مبلغ تراکنش به‌درستی واریز شده باشد، '
-        . 'کیف پول شما حداکثر تا ۱۵ دقیقه آینده به‌صورت خودکار شارژ خواهد شد.' . "\n\n"
+        . '> ⚠️ پس از پرداخت، درگاه باید تراکنش را به‌صورت قطعی تأیید کند؛ '
+        . 'تا پیش از Verify/Webhook معتبر، کیف پول شارژ نمی‌شود.' . "\n\n"
         . 'جهت پرداخت از دکمه زیر استفاده کنید 👇🏻';
     if ($paidUsd > 0) {
         $lines .= "\n\n" . 'مبلغ دقیق این فاکتور: <b>'
@@ -5271,14 +5423,30 @@ function screen_panel_detail(int|string $chat, ?int $messageId, int $panelId): v
     }
     $text .= "\n" . 'وضعیت: ' . $status . "\n";
     if ($isUnlimited) {
-        $text .= '♾️ نوع پنل: <b>نامحدود</b>' . "\n"
+        $hourlyUnlimited = panel_is_hourly_unlimited($panel);
+        $text .= '♾️ نوع پنل: <b>نامحدود' . ($hourlyUnlimited ? ' با صورتحساب ساعتی' : '') . '</b>' . "\n"
             . '⏳ اعتبار: طبق تنظیمات نقش در پاسارگارد' . "\n"
             . '📱 محدودیت دستگاه: طبق تنظیمات نقش در پاسارگارد' . "\n"
             . '👥 کاربر: ' . fa_digits((int) $panel['last_users']) . ' از '
-                . fa_digits($cap) . "\n"
-            . '💵 قیمت هر کاربر برای شارژ: ' . money(panel_unlimited_user_price($panel)) . "\n"
-            . '🔻 حداقل شارژ: ' . fa_digits(panel_unlimited_min_users($panel)) . " کاربر\n"
-            . '<i>ربات کنترل دستگاه، حجم و اعتبار این پنل را اعمال نمی‌کند.</i>' . "\n";
+                . fa_digits($cap) . "\n";
+        if ($hourlyUnlimited) {
+            $nextDue = unlimited_billing_next_due((int) $panel['id']);
+            $fixedHourly = panel_unlimited_fixed_hourly_price($panel);
+            $usersHourly = panel_unlimited_users_hourly_total($panel, $cap);
+            $hourlyTotal = $usersHourly > PHP_INT_MAX - $fixedHourly
+                ? PHP_INT_MAX : $usersHourly + $fixedHourly;
+            $text .= '💵 نرخ هر کاربر / ساعت: ' . money(panel_unlimited_user_price($panel)) . "\n"
+                . '🏷 اجارهٔ ثابت / ساعت: ' . money(panel_unlimited_fixed_hourly_price($panel)) . "\n"
+                . '⏱ نرخ فعلی با سقف ' . fa_digits($cap) . ' کاربر: <b>' . money($hourlyTotal)
+                    . '</b> / ساعت' . "\n"
+                . ($nextDue > 0 ? '🕒 کسر بعدی: ' . fa_ts($nextDue) . "\n" : '')
+                . '🔻 حداقل شارژ: ' . fa_digits(panel_unlimited_min_users($panel)) . " کاربر\n"
+                . '<i>ساعت اول هر بخش هنگام خرید آن پرداخت می‌شود؛ پس از آن کسر ساعتی از کیف پول است.</i>' . "\n";
+        } else {
+            $text .= '💵 قیمت هر کاربر برای شارژ: ' . money(panel_unlimited_user_price($panel)) . "\n"
+                . '🔻 حداقل شارژ: ' . fa_digits(panel_unlimited_min_users($panel)) . " کاربر\n";
+        }
+        $text .= '<i>ربات کنترل دستگاه، حجم و اعتبار این پنل را اعمال نمی‌کند.</i>' . "\n";
     } else {
         $text .= 'اعتبار تا: ' . fa_ts((int) ($panel['expires_at'] ?? 0)) . "\n"
             . '👥 کاربر: ' . fa_digits((int) $panel['last_users']) . ' از ' . fa_digits($cap) . "\n"
@@ -6218,8 +6386,14 @@ function screen_category(int|string $chat, ?int $messageId, int $catId): void
         $text .= ((int) $product['active'] === 1 ? '✅' : '⛔️') . ' ' . $product['emoji'] . ' <b>'
             . e($product['name']) . "</b>\n";
         if (product_is_unlimited($product)) {
-            $text .= '   ♾️ نامحدود · 💵 هر کاربر ' . money(unlimited_user_price($product))
-                . ' · 👥 حداقل ' . fa_digits(unlimited_min_users($product)) . "\n\n";
+            if (product_is_hourly_unlimited($product)) {
+                $text .= '   ♾️ ساعتی · 👤 ' . money(unlimited_user_price($product)) . '/ساعت'
+                    . ' · 🏷 ' . money(unlimited_fixed_hourly_price($product)) . '/ساعت'
+                    . ' · 👥 حداقل ' . fa_digits(unlimited_min_users($product)) . "\n\n";
+            } else {
+                $text .= '   ♾️ قدیمی · 💵 هر کاربر ' . money(unlimited_user_price($product))
+                    . ' · 👥 حداقل ' . fa_digits(unlimited_min_users($product)) . "\n\n";
+            }
         } else {
             $cap = (float) $product['data_cap_gb'] > 0
                 ? fa_digits((float) $product['data_cap_gb']) . 'GB' : 'نامحدود';
@@ -6260,20 +6434,32 @@ function screen_product_admin(int|string $chat, ?int $messageId, int $productId)
         . '🗂 دسته: ' . cat_label($cat) . ' · 🔌 پنل: '
         . e($panel['name'] ?? 'پیش‌فرض') . "\n\n";
     if (product_is_unlimited($product)) {
+        $hourlyUnlimited = product_is_hourly_unlimited($product);
         $text = $base
-            . '♾️ <b>نوع فروش: پنل نامحدود بر پایهٔ تعداد کاربر</b>' . "\n"
-            . '💵 قیمت هر کاربر: <b>' . money(unlimited_user_price($product)) . "</b>\n"
+            . '♾️ <b>نوع فروش: پنل نامحدود بر پایهٔ تعداد کاربر'
+                . ($hourlyUnlimited ? ' با صورتحساب ساعتی' : ' (روش قدیمی)') . '</b>' . "\n"
+            . ($hourlyUnlimited
+                ? ('💵 نرخ هر کاربر / ساعت: <b>' . money(unlimited_user_price($product)) . "</b>\n"
+                    . '🏷 اجارهٔ ثابت پنل / ساعت: <b>' . money(unlimited_fixed_hourly_price($product)) . "</b>\n"
+                    . '<i>ساعت اول با خرید پرداخت می‌شود؛ ادامهٔ سرویس ساعتی از کیف پول کسر می‌شود.</i>' . "\n")
+                : ('💵 قیمت هر کاربر: <b>' . money(unlimited_user_price($product)) . "</b>\n"
+                    . '<i>این محصول/فروش‌های قبلی با مدل پیش‌پرداخت حفظ شده‌اند.</i>' . "\n"))
             . '👥 حداقل تعداد کاربر در هر خرید/شارژ: <b>'
                 . fa_digits(unlimited_min_users($product)) . "</b>\n"
+            . '📱 دستگاهِ نمایش محصول: ' . fa_digits((int) ($product['device_limit'] ?? 0)) . "\n"
             . '🎭 نقش پنل: '
             . role_title((int) $product['panel_id'], (int) $product['role_id']) . "\n\n"
             . UNLIMITED_ROLE_GUIDE;
         $rows = [
-            [btn('💵 قیمت هر کاربر', "ad:pf:$productId:peruser"),
-             btn('👥 حداقل تعداد کاربر', "ad:pf:$productId:minusers")],
+            [btn($hourlyUnlimited ? '💵 نرخ ساعتی هر کاربر' : '💵 قیمت هر کاربر', "ad:pf:$productId:peruser"),
+             btn('🏷 اجارهٔ ثابت ساعتی', "ad:pf:$productId:hourly")],
+            [btn('👥 حداقل تعداد کاربر', "ad:pf:$productId:minusers"),
+             btn('📱 دستگاه', "ad:pf:$productId:devices")],
             [btn('✏️ نام', "ad:pf:$productId:name"), btn('🎨 ایموجی', "ad:pf:$productId:emoji")],
             [btn('🔌 پنل مقصد', "ad:prod:$productId:sp"),
              btn('🎭 نقش پنل', 'ad:rolep:' . $productId)],
+            ...($hourlyUnlimited ? [] : [[btn('⏱ فعال‌سازی مدل ساعتی (فقط فروش جدید)',
+                "ad:prod:$productId:hourlymode", null, 'success')]]),
             [btn((int) $product['active'] === 1 ? '🔴 خاموش کنید' : '🟢 روشن کنید',
                 "ad:prod:$productId:toggle", null, (int) $product['active'] === 1 ? 'danger' : 'success')],
             [btn('🗑 حذف محصول', "ad:prod:$productId:del", null, 'danger')],
@@ -6320,9 +6506,9 @@ function screen_product_admin(int|string $chat, ?int $messageId, int $productId)
 const PRODUCT_FIELDS = [
     'name'      => ['نام محصول', 'text', 'name'],
     'emoji'     => ['ایموجی', 'text', 'emoji'],
-    'hourly'    => ['اجارهٔ ساعتی پنل (تومان) — 0 = بدون اجاره', 'int', 'hourly_price'],
+    'hourly'    => ['اجارهٔ ثابت ساعتی پنل (تومان) — 0 = بدون اجارهٔ ثابت', 'int', 'hourly_price'],
     'pergb'     => ['قیمت هر گیگ مصرف (تومان)', 'int', 'per_gb_price'],
-    'peruser'   => ['قیمت هر کاربر پنل نامحدود (تومان)', 'int', 'per_user_price'],
+    'peruser'   => ['نرخ هر کاربر پنل نامحدود (تومان؛ برای مدل جدید در هر ساعت)', 'int', 'per_user_price'],
     'minusers'  => ['حداقل تعداد کاربر پنل نامحدود', 'int', 'min_users'],
     'minbal'    => ['حداقل موجودی کیف پول (تومان)', 'int', 'min_balance'],
     'users'     => ['سقف کاربر پنل', 'int', 'max_users'],
@@ -12814,12 +13000,28 @@ function deliver_panel_order(array $order): array
     $unlimitedUsers = (int) ($payloadOrder['user_count'] ?? 0);
     $unlimitedUnit = (int) ($payloadOrder['per_user_price'] ?? 0);
     $unlimitedMin = max(1, (int) ($payloadOrder['min_users'] ?? 1));
+    /* The order payload is the immutable economics snapshot.  Old orders have
+       no mode, so they remain the legacy up-front product by design. */
+    $unlimitedHourly = $isUnlimited
+        && (string) ($payloadOrder['unlimited_billing_mode'] ?? '') === UNLIMITED_BILLING_HOURLY;
+    $unlimitedFixedHourly = $unlimitedHourly
+        ? max(0, (int) ($payloadOrder['panel_hourly_price'] ?? 0)) : 0;
+    $unlimitedUsersTotal = 0;
+    if ($isUnlimited && $unlimitedUnit > 0 && $unlimitedUsers <= intdiv(PHP_INT_MAX, $unlimitedUnit)) {
+        $unlimitedUsersTotal = $unlimitedUsers * $unlimitedUnit;
+    }
+    $unlimitedExpected = $unlimitedUsersTotal;
+    if ($unlimitedHourly && $unlimitedExpected <= PHP_INT_MAX - $unlimitedFixedHourly) {
+        $unlimitedExpected += $unlimitedFixedHourly;
+    } elseif ($unlimitedHourly) {
+        $unlimitedExpected = -1;
+    }
     /* قیمت و تعداد در payload سفارش snapshot هستند تا تغییر محصول پس از پرداخت
-       به مبلغ/سقف فروخته‌شده اثر نگذارد. */
+       به مبلغ/سقف فروخته‌شده اثر نگذارد. ساعت اول در فاکتور است، نه کسر کیف پول. */
     if ($isUnlimited && ($unlimitedUsers < $unlimitedMin || $unlimitedUsers > UNLIMITED_USERS_MAX
         || $unlimitedUnit <= 0 || $unlimitedUsers > intdiv(PHP_INT_MAX, $unlimitedUnit)
-        || $unlimitedUsers * $unlimitedUnit !== (int) $order['price'])) {
-        return [false, 'اطلاعات تعداد کاربر این سفارش نامعتبر است؛ با پشتیبانی تماس بگیرید.'];
+        || $unlimitedExpected !== (int) $order['price'])) {
+        return [false, 'اطلاعات تعداد کاربر یا نرخ ساعتی این سفارش نامعتبر است؛ با پشتیبانی تماس بگیرید.'];
     }
 
     $panelRow = null;
@@ -12906,28 +13108,45 @@ function deliver_panel_order(array $order): array
         return [false, 'ساخت پنل روی سرور انجام نشد: ' . $note];
     }
 
-    /* پنل نامحدود نه پیش‌پرداخت دارد و نه هیچ شارژ مصرفی محلی. */
+    /* Legacy unlimited panels stay completely outside local billing.  The new
+       model records first-hour paid-through clocks per component. */
+    $now = now_ts();
     $prepaidHours = ($isTrial || $isUnlimited) ? 0 : prepaid_hours();
-    $billingStartAt = $prepaidHours > 0 ? now_ts() + $prepaidHours * 3600 : 0;
+    $billingStartAt = $unlimitedHourly ? $now + 3600
+        : ($prepaidHours > 0 ? $now + $prepaidHours * 3600 : 0);
     $prepaidAmount = ($isTrial || $isUnlimited) ? 0
         : max(0, (int) ($payloadOrder['prepaid'] ?? panel_prepaid_amount($product)));
     $labelSuffix = $isTrial ? ' (تست)' : ($isUnlimited ? ' (نامحدود)' : '');
     $panelId = DB::exec('INSERT INTO panels(tg_id, product_id, panel_admin_id, panel_username, '
         . 'panel_password, label, max_users, device_limit, data_cap, expires_at, per_gb_price, '
         . 'hourly_price, min_balance, status, created_at, pg_panel_id, order_id, user_cap, is_trial, '
-        . 'is_unlimited, unlimited_user_price, unlimited_min_users, billing_start_at, prepaid_amount, last_meter_at) '
-        . 'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+        . 'is_unlimited, unlimited_user_price, unlimited_min_users, unlimited_billing_mode, '
+        . 'billing_start_at, prepaid_amount, last_meter_at) '
+        . 'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
         [$order['tg_id'], $product['id'], (int) ($created['id'] ?? 0), $username, $password,
          $product['name'] . $labelSuffix, $userCap,
-         $isUnlimited ? 0 : (int) $product['device_limit'],
+         $isUnlimited ? max(0, (int) ($product['device_limit'] ?? 0)) : (int) $product['device_limit'],
          (int) round($dataCapGb * 1024 ** 3), $expireAt,
          ($isTrial || $isUnlimited) ? 0 : (int) $product['per_gb_price'],
-         ($isTrial || $isUnlimited) ? 0 : (int) $product['hourly_price'],
+         $unlimitedHourly ? $unlimitedFixedHourly : (($isTrial || $isUnlimited) ? 0 : (int) $product['hourly_price']),
          $isUnlimited ? 0 : (int) $product['min_balance'], 'active',
-         now_ts(), (int) $panelRow['id'], (int) $order['id'], $userCap, $isTrial ? 1 : 0,
+         $now, (int) $panelRow['id'], (int) $order['id'], $userCap, $isTrial ? 1 : 0,
          $isUnlimited ? 1 : 0, $isUnlimited ? $unlimitedUnit : 0,
-         $isUnlimited ? $unlimitedMin : 1, $billingStartAt, $prepaidAmount,
-         $billingStartAt > 0 ? $billingStartAt : now_ts()]);
+         $isUnlimited ? $unlimitedMin : 1,
+         $unlimitedHourly ? UNLIMITED_BILLING_HOURLY : UNLIMITED_BILLING_LEGACY,
+         $billingStartAt, $prepaidAmount, $billingStartAt > 0 ? $billingStartAt : $now]);
+    if ($unlimitedHourly) {
+        /* The base and user-cap lines are separate so an added cap never incurs
+           a charge for hours before it was purchased.  INSERT OR IGNORE makes
+           an accidental re-delivery of the same order harmless. */
+        db_tx(static function () use ($panelId, $order, $unlimitedFixedHourly, $unlimitedUsers,
+                                      $unlimitedUnit, $billingStartAt): void {
+            unlimited_billing_unit_add($panelId, (int) $order['id'], 'base', 1,
+                $unlimitedFixedHourly, $billingStartAt);
+            unlimited_billing_unit_add($panelId, (int) $order['id'], 'users', $unlimitedUsers,
+                $unlimitedUnit, $billingStartAt);
+        });
+    }
     if (!$isTrial && !$isUnlimited) {
         try {
             grant_order_discount($order, $panelId);
@@ -12949,7 +13168,11 @@ function deliver_panel_order(array $order): array
         $kindTitle = $isTrial ? '🧪 <b>پنل تست ساخته شد</b>'
             : ($isUnlimited ? '♾️ <b>پنل نامحدود فروخته شد</b>' : '🛒 <b>پنل فروخته شد</b>');
         $spec = $isUnlimited
-            ? '👥 سقف کاربر: ' . fa_digits($userCap) . ' · 💵 هر کاربر: ' . money($unlimitedUnit)
+            ? ('👥 سقف کاربر: ' . fa_digits($userCap)
+                . ($unlimitedHourly
+                    ? (' · 💵 هر کاربر/ساعت: ' . money($unlimitedUnit)
+                        . ' · 🏷 ثابت/ساعت: ' . money($unlimitedFixedHourly))
+                    : (' · 💵 هر کاربر: ' . money($unlimitedUnit))))
             : ('📊 حجم: ' . fa_digits($dataCapGb) . ' گیگ'
                 . ($isTrial ? ' · ⏳ ' . fa_digits((int) (($expireAt - time()) / 3600)) . ' ساعت'
                     : ' · ⏳ ' . fa_digits((int) $product['days']) . ' روز'));
@@ -12977,11 +13200,17 @@ function deliver_panel_order(array $order): array
             . 'همین حالا در «📦 پنل‌های من» هم می‌بینی‌اش. برای پنل اصلی «🛒 خرید پنل» را بزنید.'];
     }
     if ($isUnlimited) {
+        $hourlyNote = $unlimitedHourly
+            ? ('💵 ساعت اول پرداخت شده است. از ' . fa_ts($billingStartAt)
+                . '، هر ساعت <b>' . money($unlimitedUsersTotal + $unlimitedFixedHourly)
+                . '</b> از کیف پول کسر می‌شود.\n')
+            : '';
         return [true, "✅ <b>پنل نامحدود شما آماده است</b>\n\n" . $nameNote
             . '🌐 آدرس پنل: ' . e($dashboard) . "\n"
             . '👤 نام کاربری: <code>' . e($username) . "</code>\n"
             . '🔑 رمز: <code>' . e($password) . "</code>\n"
             . '👥 سقف کاربر: <b>' . fa_digits($userCap) . "</b>\n"
+            . $hourlyNote
             . '♾️ اعتبار و محدودیت دستگاه‌ها طبق نقش پاسارگارد اعمال می‌شود.' . "\n\n"
             . 'برای افزودن کاربر از «📦 پنل‌های من» استفاده کنید.'];
     }
@@ -13056,11 +13285,17 @@ function settle_payment(array $order, string $source = 'wallet', int $adminId = 
             order_mark((int) $order['id'], 'failed');
             return [false, 'این پنل پیدا نشد.'];
         }
+        $hourlyUnlimitedRecharge = false;
         if ($isUnlimitedRecharge) {
             $block = (int) ($payload['user_count'] ?? 0);
             $unit = (int) ($payload['per_user_price'] ?? 0);
             $min = max(1, (int) ($payload['min_users'] ?? 1));
-            if (!panel_is_unlimited($panel) || $block < $min || $block > UNLIMITED_USERS_MAX
+            $payloadHourly = (string) ($payload['unlimited_billing_mode'] ?? '') === UNLIMITED_BILLING_HOURLY;
+            $hourlyUnlimitedRecharge = panel_is_hourly_unlimited($panel);
+            /* Added capacity pays only its own first hour.  It must never be
+               charged for historical hours of an existing panel. */
+            if (!panel_is_unlimited($panel) || $payloadHourly !== $hourlyUnlimitedRecharge
+                || $block < $min || $block > UNLIMITED_USERS_MAX
                 || $unit <= 0 || $block > intdiv(PHP_INT_MAX, $unit)
                 || $block * $unit !== (int) $order['price']
                 || $unit !== panel_unlimited_user_price($panel)
@@ -13095,6 +13330,14 @@ function settle_payment(array $order, string $source = 'wallet', int $adminId = 
         }
         /* فقط پس از پاسخ موفق PasarGuard مقدار محلی تغییر می‌کند. */
         DB::exec('UPDATE panels SET user_cap=?, max_users=? WHERE id=?', [$cap, $cap, $panelId]);
+        $newUsersPaidUntil = 0;
+        if ($hourlyUnlimitedRecharge) {
+            $newUsersPaidUntil = now_ts() + 3600;
+            db_tx(static function () use ($panelId, $order, $block, $unit, $newUsersPaidUntil): void {
+                unlimited_billing_unit_add($panelId, (int) $order['id'], 'users', $block, $unit,
+                    $newUsersPaidUntil);
+            });
+        }
         order_mark((int) $order['id'], 'delivered');
         post_report(($isUnlimitedRecharge ? '♾️ <b>افزودن کاربر پنل نامحدود</b>'
                 : '➕ <b>افزایش سقف کاربر</b>') . "\n"
@@ -13102,9 +13345,14 @@ function settle_payment(array $order, string $source = 'wallet', int $adminId = 
             . '📦 پنل <code>' . e((string) $panel['panel_username']) . "</code>\n"
             . '➕ کاربر افزوده‌شده: ' . fa_digits($block) . "\n"
             . '👥 سقف جدید: ' . fa_digits($cap) . "\n"
-            . '💵 مبلغ: ' . money((int) $order['payable']), 'sales');
+            . '💵 مبلغ: ' . money((int) $order['payable'])
+            . ($hourlyUnlimitedRecharge ? "\n⏱ ساعت اول کاربران تازه تا " . fa_ts($newUsersPaidUntil)
+                . ' پرداخت شد.' : ''), 'sales');
         return [true, '✅ سقف کاربر پنل <code>' . e((string) $panel['panel_username'])
-            . '</code> شد <b>' . fa_digits($cap) . "</b> کاربر."];
+            . '</code> شد <b>' . fa_digits($cap) . "</b> کاربر."
+            . ($hourlyUnlimitedRecharge
+                ? "\n⏱ ساعت اولِ کاربران تازه پرداخت شده؛ کسر ساعتی از "
+                    . fa_ts($newUsersPaidUntil) . ' آغاز می‌شود.' : '')];
     }
     if ($kind === 'slot') {
         DB::exec('INSERT INTO slots(tg_id, count, expires_at, created_at) VALUES(?,?,?,?)',
@@ -13805,9 +14053,11 @@ function wiz_finish(int $uid, array $data): void
                 return;
             }
             $perUser = (int) ($values['per_user_price'] ?? 0);
+            $fixedHourly = max(0, (int) ($values['hourly_price'] ?? 0));
+            $deviceLimit = max(0, (int) ($values['device_limit'] ?? 0));
             $minUsers = (int) ($values['min_users'] ?? 0);
             if ($perUser <= 0 || $minUsers < 1 || $minUsers > UNLIMITED_USERS_MAX) {
-                Tg::send($uid, '❌ قیمت هر کاربر باید بیشتر از صفر و حداقل تعداد کاربر معتبر باشد.',
+                Tg::send($uid, '❌ نرخ ساعتی هر کاربر باید بیشتر از صفر و حداقل تعداد کاربر معتبر باشد.',
                     [[btn('➕ محصول نامحدود', 'ad:cat:' . $catId . ':new:unlimited', null, 'success')]]);
                 return;
             }
@@ -13818,20 +14068,26 @@ function wiz_finish(int $uid, array $data): void
                     break;
                 }
             }
+            /* مدل جدید فقط برای محصول تازه فعال می‌شود. محصولات/پنل‌های قدیمی
+               عمداً legacy می‌مانند تا اقتصاد فروخته‌شده‌شان تغییر نکند. */
             $productId = DB::exec('INSERT INTO products(name, emoji, category, category_id, '
                 . 'role_id, group_ids, max_users, device_limit, days, data_cap_gb, per_gb_price, '
                 . 'hourly_price, min_balance, renew_price, slots_needed, panel_prefix, trial, '
-                . 'active, created_at, panel_id, sale_type, per_user_price, min_users) '
-                . 'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                . 'active, created_at, panel_id, sale_type, per_user_price, min_users, unlimited_billing_mode) '
+                . 'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                 [trim((string) $values['name']), $values['emoji'] ?: '♾️', 'v2ray', $catId,
-                 $roleId, '[]', 0, 0, 0, 0, 0, 0, 0, 0, 1, '', 0, 1, now_ts(),
-                 (int) $panelRow['id'], PRODUCT_SALE_UNLIMITED_USERS, $perUser, $minUsers]);
-            $text = '✅ محصول نامحدود #' . $productId . " ساخته شد.\n\n"
+                 $roleId, '[]', 0, $deviceLimit, 0, 0, 0, $fixedHourly, 0, 0, 1, '', 0, 1,
+                 now_ts(), (int) $panelRow['id'], PRODUCT_SALE_UNLIMITED_USERS, $perUser,
+                 $minUsers, UNLIMITED_BILLING_HOURLY]);
+            $text = '✅ محصول نامحدود ساعتی #' . $productId . " ساخته شد.\n\n"
                 . ($values['emoji'] ?: '♾️') . ' <b>' . e((string) $values['name']) . "</b>\n"
                 . '🔌 پنل: ' . e((string) $panelRow['name']) . "\n"
                 . '🎭 نقش: ' . e($roleName !== '' ? $roleName : (string) $roleId) . "\n"
-                . '💵 قیمت هر کاربر: <b>' . money($perUser) . "</b>\n"
+                . '💵 نرخ هر کاربر / ساعت: <b>' . money($perUser) . "</b>\n"
+                . '🏷 اجارهٔ ثابت پنل / ساعت: <b>' . money($fixedHourly) . "</b>\n"
+                . '📱 دستگاهِ نمایش محصول: <b>' . fa_digits($deviceLimit) . "</b>\n"
                 . '👥 حداقل تعداد کاربر: <b>' . fa_digits($minUsers) . "</b>\n\n"
+                . 'ساعت اول با خرید پرداخت می‌شود؛ از ساعت بعد کسر خودکار از کیف پول آغاز می‌شود.\n'
                 . UNLIMITED_ROLE_GUIDE;
             Tg::send($uid, $text, [
                 [btn('👁 پیش‌نمایش محصول', 'ad:prod:' . $productId)],
@@ -13889,12 +14145,15 @@ function wiz_finish(int $uid, array $data): void
                 set_put('pay_' . $gw . '_min_cache', '0');
                 set_put('pay_' . $gw . '_min_at', '0');
             }
-            if (in_array($field, ['key', 'key2'], true) && (string) $value !== ''
+            /* فقط کلید اصلی می‌تواند درگاه را آماده کند؛ secret وب‌هوک به‌تنهایی کافی نیست. */
+            if ($field === 'key' && (string) $value !== ''
                 && set_get('pay_' . $gw . '_on') !== '1' && $gw !== 'card') {
                 set_put('pay_' . $gw . '_on', '1');
             }
-            Tg::send($uid, '✅ ذخیره شد: <b>'
-                . e((string) $value) . '</b>',
+            $saved = in_array($field, ['key', 'key2'], true)
+                ? 'کلید محرمانه ثبت شد و نمایش داده نمی‌شود.'
+                : e((string) $value);
+            Tg::send($uid, '✅ ذخیره شد: <b>' . $saved . '</b>',
                 [[btn('« درگاه', 'ad:pay:' . $gw, null, 'success')]]);
             return;
 
@@ -14858,32 +15117,32 @@ function handle_callback_inner(array $cb): void
                     return;
                 }
                 if (($result['url'] ?? '') !== '') {
-                    $gwType = PAY_GATEWAYS[$gw]['type'] ?? 'online';
                     $paymentRow = DB::one('SELECT * FROM payments WHERE order_id=? AND method=? '
                         . "AND status='unpaid' ORDER BY id DESC LIMIT 1", [(int) $order['id'], $gw]);
-                    $invoiceNo = (string) ($paymentRow['authority'] ?? '');
-                    pay_note_message((int) $order['id'], $gw, (int) $messageId);
-                    if ($gwType === 'crypto') {
-                        /* قالب پیام تأیید */
-                        $meta = $paymentRow ? pay_meta($paymentRow) : [];
-                        Tg::show($chatId, $messageId,
-                            crypto_invoice_header($order, (string) ($result['text'] ?: $gw))
-                            . "\n\n" . crypto_invoice_text($order, (string) $gw, $invoiceNo,
-                                (float) ($meta['fiat_amount'] ?? 0)),
-                            [[btn('💳 پرداخت', null, (string) $result['url'], 'success')],
-                             [btn('« بازگشت', 'inv:gw:' . $order['id'], null, 'danger')]]);
+                    if ($paymentRow === null) {
+                        Tg::answer($cbId, 'ثبت فاکتور درگاه کامل نشد', true);
+                        screen_gateways($chatId, $messageId, $order, 'فاکتور درگاه پیدا نشد؛ دوباره تلاش کنید.');
                         return;
                     }
                     pay_note_message((int) $order['id'], $gw, (int) $messageId);
-                    Tg::show($chatId, $messageId,
-                        '🌐 <b>پرداخت ' . e($result['text']) . "</b>\n\n"
-                        . 'مبلغ: <b>' . money((int) $order['payable']) . "</b>\n"
-                        . 'کد سفارش: <code>' . e((string) $order['ref']) . "</code>\n\n"
-                        . 'روی دکمهٔ زیر بزنید و پرداخت را کامل کنید. ' .
-                        'بعد از پرداخت خودکار به همین‌جا برمی‌گردی.',
-                        [[btn('💳 پرداخت ' . money((int) $order['payable']),
-                            null, $result['url'], 'success')],
-                         [btn('« بازگشت', 'inv:gw:' . $order['id'], null, 'danger')]]);
+                    $rows = [[btn('💳 پرداخت ' . money((int) $order['payable']),
+                        null, (string) $result['url'], 'success')]];
+                    $alternate = trim((string) ($result['alt_url'] ?? ''));
+                    if ($alternate !== '' && preg_match('~^https://~i', $alternate) === 1) {
+                        $rows[] = [btn('🤖 پرداخت در ربات درگاه', null, $alternate, 'primary')];
+                    }
+                    $rows[] = [btn('« بازگشت', 'inv:gw:' . $order['id'], null, 'danger')];
+                    $pendingNotice = pay_created_notice($order, $paymentRow);
+                    /* NowPayments/Plisio keep their useful invoice guidance, but its
+                       wording is strictly pending until provider verification. */
+                    if ((PAY_GATEWAYS[$gw]['type'] ?? '') === 'crypto') {
+                        $meta = pay_meta($paymentRow);
+                        $pendingNotice .= "\n\n" . crypto_invoice_text($order,
+                            (string) ($result['text'] ?? $gw),
+                            (string) ($paymentRow['authority'] ?? ''),
+                            (float) ($meta['fiat_amount'] ?? 0));
+                    }
+                    Tg::show($chatId, $messageId, $pendingNotice, $rows);
                     return;
                 }
             }
@@ -14935,13 +15194,17 @@ function handle_callback_inner(array $cb): void
                 screen_panel_detail($chatId, $messageId, $panelId);
                 return;
             }
+            $hourlyUnlimited = panel_is_hourly_unlimited($panel);
             State::set($uid, 'unlimited_add_users', ['panel_id' => $panelId]);
             Tg::show($chatId, $messageId,
                 '➕ <b>شارژ / افزودن کاربر</b>' . "\n\n"
                 . 'تعداد کاربری را که می‌خواهید اضافه شود فقط به‌صورت عدد بفرستید.' . "\n"
                 . 'حداقل: <b>' . fa_digits(panel_unlimited_min_users($panel)) . "</b> کاربر\n"
-                . 'قیمت هر کاربر: <b>' . money(panel_unlimited_user_price($panel)) . "</b>\n\n"
-                . 'برای لغو: <code>لغو</code>',
+                . ($hourlyUnlimited
+                    ? ('نرخ هر کاربر / ساعت: <b>' . money(panel_unlimited_user_price($panel))
+                        . "</b>\n<i>فاکتور، فقط ساعت اول کاربران تازه را پوشش می‌دهد.</i>")
+                    : ('قیمت هر کاربر: <b>' . money(panel_unlimited_user_price($panel)) . '</b>'))
+                . "\n\n" . 'برای لغو: <code>لغو</code>',
                 [[btn('« بازگشت', 'pn:' . $panelId, null, 'danger')]]);
             return;
         }
@@ -15501,19 +15764,21 @@ function handle_callback_inner(array $cb): void
                 screen_pay_gateway($chatId, $messageId, $gw);
                 return;
             }
+            if ($op === 'sandbox' && $gw === 'tetrapay') {
+                set_put('pay_tetrapay_sandbox', tetrapay_sandbox() ? '0' : '1');
+                screen_pay_gateway($chatId, $messageId, $gw);
+                return;
+            }
             if ($op === 'test') {
                 $test = gw_live_test($gw);
-                $text = '🧪 <b>تست زندهٔ ' . e(PAY_GATEWAYS[$gw]['label']) . "</b>\n\n"
+                $text = '🛡 <b>بررسی امن پیکربندی ' . e(PAY_GATEWAYS[$gw]['label']) . "</b>\n\n"
                     . 'آدرس: <code>' . e((string) ($test['endpoint'] ?? '—')) . "</code>\n"
-                    . 'مبلغ تست: ' . money((int) ($test['amount'] ?? 0)) . "\n"
                     . 'نتیجه: ' . ($test['ok'] ? '🟢 ' : '🔴 ') . e((string) $test['title']) . "\n\n"
-                    . '<b>پاسخ درگاه:</b>' . "\n<code>"
-                    . e(mb_substr((string) $test['body'], 0, 400)) . '</code>';
-                if (!empty($test['url'])) {
-                    $text .= "\n\nلینک پرداخت تست:" . "\n" . e((string) $test['url']);
-                }
+                    . '<b>جزئیات:</b>' . "\n<code>"
+                    . e(mb_substr((string) $test['body'], 0, 400)) . '</code>'
+                    . "\n\n<i>این بررسی هیچ فاکتور یا پرداخت واقعی ایجاد نمی‌کند.</i>";
                 Tg::show($chatId, null, $text,
-                    [[btn('🔄 دوباره تست', 'ad:pay:' . $gw . ':test', null, 'success')],
+                    [[btn('🔄 بررسی دوباره', 'ad:pay:' . $gw . ':test', null, 'success')],
                      [btn('« ' . PAY_GATEWAYS[$gw]['label'], 'ad:pay:' . $gw, null, 'danger')]]);
                 return;
             }
@@ -15535,9 +15800,12 @@ function handle_callback_inner(array $cb): void
                         gw_endpoint_default($gw)),
                     default => (string) gw_cashback($gw),
                 };
+                $shownCurrent = in_array($op, ['key', 'key2'], true)
+                    ? ($current !== '' ? '✅ ثبت شده (نمایش داده نمی‌شود)' : '—')
+                    : ($current !== '' ? $current : '—');
                 wiz_start($uid, 'gwfield', [
                     step_def('value', $labels[$op] . "
-مقدار فعلی: " . ($current !== '' ? $current : '—'),
+مقدار فعلی: " . $shownCurrent,
                         in_array($op, ['key', 'key2', 'endpoint'], true) ? 'text' : 'int', null,
                         '💳 ' . PAY_GATEWAYS[$gw]['label']),
                 ], ['gw' => $gw, 'field' => $op]);
@@ -15961,8 +16229,12 @@ function handle_callback_inner(array $cb): void
                         step_def('role_id', 'نقش این محصول روی همین پنل را انتخاب کنید '
                             . "(فقط نقش‌های همان پنل):\n<i>اگر نقشی نمی‌بینی، «🔄 خواندن نقش‌های این پنل» را بزنید.</i>",
                             'pick', 0, '🎭 انتخاب نقش', 'roles'),
-                        step_def('per_user_price', 'قیمت هر کاربر (تومان) را بفرستید.', 'int', 0,
-                            '💵 قیمت هر کاربر'),
+                        step_def('per_user_price', 'نرخ ساعتی هر کاربر (تومان) را بفرستید.', 'int', 0,
+                            '💵 نرخ ساعتی هر کاربر'),
+                        step_def('hourly_price', 'اجارهٔ ثابت خودِ پنل در هر ساعت (تومان) را بفرستید — 0 مجاز است.',
+                            'int', 0, '🏷 اجارهٔ ثابت ساعتی پنل'),
+                        step_def('device_limit', 'تعداد دستگاه برای نمایش محصول را بفرستید — محدودیت نهایی را Role پاسارگارد اعمال می‌کند.',
+                            'int', 0, '📱 دستگاه هر کاربر'),
                         step_def('min_users', 'حداقل تعداد کاربر در هر خرید یا شارژ را بفرستید.',
                             'int', 1, '👥 حداقل تعداد کاربر'),
                     ], ['cat_id' => $catId, 'role_page' => 1]);
@@ -16055,6 +16327,33 @@ function handle_callback_inner(array $cb): void
                 screen_roles($chatId, $messageId, $newPanel, $productId);
                 return;
             }
+            if ($op === 'hourlymode') {
+                $product = product_get($productId);
+                if ($product === null || !product_is_unlimited($product)) {
+                    Tg::answer($cbId, 'این محصول نامحدود نیست.', true);
+                    return;
+                }
+                if (product_is_hourly_unlimited($product)) {
+                    Tg::answer($cbId, 'مدل ساعتی این محصول از قبل فعال است.', false);
+                    screen_product_admin($chatId, $messageId, $productId);
+                    return;
+                }
+                if (($parts[4] ?? '') !== 'yes') {
+                    Tg::show($chatId, $messageId,
+                        '⏱ <b>فعال‌سازی مدل ساعتی برای فروش‌های تازه</b>' . "\n\n"
+                        . 'از این لحظه، فاکتور ساعت اول را شامل می‌شود و ادامهٔ سرویس از کیف پول کسر ساعتی دارد.' . "\n"
+                        . '<b>پنل‌ها و سفارش‌های قبلی تغییر نمی‌کنند.</b>' . "\n\n"
+                        . 'نرخ هر کاربر و اجارهٔ ثابت را سپس از صفحهٔ محصول تنظیم کنید.',
+                        [[btn('✅ فعال‌سازی فقط برای فروش جدید', 'ad:prod:' . $productId . ':hourlymode:yes', null, 'success')],
+                         [btn('« انصراف', 'ad:prod:' . $productId, null, 'danger')]]);
+                    return;
+                }
+                DB::exec('UPDATE products SET unlimited_billing_mode=? WHERE id=?',
+                    [UNLIMITED_BILLING_HOURLY, $productId]);
+                Tg::answer($cbId, 'مدل ساعتی برای فروش‌های جدید فعال شد.', false);
+                screen_product_admin($chatId, $messageId, $productId);
+                return;
+            }
             if ($op === 'toggle') {
                 DB::exec('UPDATE products SET active = 1 - active WHERE id=?', [$productId]);
             }
@@ -16091,7 +16390,7 @@ function handle_callback_inner(array $cb): void
                 return;
             }
             if (product_is_unlimited($product)
-                && !in_array($field, ['name', 'emoji', 'peruser', 'minusers'], true)) {
+                && !in_array($field, ['name', 'emoji', 'peruser', 'hourly', 'minusers', 'devices'], true)) {
                 Tg::answer($cbId, 'این تنظیم برای پنل نامحدود با نقش پاسارگارد مدیریت می‌شود.', true);
                 screen_product_admin($chatId, $messageId, $productId);
                 return;
@@ -16862,23 +17161,29 @@ function handle_message_inner(array $message): void
             }
             $count = (int) $count;
             $unit = panel_unlimited_user_price($panel);
-            $price = $count * $unit;
+            /* A capacity extension buys exactly its own first hourly period; the
+               fixed panel component is never charged again here. */
+            $hourly = panel_is_hourly_unlimited($panel);
+            $price = panel_unlimited_users_hourly_total($panel, $count);
             State::clear($uid);
             $order = create_order($uid, 'users', $price, (int) ($panel['product_id'] ?? 0), [
                 'panel_id' => $panelId,
                 'block' => $count, // سازگاری با فیلد قدیمی؛ شاخهٔ تحویل با unlimited_users تشخیص می‌دهد.
                 'sale_type' => PRODUCT_SALE_UNLIMITED_USERS,
                 'unlimited_users' => true,
+                'unlimited_billing_mode' => $hourly ? UNLIMITED_BILLING_HOURLY : UNLIMITED_BILLING_LEGACY,
                 'user_count' => $count,
                 'per_user_price' => $unit,
                 'min_users' => panel_unlimited_min_users($panel),
             ]);
-            Tg::send($chatId,
-                invoice_text($order, 'افزودن کاربر به پنل نامحدود',
-                    '📦 پنل <code>' . e((string) $panel['panel_username']) . "</code>\n"
-                    . '👥 تعداد کاربر: <b>' . fa_digits($count) . "</b>\n"
-                    . '💵 ' . fa_digits($count) . ' × ' . money($unit) . ' = <b>'
-                        . money($price) . '</b>'),
+            $detail = '📦 پنل <code>' . e((string) $panel['panel_username']) . "</code>\n"
+                . '👥 تعداد کاربر: <b>' . fa_digits($count) . "</b>\n"
+                . '💵 ' . fa_digits($count) . ' × ' . money($unit) . ' = <b>'
+                    . money($price) . '</b>';
+            if ($hourly) {
+                $detail .= "\n<i>این مبلغ ساعت اولِ کاربران تازه است؛ از ساعت بعد نرخ آن‌ها ساعتی از کیف پول کم می‌شود.</i>";
+            }
+            Tg::send($chatId, invoice_text($order, 'افزودن کاربر به پنل نامحدود', $detail),
                 invoice_kb($order, $uid));
             return;
 
@@ -17265,6 +17570,129 @@ function panel_charge_once(array $panel, int $usedBytes, bool $hourlyEnabled,
     return $out;
 }
 
+/**
+ * Meter the immutable components of an hourly unlimited panel.
+ *
+ * A component is either the fixed panel rent or one purchased user-cap block.
+ * Its paid_until clock means capacity added later cannot be billed backwards.
+ * The full decision and wallet debit live under one SQLite write lock, so two
+ * cron invocations cannot charge the same hour twice.
+ */
+function unlimited_hourly_charge_once(array $panel, ?int $at = null): array
+{
+    $out = ['charged' => 0, 'hours' => 0, 'insufficient' => false,
+            'suspended' => false, 'resumed' => false, 'skipped' => false];
+    if (!panel_is_hourly_unlimited($panel)) {
+        return $out;
+    }
+    $at = $at ?? now_ts();
+    $panelId = (int) $panel['id'];
+    $decision = db_tx(static function () use ($panelId, $at): array {
+        $fresh = DB::one('SELECT * FROM panels WHERE id=?', [$panelId]);
+        if ($fresh === null || !panel_is_hourly_unlimited($fresh)) {
+            return ['skip' => true, 'charged' => 0, 'hours' => 0, 'insufficient' => false,
+                    'tg' => 0, 'username' => '', 'balance' => 0, 'status' => '', 'reason' => ''];
+        }
+        $units = DB::all('SELECT * FROM unlimited_billing_units WHERE panel_id=? AND active=1 '
+            . 'AND paid_until<=? AND (units * hourly_price)>0 ORDER BY paid_until, id',
+            [$panelId, $at]);
+        if ($units === []) {
+            return ['skip' => false, 'charged' => 0, 'hours' => 0, 'insufficient' => false,
+                    'tg' => (int) $fresh['tg_id'], 'username' => (string) $fresh['panel_username'],
+                    'balance' => balance_of((int) $fresh['tg_id']), 'status' => (string) $fresh['status'],
+                    'reason' => (string) ($fresh['suspended_reason'] ?? '')];
+        }
+        $tgId = (int) $fresh['tg_id'];
+        $balance = balance_of($tgId);
+        $startingBalance = $balance;
+        $charged = 0;
+        $hours = 0;
+        $insufficient = false;
+        foreach ($units as $unit) {
+            $paidUntil = (int) $unit['paid_until'];
+            $unitCount = max(0, (int) $unit['units']);
+            $price = max(0, (int) $unit['hourly_price']);
+            if ($paidUntil > $at || $unitCount === 0 || $price === 0
+                || $unitCount > intdiv(PHP_INT_MAX, $price)) {
+                continue;
+            }
+            $rate = $unitCount * $price;
+            $periods = intdiv($at - $paidUntil, 3600) + 1;
+            /* Each period needs a whole rate; partial hours are never silently
+               booked, so an unpaid clock remains due for the next run. */
+            $canPay = min($periods, intdiv(max(0, $balance), $rate));
+            if ($canPay > 0) {
+                $amount = $canPay * $rate;
+                DB::exec('UPDATE unlimited_billing_units SET paid_until=? WHERE id=? AND paid_until=?',
+                    [$paidUntil + $canPay * 3600, (int) $unit['id'], $paidUntil]);
+                $charged += $amount;
+                $balance -= $amount;
+                $hours += $canPay;
+            }
+            if ($canPay < $periods) {
+                $insufficient = true;
+            }
+        }
+        if ($charged > 0) {
+            $changed = DB::update('UPDATE users SET balance=balance-? WHERE tg_id=? AND balance>=?',
+                [$charged, $tgId, $charged]);
+            if ($changed !== 1) {
+                throw new RuntimeException('hourly unlimited balance changed during locked debit');
+            }
+            $newBalance = $startingBalance - $charged;
+            DB::exec('INSERT INTO wallet_tx(tg_id, amount, kind, ref, note, balance, created_at) '
+                . 'VALUES(?,?,?,?,?,?,?)', [$tgId, -$charged, 'unlimited-hourly', (string) $panelId,
+                'صورتحساب ساعتی پنل نامحدود', $newBalance, now_ts()]);
+            DB::exec('INSERT INTO usage_charges(panel_id, tg_id, bytes, hours, amount, kind, created_at) '
+                . 'VALUES(?,?,?,?,?,?,?)', [$panelId, $tgId, 0, $hours, $charged,
+                'unlimited-hourly', now_ts()]);
+            DB::exec('UPDATE panels SET spent_total=spent_total+?, last_meter_at=? WHERE id=?',
+                [$charged, $at, $panelId]);
+        }
+        return ['skip' => false, 'charged' => $charged, 'hours' => $hours,
+                'insufficient' => $insufficient, 'tg' => $tgId,
+                'username' => (string) $fresh['panel_username'], 'balance' => $balance,
+                'status' => (string) $fresh['status'],
+                'reason' => (string) ($fresh['suspended_reason'] ?? '')];
+    });
+    if (($decision['skip'] ?? false) === true) {
+        $out['skipped'] = true;
+        return $out;
+    }
+    $out['charged'] = (int) $decision['charged'];
+    $out['hours'] = (int) $decision['hours'];
+    $out['insufficient'] = (bool) $decision['insufficient'];
+    if ($out['charged'] > 0) {
+        post_report('♾️ <b>صورتحساب ساعتی پنل نامحدود</b>' . "\n"
+            . '👤 کاربر <code>' . (int) $decision['tg'] . "</code>\n"
+            . '📦 پنل <code>' . e((string) $decision['username']) . "</code>\n"
+            . '⏱ دورهٔ ثبت‌شده: ' . fa_digits($out['hours']) . " ساعت\n"
+            . '💵 کسر شد: ' . money($out['charged']) . "\n"
+            . '👛 موجودی: ' . money((int) $decision['balance']), 'usage');
+    }
+    $fresh = DB::one('SELECT * FROM panels WHERE id=?', [$panelId]);
+    if ($fresh === null) {
+        return $out;
+    }
+    if ($out['insufficient']) {
+        if ((string) $fresh['status'] === 'active'
+            && suspend_panel($fresh, 'کمبود موجودی برای صورتحساب ساعتی پنل نامحدود')) {
+            DB::exec('UPDATE panels SET suspended_reason=? WHERE id=?', ['hourly_balance', $panelId]);
+            $out['suspended'] = true;
+        }
+        return $out;
+    }
+    /* Only a suspension caused by this billing model is auto-resumed. */
+    if ((string) $fresh['status'] === 'suspended'
+        && (string) ($fresh['suspended_reason'] ?? '') === 'hourly_balance') {
+        DB::exec('UPDATE panels SET suspended_reason=NULL WHERE id=?', [$panelId]);
+        if (resume_panel($fresh)) {
+            $out['resumed'] = true;
+        }
+    }
+    return $out;
+}
+
 function panels_meter(bool $verbose = false): array
 {
     $grace = set_int('meter_grace', 0);
@@ -17277,6 +17705,19 @@ function panels_meter(bool $verbose = false): array
     /* پنل‌های معلق: صورتحساب متوقف است و فقط شرط بازگشت بررسی می‌شود */
     foreach (DB::all("SELECT * FROM panels WHERE status='suspended'") as $held) {
         if (panel_is_unlimited($held)) {
+            if (panel_is_hourly_unlimited($held)) {
+                if ($hourlyEnabled && (string) ($held['suspended_reason'] ?? '') === 'hourly_balance') {
+                    $hourly = unlimited_hourly_charge_once($held);
+                    if ($hourly['charged'] > 0) {
+                        $stats['charges']++;
+                        $stats['charged'] += $hourly['charged'];
+                    }
+                    if ($hourly['resumed']) {
+                        $stats['resumed']++;
+                    }
+                }
+                continue;
+            }
             /* اگر نسخهٔ قبلی ربات به‌علت موجودی این پنل را بسته باشد، واگذار کردن
                اختیار به Role مستلزم برداشتن همان محدودیت محلی است. */
             if (($held['suspended_reason'] ?? '') === 'balance') {
@@ -17303,7 +17744,22 @@ function panels_meter(bool $verbose = false): array
     $rows = DB::all("SELECT * FROM panels WHERE status='active'");
     foreach ($rows as $panel) {
         if (panel_is_unlimited($panel)) {
-            /* هیچ خواندن مصرف، پایان اعتبار، حجم یا صورتحساب محلی برای این نوع نیست. */
+            if (panel_is_hourly_unlimited($panel) && $hourlyEnabled) {
+                $hourly = unlimited_hourly_charge_once($panel);
+                if ($hourly['charged'] > 0) {
+                    $stats['charges']++;
+                    $stats['charged'] += $hourly['charged'];
+                }
+                if ($hourly['suspended']) {
+                    $stats['suspended']++;
+                }
+                if ($verbose && ($hourly['charged'] > 0 || $hourly['insufficient'])) {
+                    echo '· unlimited ' . $panel['panel_username'] . ' — hours=' . $hourly['hours']
+                        . ' charge=' . money($hourly['charged'])
+                        . ($hourly['insufficient'] ? ' (insufficient)' : '') . "\n";
+                }
+            }
+            /* No usage/traffic/expiry meter for either unlimited model. */
             continue;
         }
         $panelRow = $panel['pg_panel_id']
@@ -17442,13 +17898,17 @@ function panels_balance_enforce(bool $verbose = false): array
             continue; // پنل تست رایگان است و به موجودی کاری ندارد
         }
         if (panel_is_unlimited($panel)) {
+            if (panel_is_hourly_unlimited($panel)) {
+                /* Its own component meter decides when this service may resume. */
+                continue;
+            }
             if ($panel['status'] === 'suspended' && ($panel['suspended_reason'] ?? '') === 'balance') {
                 DB::exec('UPDATE panels SET suspended_reason=NULL WHERE id=?', [(int) $panel['id']]);
                 if (resume_panel($panel)) {
                     $out['resumed']++;
                 }
             }
-            continue; // اعتبار، دستگاه و موجودی پنل نامحدود فقط با Role است
+            continue; // legacy unlimited: اعتبار/دستگاه فقط با Role است
         }
         $balance = balance_of((int) $panel['tg_id']);
         /* پول ۲۴ ساعت اول در فاکتور اولیه تسویه شده است؛ تا عبور صریح زمان
@@ -18850,6 +19310,8 @@ const PAY_GATEWAYS = [
                         'hint' => 'توکن Bearer از cubevps.ir (همان کلید، امضای کال‌بک را می‌سازد).'],
     'iranpay4'      => ['label' => 'AbanPay', 'emoji' => '🟠', 'type' => 'online',
                         'hint' => 'API key + آدرس سرویس درگاه (https).'],
+    'tetrapay'      => ['label' => 'تتراپی', 'emoji' => '🔷', 'type' => 'online',
+                        'hint' => 'کلید API تتراپی + کلید اختیاری وب‌هوک؛ مبلغ‌ها خودکار از تومان به ریال تبدیل می‌شوند.'],
     'nowpayment'    => ['label' => 'NowPayments', 'emoji' => '₿', 'type' => 'crypto',
                         'hint' => 'x-api-key از nowpayments.io + IPN secret.'],
     'plisio'        => ['label' => 'Plisio', 'emoji' => '🪙', 'type' => 'crypto',
@@ -18876,6 +19338,7 @@ function pay_setting_defaults(): array
         /* اعداد پیش‌فرض درگاه‌ها */
         $minMax = [
             'card'       => ['20000', '10000000'],
+            'tetrapay'   => ['20000', '1000000'],
             'nowpayment' => ['250000', '1000000'],
             'plisio'     => ['250000', '100000000'],
             'stars'      => ['20000', '1000000'],
@@ -18887,6 +19350,8 @@ function pay_setting_defaults(): array
             $defaults["pay_{$id}_min_fiat"] = '0';    // ۰ = حداقل را از خود درگاه می‌خوانیم
         }
     }
+    /* محیط آزمایشی تتراپی فقط با انتخاب صریح مدیر فعال می‌شود؛ هرگز پیش‌فرض نیست. */
+    $defaults['pay_tetrapay_sandbox'] = '0';
     $defaults['swap_api_key'] = '';
     $defaults['usd_toman_rate'] = '0';                // فقط نرخ پشتیبان، وقتی سواپ‌ولت در دسترس نیست
     return $defaults;
@@ -18922,6 +19387,12 @@ function gw_key(string $gw): string
 function gw_key2(string $gw): string
 {
     return trim(set_get("pay_{$gw}_key2", ''));
+}
+
+/** تتراپی فقط با انتخاب صریح مدیر روی سندباکس می‌رود؛ کلید و وب‌هوک همان کلیدهای درگاه‌اند. */
+function tetrapay_sandbox(): bool
+{
+    return set_get('pay_tetrapay_sandbox', '0') === '1';
 }
 
 function gw_min(string $gw): int
@@ -19018,6 +19489,70 @@ function pay_find_by_authority(string $authority): ?array
         . 'ORDER BY id DESC LIMIT 1', [$authority]);
 }
 
+/** پیام استاندارد بعد از ساخت لینک؛ این پیام عمداً از شارژ شدن کیف پول حرف نمی‌زند. */
+function pay_created_notice(array $order, array $payment): string
+{
+    $gateway = PAY_GATEWAYS[(string) ($payment['method'] ?? '')]['label']
+        ?? (string) ($payment['method'] ?? '—');
+    $tracking = trim((string) ($payment['authority'] ?? ''));
+    if ($tracking === '') {
+        $tracking = (string) ($order['ref'] ?? '—');
+    }
+    $minutes = max(1, set_int('pay_expire_minutes', 30));
+    $support = support_username();
+    $supportLine = $support !== '' ? "
+☎️ پشتیبانی: @" . e($support) : '';
+    return '🏧 <b>تراکنش جدید در ' . e(bot_name()) . "</b>
+
+"
+        . '🧾 کد سفارش: <code>' . e((string) ($order['ref'] ?? '—')) . "</code>
+"
+        . '🔢 کد رهگیری: <code>' . e($tracking) . "</code>
+"
+        . '💳 روش پرداخت: ' . e($gateway) . "
+"
+        . '💰 مبلغ: <b>' . money((int) ($payment['amount'] ?? $order['payable'] ?? 0)) . "</b>
+"
+        . '⌛ مهلت پرداخت: ' . fa_digits($minutes) . " دقیقه
+
+"
+        . '⚠️ وضعیت: <b>در انتظار پرداخت و تأیید قطعی درگاه</b>' . "
+"
+        . '<i>تا قبل از Verify/Webhook معتبر، هیچ مبلغی به کیف پول اضافه نمی‌شود.</i>'
+        . $supportLine;
+}
+
+/** پیام تأیید نهایی فقط پس از پاسخ معتبر Verify/Webhook و تحویل موفق سفارش. */
+function pay_verified_notice(array $order, array $payment, string $deliveryText): string
+{
+    $gateway = PAY_GATEWAYS[(string) ($payment['method'] ?? '')]['label']
+        ?? (string) ($payment['method'] ?? '—');
+    $ref = trim((string) ($payment['ref'] ?? ''));
+    if ($ref === '') {
+        $ref = trim((string) ($payment['authority'] ?? ''));
+    }
+    $body = '✅ <b>پرداخت با موفقیت و به‌صورت قطعی تأیید شد</b>' . "
+
+"
+        . '🏧 ربات: <b>' . e(bot_name()) . "</b>
+"
+        . '🧾 کد سفارش: <code>' . e((string) ($order['ref'] ?? '—')) . "</code>
+"
+        . '🔢 کد رهگیری: <code>' . e($ref !== '' ? $ref : '—') . "</code>
+"
+        . '💳 روش پرداخت: ' . e($gateway) . "
+"
+        . '💰 مبلغ تأییدشده: <b>' . money((int) ($payment['amount'] ?? 0)) . "</b>
+
+";
+    if ((string) ($order['kind'] ?? '') === 'topup') {
+        $body .= '👛 <b>شارژ کیف پول پس از تأیید قطعی انجام شد.</b>' . "
+
+";
+    }
+    return $body . $deliveryText;
+}
+
 /**
  * تسویهٔ نهایی یک پرداخت (idempotent).
  * خروجی: ['ok' => bool, 'state' => success|already|notfound|failed, 'text' => پیام]
@@ -19042,10 +19577,14 @@ function pay_settle(int $paymentId, string $ref = '', array $extra = [], bool $f
     if ($order === null) {
         return ['ok' => false, 'state' => 'notfound', 'text' => 'سفارش پیدا نشد'];
     }
-    // قفل اتمی: فقط یک درخواست برنده می‌شود
+    // قفل اتمی: فقط یک درخواست برنده می‌شود. متادیتای ساخت فاکتور را نگه
+    // می‌داریم و پاسخ Verify را جداگانه ثبت می‌کنیم؛ حذف آن، verify/idempotency
+    // بعدی (به‌ویژه برای تتراپی) را کور می‌کرد.
+    $settledMeta = pay_meta($payment);
+    $settledMeta['verify'] = $extra;
     $changed = DB::update("UPDATE payments SET status='paid', ref=?, paid_at=?, payload=? "
         . "WHERE id=? AND status<>'paid'",
-        [$ref, now_ts(), json_encode($extra, JSON_UNESCAPED_UNICODE), $paymentId]);
+        [$ref, now_ts(), json_encode($settledMeta, JSON_UNESCAPED_UNICODE), $paymentId]);
     if ($changed === 0) {
         return ['ok' => true, 'state' => 'already', 'text' => 'قبلاً تأیید شده است'];
     }
@@ -19057,7 +19596,18 @@ function pay_settle(int $paymentId, string $ref = '', array $extra = [], bool $f
     [$ok, $text] = settle_payment($order, (string) $payment['method']);
     $tgId = (int) $payment['tg_id'];
 
-    /* کش‌بک درگاه */
+    /* پرداخت ممکن است در Verify قطعی شود ولی ساخت پنل/تحویلش خطا دهد.
+       در این حالت هیچ پیام «شارژ شد» یا کش‌بکِ زودرس نمی‌فرستیم. */
+    if (!$ok) {
+        Tg::send($tgId, '⚠️ <b>پرداخت تأیید شد، اما انجام سفارش نیاز به بررسی دارد</b>' . "\n\n"
+            . 'کد سفارش: <code>' . e((string) $order['ref']) . "</code>\n"
+            . 'هنوز پیام موفقیت یا شارژ کیف پول صادر نشده است. لطفاً با پشتیبانی هماهنگ کنید.');
+        post_report('⚠️ <b>پرداخت تأیید شد ولی تحویل ناموفق بود</b>' . "\n"
+            . 'کاربر <code>' . $tgId . '</code> · سفارش <code>' . e((string) $order['ref']) . '</code>', 'payment');
+        return ['ok' => false, 'state' => 'waiting', 'text' => $text];
+    }
+
+    /* کش‌بک فقط وقتی سفارش واقعاً تحویل/شارژ شد اضافه می‌شود. */
     $cashbackPercent = gw_cashback((string) $payment['method']);
     if ($cashbackPercent > 0) {
         $reward = intdiv((int) $payment['amount'] * $cashbackPercent, 100);
@@ -19067,12 +19617,13 @@ function pay_settle(int $paymentId, string $ref = '', array $extra = [], bool $f
             Tg::send($tgId, '🎁 ' . money($reward) . ' کش‌بک پرداخت به کیف پولتان اضافه شد.');
         }
     }
-    Tg::send($tgId, $text, home_kb($tgId));
+    $paidRow = pay_get($paymentId) ?? $payment;
+    Tg::send($tgId, pay_verified_notice($order, $paidRow, $text), home_kb($tgId));
     $gwLabel = PAY_GATEWAYS[(string) $payment['method']]['label'] ?? $payment['method'];
     post_report('💰 <b>پرداخت موفق</b>' . "\n" . 'درگاه: ' . e($gwLabel) . "\n"
         . 'کاربر <code>' . $tgId . '</code> · ' . money((int) $payment['amount']) . "\n"
         . 'سفارش <code>' . e((string) $order['ref']) . '</code>');
-    return ['ok' => $ok, 'state' => 'success', 'text' => $text];
+    return ['ok' => true, 'state' => 'success', 'text' => $text];
 }
 
 /** صفحهٔ نتیجهٔ پرداخت — ساده و بدون فونت بیرونی */
@@ -19148,6 +19699,19 @@ function pay_start(array $order, string $gw): array
     if ($gw === 'stars') {
         return pay_stars($order);
     }
+    /* لمس دوبارهٔ دکمه نباید برای یک سفارش چند فاکتور درگاه بسازد. */
+    $existing = DB::one("SELECT * FROM payments WHERE order_id=? AND method=? AND status='unpaid' "
+        . "AND authority<>'' ORDER BY id DESC LIMIT 1", [(int) $order['id'], $gw]);
+    if ($existing !== null) {
+        $existingMeta = pay_meta($existing);
+        $existingUrl = trim((string) ($existingMeta['checkout_url'] ?? ''));
+        if (preg_match('~^https://~i', $existingUrl) === 1) {
+            return ['ok' => true, 'url' => $existingUrl,
+                    'alt_url' => (string) ($existingMeta['telegram_checkout_url'] ?? ''),
+                    'text' => PAY_GATEWAYS[$gw]['label'] ?? $gw,
+                    'payment' => (int) $existing['id'], 'reused' => true];
+        }
+    }
     $payment = pay_new($order, $gw, $amount);
     if (!$payment) {
         return ['ok' => false, 'url' => '', 'text' => 'ثبت پرداخت ناموفق بود'];
@@ -19160,6 +19724,7 @@ function pay_start(array $order, string $gw): array
         'iranpay1'      => pay_floypay_create($payment, $order),
         'iranpay2'      => pay_cubepay_create($payment, $order),
         'iranpay4'      => pay_abanpay_create($payment, $order),
+        'tetrapay'      => pay_tetrapay_create($payment, $order),
         'nowpayment'    => pay_nowpay_create($payment, $order),
         'plisio'        => pay_plisio_create($payment, $order),
         'variza'        => pay_variza_create($payment, $order),
@@ -19173,6 +19738,17 @@ function pay_start(array $order, string $gw): array
         if ($raw !== '' && preg_match('/min|low|small|کم/i', $raw) === 1) {
             $created['text'] = gw_min_from_provider_text($gw, $amount, $raw);
         }
+    }
+    if (($created['ok'] ?? false) === true && ($created['url'] ?? '') !== '') {
+        /* URL را محلی نگه می‌داریم تا لمس دوبارهٔ دکمه همان فاکتور باز را باز کند. */
+        $fresh = pay_get((int) $payment['id']) ?? $payment;
+        $meta = pay_meta($fresh);
+        $meta['checkout_url'] = (string) $created['url'];
+        if (!empty($created['alt_url']) && preg_match('~^https://~i', (string) $created['alt_url']) === 1) {
+            $meta['telegram_checkout_url'] = (string) $created['alt_url'];
+        }
+        pay_save_meta((int) $payment['id'], $meta);
+        $created['payment'] = (int) $payment['id'];
     }
     return $created;
 }
@@ -19542,6 +20118,9 @@ function gw_endpoint_default(string $gw): string
         'iranpay1'      => 'https://tetra98.com',            // FloyPay
         'iranpay2'      => 'https://cubevps.ir',             // CubePay
         'iranpay4'      => '',                               // AbanPay: سرویس خودتان
+        'tetrapay'      => tetrapay_sandbox()
+            ? 'https://api.sandbox.tetra98.com/api/v1'
+            : 'https://api.tetra98.com/api/v1',
         'nowpayment'    => 'https://api.nowpayments.io',
         'plisio'        => 'https://api.plisio.net',
         'variza'        => 'https://variza.ir',
@@ -19962,6 +20541,266 @@ function pay_abanpay_verify(array $payment, array $params): array
     return pay_accept($payment, $paid > 0 ? $paid : (float) $payment['amount'], $orderRef, $res);
 }
 
+/* تتراپی v1 ───────────────────────────────────────────────────────────── */
+
+/**
+ * این درگاه در API مبلغ ریالی می‌گیرد، ولی همهٔ مبلغ‌های داخلی SIBIL تومان‌اند.
+ * URL ایجادکننده و محیط (تولید/سندباکس) همراه همان پرداخت snapshot می‌شوند تا
+ * تغییر بعدی تنظیمات، verify یک فاکتور قدیمی را به محیط دیگری نفرستد.
+ */
+function tetrapay_base_url(?bool $sandbox = null): string
+{
+    $sandbox = $sandbox ?? tetrapay_sandbox();
+    $custom = trim(set_get('pay_tetrapay_endpoint', ''));
+    if ($custom !== '' && preg_match('~^https://[^\s/?#]+(?:/[^\s?#]*)?$~i', $custom) === 1) {
+        return rtrim($custom, '/');
+    }
+    return $sandbox
+        ? 'https://api.sandbox.tetra98.com/api/v1'
+        : 'https://api.tetra98.com/api/v1';
+}
+
+/** فقط HTTPS دامنهٔ خود ربات برای callback قابل قبول است. */
+function tetrapay_callback_url(): string
+{
+    $url = pay_callback_url('tetrapay');
+    $parts = parse_url($url);
+    if (!is_array($parts) || strtolower((string) ($parts['scheme'] ?? '')) !== 'https'
+        || empty($parts['host']) || isset($parts['user']) || isset($parts['pass'])) {
+        return '';
+    }
+    return $url;
+}
+
+function tetrapay_webhook_url(): string
+{
+    if (gw_key2('tetrapay') === '') {
+        return '';
+    }
+    $base = web_base();
+    $parts = parse_url($base);
+    if (!is_array($parts) || strtolower((string) ($parts['scheme'] ?? '')) !== 'https'
+        || empty($parts['host']) || isset($parts['user']) || isset($parts['pass'])) {
+        return '';
+    }
+    return rtrim($base, '/') . '/pay/tetrapay/webhook';
+}
+
+function tetrapay_external_order_id(array $order, array $payment): string
+{
+    $ref = preg_replace('/[^A-Za-z0-9_-]/', '', (string) ($order['ref'] ?? '')) ?: 'order';
+    return mb_substr('sibil-' . $ref . '-' . (int) ($payment['id'] ?? 0), 0, 80);
+}
+
+function tetrapay_error(array $res, string $fallback = 'ساخت لینک تتراپی انجام نشد.'): string
+{
+    $error = is_array($res['error'] ?? null) ? $res['error'] : [];
+    $code = strtoupper(trim((string) ($error['code'] ?? '')));
+    $retry = max(0, (int) ($error['retryAfter'] ?? 0));
+    return match ($code) {
+        'UNAUTHORIZED' => 'کلید API تتراپی پذیرفته نشد یا باطل شده است.',
+        'GATEWAY_SUSPENDED' => 'درگاه تتراپی در پنل پذیرنده غیرفعال یا تعلیق شده است.',
+        'NO_METHOD_AVAILABLE' => 'هیچ روش پرداخت فعالی در پنل تتراپی روشن نیست.',
+        'INVALID_CALLBACK' => 'آدرس HTTPS بازگشت درگاه تتراپی پذیرفته نشد.',
+        'INVALID_WEBHOOK', 'WEBHOOK_NOT_CONFIGURED' => 'کلید یا آدرس وب‌هوک تتراپی پذیرفته نشد.',
+        'AMOUNT_OUT_OF_RANGE' => 'مبلغ خارج از بازهٔ مجاز تتراپی است.',
+        'SANDBOX_DISABLED' => 'سندباکس تتراپی در پنل پذیرنده روشن نیست.',
+        'RATE_LIMITED' => $retry > 0
+            ? 'تعداد درخواست‌های تتراپی زیاد است؛ ' . $retry . ' ثانیه دیگر دوباره تلاش کنید.'
+            : 'تعداد درخواست‌های تتراپی موقتاً زیاد است؛ کمی بعد دوباره تلاش کنید.',
+        'DAILY_LIMIT_REACHED' => 'سقف روزانهٔ درگاه تتراپی پر شده است.',
+        default => ($code !== '' ? 'تتراپی: ' . $code : pay_error_text($res, $fallback)),
+    };
+}
+
+function tetrapay_data(array $res): array
+{
+    return is_array($res['data'] ?? null) ? $res['data'] : $res;
+}
+
+function tetrapay_rial(int $toman): int
+{
+    return $toman > 0 && $toman <= intdiv(PHP_INT_MAX, 10) ? $toman * 10 : 0;
+}
+
+function tetrapay_same_amount(mixed $actual, int $expectedRial): bool
+{
+    $actual = trim((string) $actual);
+    if ($expectedRial <= 0 || preg_match('/^\d+$/', $actual) !== 1) {
+        return false;
+    }
+    return ltrim($actual, '0') === (string) $expectedRial
+        || ($expectedRial === 0 && $actual === '0');
+}
+
+function pay_tetrapay_create(array $payment, array $order): array
+{
+    if (gw_key('tetrapay') === '') {
+        return ['ok' => false, 'url' => '', 'text' => 'کلید API تتراپی ثبت نشده است.'];
+    }
+    $callback = tetrapay_callback_url();
+    if ($callback === '') {
+        return ['ok' => false, 'url' => '', 'text' => 'برای تتراپی باید «آدرس وب و کال‌بک» یک دامنهٔ HTTPS معتبر باشد.'];
+    }
+    $amountRial = tetrapay_rial((int) ($payment['amount'] ?? 0));
+    if ($amountRial <= 0) {
+        return ['ok' => false, 'url' => '', 'text' => 'مبلغ پرداخت تتراپی معتبر نیست.'];
+    }
+    $sandbox = tetrapay_sandbox();
+    $base = tetrapay_base_url($sandbox);
+    $externalOrder = tetrapay_external_order_id($order, $payment);
+    $meta = pay_meta($payment);
+    $meta['tetrapay_order_id'] = $externalOrder;
+    $meta['tetrapay_amount_rial'] = (string) $amountRial;
+    $meta['tetrapay_sandbox'] = $sandbox ? 1 : 0;
+    $meta['tetrapay_endpoint'] = $base;
+    $meta['tetrapay_callback'] = $callback;
+    pay_save_meta((int) $payment['id'], $meta);
+
+    $body = [
+        'amount'       => (string) $amountRial,
+        'order_id'     => $externalOrder,
+        'callback_url' => $callback,
+        'description'  => 'SIBIL order ' . (string) ($order['ref'] ?? ''),
+        'allow_partial' => false,
+    ];
+    $webhook = tetrapay_webhook_url();
+    if ($webhook !== '') {
+        $body['webhook_url'] = $webhook;
+    }
+    $res = pay_json_post($base . '/payments', $body,
+        ['Authorization: Bearer ' . gw_key('tetrapay')]);
+    $data = tetrapay_data($res);
+    $token = trim((string) ($data['token'] ?? ''));
+    $url = trim((string) ($data['payment_url'] ?? ''));
+    $botUrl = trim((string) ($data['bot_payment_url'] ?? ''));
+    if (preg_match('/^[A-Za-z0-9_-]{6,191}$/', $token) !== 1
+        || preg_match('~^https://~i', $url) !== 1) {
+        return ['ok' => false, 'url' => '', 'text' => tetrapay_error($res)];
+    }
+    pay_set_authority((int) $payment['id'], $token, $res);
+    $fresh = pay_get((int) $payment['id']) ?? $payment;
+    $meta = pay_meta($fresh);
+    $meta['checkout_url'] = $url;
+    if (preg_match('~^https://~i', $botUrl) === 1) {
+        $meta['telegram_checkout_url'] = $botUrl;
+    }
+    pay_save_meta((int) $payment['id'], $meta);
+    return ['ok' => true, 'url' => $url, 'alt_url' => $meta['telegram_checkout_url'] ?? '',
+            'text' => 'تتراپی', 'payment' => (int) $payment['id']];
+}
+
+function pay_tetrapay_verify(array $payment, array $params = []): array
+{
+    $token = trim((string) ($params['token'] ?? $params['Token'] ?? $payment['authority'] ?? ''));
+    if ($token === '' || !hash_equals((string) ($payment['authority'] ?? ''), $token)) {
+        return ['ok' => false, 'state' => 'notfound', 'text' => 'توکن تتراپی با پرداخت ربات مطابقت ندارد.'];
+    }
+    $meta = pay_meta($payment);
+    $sandbox = !empty($meta['tetrapay_sandbox']);
+    $base = trim((string) ($meta['tetrapay_endpoint'] ?? ''));
+    if (preg_match('~^https://~i', $base) !== 1) {
+        $base = tetrapay_base_url($sandbox);
+    }
+    $res = pay_json_post(rtrim($base, '/') . '/payments/' . rawurlencode($token) . '/verify', [],
+        ['Authorization: Bearer ' . gw_key('tetrapay')]);
+    $data = tetrapay_data($res);
+    $state = strtolower(trim((string) ($data['status'] ?? '')));
+    if ($state === 'expired') {
+        DB::exec("UPDATE payments SET status='expire' WHERE id=? AND status='unpaid'", [(int) $payment['id']]);
+        return ['ok' => false, 'state' => 'expired', 'text' => 'لینک پرداخت تتراپی منقضی شده است.'];
+    }
+    if ($state !== 'paid') {
+        if ((int) ($res['_status'] ?? 0) >= 400) {
+            return ['ok' => false, 'state' => 'waiting', 'text' => tetrapay_error($res, 'استعلام تتراپی انجام نشد.')];
+        }
+        return ['ok' => false, 'state' => 'waiting', 'text' => 'پرداخت تتراپی هنوز تأیید نشده است.'];
+    }
+    $expectedOrder = (string) ($meta['tetrapay_order_id'] ?? '');
+    $expectedRial = (int) ($meta['tetrapay_amount_rial'] ?? tetrapay_rial((int) $payment['amount']));
+    if ($expectedOrder === '' || !hash_equals($expectedOrder, (string) ($data['order_id'] ?? ''))
+        || !tetrapay_same_amount($data['amount'] ?? '', $expectedRial)) {
+        log_payment('tetrapay verify mismatch', ['payment' => (int) $payment['id']]);
+        return ['ok' => false, 'state' => 'failed', 'text' => 'مبلغ یا شمارهٔ سفارش تتراپی با فاکتور مطابقت ندارد.'];
+    }
+    if (isset($data['received_amount']) && $data['received_amount'] !== null
+        && (string) $data['received_amount'] !== ''
+        && (!tetrapay_same_amount($data['received_amount'], $expectedRial))) {
+        return ['ok' => false, 'state' => 'failed', 'text' => 'پرداخت تتراپی ناقص است و شارژ نشد.'];
+    }
+    return pay_accept($payment, (float) ((int) $expectedRial / 10),
+        (string) ($data['transaction_id'] ?? $data['reference'] ?? $token), $res);
+}
+
+/** امضای وب‌هوک v1: X-TetraPay-Signature: t=unix,v1=HMAC_SHA256(t.raw_body). */
+function tetrapay_webhook_signature_ok(string $raw, string $signature, string $secret): bool
+{
+    if ($raw === '' || $signature === '' || $secret === '') {
+        return false;
+    }
+    $parts = [];
+    foreach (explode(',', $signature) as $piece) {
+        [$key, $value] = array_pad(explode('=', trim($piece), 2), 2, '');
+        if ($key !== '' && $value !== '') {
+            $parts[trim($key)] = trim($value);
+        }
+    }
+    $timestamp = (string) ($parts['t'] ?? '');
+    $given = strtolower((string) ($parts['v1'] ?? ''));
+    if (preg_match('/^\d+$/', $timestamp) !== 1 || preg_match('/^[a-f0-9]{64}$/', $given) !== 1
+        || abs(now_ts() - (int) $timestamp) > 300) {
+        return false;
+    }
+    return hash_equals(hash_hmac('sha256', $timestamp . '.' . $raw, $secret), $given);
+}
+
+function pay_tetrapay_webhook(array $body, string $raw, string $signature, string $sandboxHeader = ''): array
+{
+    $secret = gw_key2('tetrapay');
+    if ($secret === '') {
+        return ['ok' => false, 'code' => 500, 'text' => 'webhook not configured'];
+    }
+    if (!tetrapay_webhook_signature_ok($raw, $signature, $secret)) {
+        return ['ok' => false, 'code' => 403, 'text' => 'invalid signature'];
+    }
+    $event = is_array($body['data'] ?? null) ? ($body['data'] + $body) : $body;
+    $type = strtolower((string) ($event['event'] ?? $event['type'] ?? ''));
+    $state = strtolower((string) ($event['status'] ?? ''));
+    if ($type !== 'payment.paid' && $state !== 'paid') {
+        return ['ok' => true, 'code' => 200, 'text' => 'ignored'];
+    }
+    $token = trim((string) ($event['token'] ?? ''));
+    $payment = $token !== '' ? DB::one('SELECT * FROM payments WHERE authority=? AND method=? '
+        . 'ORDER BY id DESC LIMIT 1', [$token, 'tetrapay']) : null;
+    if ($payment === null) {
+        return ['ok' => false, 'code' => 404, 'text' => 'payment not found'];
+    }
+    if ((string) $payment['status'] === 'paid') {
+        return ['ok' => true, 'code' => 200, 'text' => 'already'];
+    }
+    if ((string) $payment['status'] !== 'unpaid') {
+        return ['ok' => false, 'code' => 409, 'text' => 'payment closed'];
+    }
+    $meta = pay_meta($payment);
+    $sandbox = !empty($event['sandbox']) || strtolower(trim($sandboxHeader)) === 'true';
+    if ($sandbox !== !empty($meta['tetrapay_sandbox'])) {
+        return ['ok' => false, 'code' => 400, 'text' => 'sandbox mismatch'];
+    }
+    $expectedOrder = (string) ($meta['tetrapay_order_id'] ?? '');
+    $expectedRial = (int) ($meta['tetrapay_amount_rial'] ?? tetrapay_rial((int) $payment['amount']));
+    if (($event['order_id'] ?? '') !== $expectedOrder
+        || !tetrapay_same_amount($event['amount'] ?? '', $expectedRial)) {
+        return ['ok' => false, 'code' => 400, 'text' => 'payment mismatch'];
+    }
+    /* وب‌هوک امضاشده سریع است، ولی نتیجه را یک بار دیگر از verify می‌خوانیم. */
+    $result = pay_tetrapay_verify($payment, ['token' => $token]);
+    $state = (string) ($result['state'] ?? 'waiting');
+    return ['ok' => (bool) ($result['ok'] ?? false),
+            'code' => ($result['ok'] ?? false) ? 200 : ($state === 'waiting' ? 500 : 400),
+            'text' => $state];
+}
+
+
 /* NowPayments ──────────────────────────────────────────────────────────── */
 
 function pay_nowpay_create(array $payment, array $order): array
@@ -20297,54 +21136,59 @@ function pay_trx_verify(array $payment): array
 }
 
 /**
- * تست زندهٔ یک درگاه: یک فاکتور واقعی با کمترین مبلغ مجاز می‌سازد و
- * پاسخ خام درگاه را برمی‌گرداند. هیچ ردیفی در دیتابیس ثبت نمی‌شود.
+ * بررسی امن پیکربندی درگاه.
+ *
+ * نسخه‌های پیشین برای «تست زنده» یک فاکتور واقعی می‌ساختند؛ این رفتار هم
+ * ناخواسته بود و هم می‌توانست سهمیه/تراکنش واقعی بسازد. این بررسی فقط
+ * تنظیمات محلی، URL و آدرس callback را می‌سنجد و هیچ درخواست پرداختی ارسال
+ * نمی‌کند. verify واقعی فقط از callback/webhook یک پرداختی که خود کاربر آغاز
+ * کرده اجرا می‌شود.
  */
 function gw_live_test(string $gw): array
 {
     if (!isset(PAY_GATEWAYS[$gw]) || in_array($gw, ['wallet', 'card', 'stars'], true)) {
         return ['ok' => false, 'title' => 'درگاه نامعتبر',
-                'body' => 'برای این نوع پرداخت تست خودکار وجود ندارد.'];
+                'body' => 'برای این نوع پرداخت بررسی خودکار لازم نیست.'];
     }
+    $issues = [];
+    $notes = [];
+    $endpoint = $gw === 'tetrapay' ? tetrapay_base_url()
+        : gw_endpoint($gw, gw_endpoint_default($gw));
     if (gw_key($gw) === '') {
-        return ['ok' => false, 'title' => 'کلید ثبت نشده',
-                'body' => 'اول کلید درگاه را وارد کن، بعد تست بگیرید.'];
-    }
-    if (gw_is_fiat($gw) && gw_min_fiat($gw) > 0) {
-        $amount = (int) ceil(gw_min_fiat($gw) * usd_toman_rate());
+        $issues[] = 'کلید درگاه ثبت نشده است.';
     } else {
-        $amount = max(gw_min($gw), 50000);
+        $notes[] = 'کلید درگاه ثبت شده است.';
     }
-    $order = ['id' => 0, 'ref' => 'TEST' . now_ts(), 'payable' => $amount,
-              'amount' => $amount, 'tg_id' => 0, 'kind' => 'topup'];
-    $payment = ['id' => 0, 'order_id' => 0, 'method' => $gw, 'amount' => $amount,
-                'authority' => 'TEST' . now_ts(), 'status' => 'unpaid',
-                'payload' => json_encode(['order_ref' => $order['ref'],
-                    'fiat_amount' => gw_is_fiat($gw) ? gw_fiat_amount($gw, $amount) : $amount])];
-    try {
-        $res = match ($gw) {
-            'zarinpal'      => pay_zarinpal_create($payment, $order),
-            'aqayepardakht' => pay_aqaye_create($payment, $order),
-            'iranpay1'      => pay_floypay_create($payment, $order),
-            'iranpay2'      => pay_cubepay_create($payment, $order),
-            'iranpay4'      => pay_abanpay_create($payment, $order),
-            'nowpayment'    => pay_nowpay_create($payment, $order),
-            'plisio'        => pay_plisio_create($payment, $order),
-            'variza'        => pay_variza_create($payment, $order),
-            'trx'           => pay_trx_create($payment, $order),
-            default         => ['ok' => false, 'text' => 'پشتیبانی نمی‌شود'],
-        };
-    } catch (Throwable $ex) {
-        return ['ok' => false, 'title' => 'خطای اجرای تست', 'body' => $ex->getMessage()];
+    if (preg_match('~^https://~i', $endpoint) !== 1) {
+        $issues[] = 'آدرس سرویس باید HTTPS معتبر باشد.';
+    } else {
+        $notes[] = 'آدرس HTTPS سرویس معتبر است.';
     }
-    $ok = (bool) ($res['ok'] ?? false);
+    $callback = pay_callback_url($gw);
+    $parts = parse_url($callback);
+    $callbackOk = is_array($parts) && strtolower((string) ($parts['scheme'] ?? '')) === 'https'
+        && !empty($parts['host']) && !isset($parts['user']) && !isset($parts['pass']);
+    if (!$callbackOk) {
+        $issues[] = 'آدرس وب ربات باید یک دامنهٔ HTTPS عمومی باشد تا callback درگاه کار کند.';
+    } else {
+        $notes[] = 'callback HTTPS آماده است: ' . $callback;
+    }
+    if ($gw === 'tetrapay') {
+        $notes[] = tetrapay_sandbox() ? 'محیط: سندباکس (بدون پول واقعی).' : 'محیط: تولید.';
+        if (gw_key2('tetrapay') === '') {
+            $notes[] = 'وب‌هوک اختیاری است؛ در نبود secret، بازگشت کاربر و poll سمت سرور Verify می‌شوند.';
+        } elseif (tetrapay_webhook_url() === '') {
+            $issues[] = 'کلید وب‌هوک ثبت شده اما دامنهٔ HTTPS برای وب‌هوک معتبر نیست.';
+        } else {
+            $notes[] = 'وب‌هوک امضاشده آماده است: ' . tetrapay_webhook_url();
+        }
+    }
     return [
-        'ok'    => $ok,
-        'title' => $ok ? 'درگاه سالم است' : 'درگاه پاسخ درست نداد',
-        'body'  => (string) ($res['text'] ?? ''),
-        'url'   => (string) ($res['url'] ?? ''),
-        'amount' => $amount,
-        'endpoint' => gw_endpoint($gw, gw_endpoint_default($gw)),
+        'ok'       => $issues === [],
+        'title'    => $issues === [] ? 'پیکربندی برای استفاده آماده است' : 'پیکربندی کامل نیست',
+        'body'     => implode("\n", array_merge($issues, $notes)),
+        'endpoint' => $endpoint,
+        'amount'   => 0,
     ];
 }
 
@@ -20544,7 +21388,7 @@ function payments_poll(): int
 {
     $settled = 0;
     $rows = DB::all("SELECT * FROM payments WHERE status='unpaid' "
-        . "AND method IN ('trx','plisio','nowpayment') AND authority<>'' "
+        . "AND method IN ('trx','plisio','nowpayment','tetrapay') AND authority<>'' "
         . 'ORDER BY id LIMIT 15');
     foreach ($rows as $row) {
         try {
@@ -20552,6 +21396,7 @@ function payments_poll(): int
                 'trx'        => pay_trx_verify($row),
                 'plisio'     => pay_plisio_status($row),
                 'nowpayment' => pay_nowpay_status($row),
+                'tetrapay'   => pay_tetrapay_verify($row),
                 default      => ['ok' => false, 'state' => 'waiting'],
             };
         } catch (Throwable $ex) {
@@ -20568,7 +21413,7 @@ function payments_poll(): int
 /*
    22) WEB ENDPOINT — کال‌بک درگاه‌ها (php -S):
        /pay/zarinpal · /pay/aqayepardakht · /pay/iranpay1|2|4 ·
-       /pay/nowpayment (IPN) · /pay/plisio · /pay/variza + webhook · /pay/trx
+       /pay/nowpayment (IPN) · /pay/plisio · /pay/variza + webhook · /pay/tetrapay + webhook · /pay/trx
 */
 
 function web_input(): array
@@ -20661,6 +21506,18 @@ function web_handle(): void
         return;
     }
 
+    /* وب‌هوک امضاشدهٔ تتراپی؛ قبل از هر پردازش، HMAC و محیط sandbox بررسی می‌شود. */
+    if ($gw === 'tetrapay/webhook') {
+        $signature = web_header('X-TetraPay-Signature');
+        if ($signature === '') {
+            $signature = web_header('X-Webhook-Signature'); // سازگاری پراکسی‌های قدیمی
+        }
+        $result = pay_tetrapay_webhook($input['json'], $input['raw'], $signature,
+            web_header('X-TetraPay-Sandbox'));
+        web_json((int) ($result['code'] ?? 200), ['status' => $result['text'] ?? 'ok']);
+        return;
+    }
+
     if (!isset(PAY_GATEWAYS[$gw])) {
         web_status(404);
         web_html(pay_result_page('notfound'));
@@ -20686,7 +21543,8 @@ function web_handle(): void
     /* ── بازگشت کاربر از درگاه: پیدا کردن پرداخت ──────────────────────── */
     $payment = null;
     $authority = (string) ($input['get']['Authority'] ?? $input['get']['authority']
-        ?? $input['post']['authority'] ?? $input['get']['txn_id'] ?? '');
+        ?? $input['post']['authority'] ?? $input['get']['token'] ?? $input['post']['token']
+        ?? $input['get']['txn_id'] ?? '');
     if ($authority !== '') {
         $payment = pay_find_by_authority($authority);
     }
@@ -20736,6 +21594,7 @@ function web_handle(): void
             'iranpay1'      => pay_floypay_verify($payment, $input['json'] + $input['get'] + $input['post']),
             'iranpay2'      => pay_cubepay_verify($payment, $input['json'] + $input['get'] + $input['post']),
             'iranpay4'      => pay_abanpay_verify($payment, $input['get'] + $input['post']),
+            'tetrapay'      => pay_tetrapay_verify($payment, $input['get'] + $input['post']),
             'plisio'        => pay_plisio_status($payment),
             'nowpayment'    => pay_nowpay_status($payment),
             'variza'        => ['ok' => false, 'state' => 'waiting',
@@ -20932,8 +21791,9 @@ function screen_pay_gateway(int|string $chat, ?int $messageId, string $gw): void
             : ($state['on'] ? '🟢 روشن' : '🔴 خاموش')) . "\n";
     if ($gw !== 'wallet' && $gw !== 'card' && $gw !== 'stars') {
         $text .= 'کلید: <code>' . e($mask($key)) . "</code>\n";
-        if (in_array($gw, ['iranpay4', 'iranpay2', 'variza', 'trx', 'nowpayment'], true)) {
-            $labels2 = ['iranpay4' => 'آدرس درگاه', 'nowpayment' => 'IPN secret'];
+        if (in_array($gw, ['iranpay4', 'iranpay2', 'variza', 'trx', 'nowpayment', 'tetrapay'], true)) {
+            $labels2 = ['iranpay4' => 'آدرس درگاه', 'nowpayment' => 'IPN secret',
+                        'tetrapay' => 'کلید وب‌هوک (اختیاری)'];
             $text .= ($labels2[$gw] ?? 'کلید دوم') . ': ' . e($mask($key2)) . "\n";
         }
         if (gw_is_fiat($gw)) {
@@ -20948,8 +21808,14 @@ function screen_pay_gateway(int|string $chat, ?int $messageId, string $gw): void
         $text .= 'محدوده: ' . money(gw_min($gw)) . ' تا ' . money(gw_max($gw)) . "\n"
             . 'کش‌بک: ' . (string) gw_cashback($gw) . "٪\n"
             . '🌐 آدرس سرویس: <code>'
-            . e(gw_endpoint($gw, gw_endpoint_default($gw)) !== ''
-                ? gw_endpoint($gw, gw_endpoint_default($gw)) : 'ثبت نشده') . "</code>\n";
+            . e($gw === 'tetrapay' ? tetrapay_base_url() :
+                (gw_endpoint($gw, gw_endpoint_default($gw)) !== ''
+                    ? gw_endpoint($gw, gw_endpoint_default($gw)) : 'ثبت نشده')) . "</code>\n";
+        if ($gw === 'tetrapay') {
+            $text .= 'محیط: ' . (tetrapay_sandbox() ? '🟡 سندباکس (بدون پول واقعی)' : '🟢 تولید') . "\n"
+                . 'کال‌بک: <code>' . e(tetrapay_callback_url() ?: 'دامنهٔ HTTPS تنظیم نشده') . "</code>\n"
+                . 'وب‌هوک: <code>' . e(tetrapay_webhook_url() ?: 'اختیاری / تنظیم نشده') . "</code>\n";
+        }
     }
     if ($gw === 'card') {
         /* فقط تنظیم‌های لازم؛ بدون کلید خام */
@@ -20975,16 +21841,21 @@ function screen_pay_gateway(int|string $chat, ?int $messageId, string $gw): void
     }
     if ($gw !== 'wallet' && $gw !== 'card' && $gw !== 'stars') {
         $rows[] = [btn('🔑 کلید', 'ad:pay:' . $gw . ':key')];
-        if (in_array($gw, ['iranpay4', 'iranpay2', 'variza', 'trx', 'nowpayment'], true)) {
+        if (in_array($gw, ['iranpay4', 'iranpay2', 'variza', 'trx', 'nowpayment', 'tetrapay'], true)) {
             $rows[] = [btn($gw === 'iranpay4' ? '🌐 آدرس درگاه'
-                : ($gw === 'nowpayment' ? '🔐 IPN secret' : '🔐 کلید دوم'),
+                : ($gw === 'nowpayment' ? '🔐 IPN secret'
+                : ($gw === 'tetrapay' ? '🔐 کلید وب‌هوک (اختیاری)' : '🔐 کلید دوم')),
                 'ad:pay:' . $gw . ':key2')];
+        }
+        if ($gw === 'tetrapay') {
+            $rows[] = [btn(tetrapay_sandbox() ? '🟡 خروج از سندباکس' : '🧪 فعال‌سازی سندباکس',
+                'ad:pay:tetrapay:sandbox', null, tetrapay_sandbox() ? 'danger' : 'primary')];
         }
         if (gw_is_fiat($gw)) {
             $rows[] = [btn('📉 حداقل دلاری درگاه', 'ad:pay:' . $gw . ':minfiat')];
         }
         $rows[] = [btn('🌐 آدرس سرویس', 'ad:pay:' . $gw . ':endpoint')];
-        $rows[] = [btn('🧪 تست زندهٔ درگاه', 'ad:pay:' . $gw . ':test', null, 'success')];
+        $rows[] = [btn('🛡 بررسی امن پیکربندی', 'ad:pay:' . $gw . ':test', null, 'success')];
         $rows[] = [btn('⬇️ حداقل', 'ad:pay:' . $gw . ':min'),
                    btn('⬆️ حداکثر', 'ad:pay:' . $gw . ':max')];
         $rows[] = [btn('🎁 کش‌بک ٪', 'ad:pay:' . $gw . ':cashback')];
@@ -21014,6 +21885,7 @@ function screen_pay_web(int|string $chat, ?int $messageId): void
         . "<code>https://panel.example.com</code>\n\n"
         . 'کال‌بک هر درگاه می‌شود: <code>آدرس/pay/نام‌درگاه</code>' . "\n"
         . 'وبهوک واریزا: <code>آدرس/pay/variza/webhook</code>' . "\n"
+        . 'وب‌هوک تتراپی: <code>آدرس/pay/tetrapay/webhook</code>' . "\n"
         . 'IPN نواپی‌منت: <code>آدرس/pay/nowpayment</code>';
     Tg::show($chat, $messageId, $text, [
         [btn('✏️ تغییر آدرس', 'ad:set:web_url', null, 'success')],

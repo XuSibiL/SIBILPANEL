@@ -386,23 +386,29 @@ function handle_message_inner(array $message): void
             }
             $count = (int) $count;
             $unit = panel_unlimited_user_price($panel);
-            $price = $count * $unit;
+            /* A capacity extension buys exactly its own first hourly period; the
+               fixed panel component is never charged again here. */
+            $hourly = panel_is_hourly_unlimited($panel);
+            $price = panel_unlimited_users_hourly_total($panel, $count);
             State::clear($uid);
             $order = create_order($uid, 'users', $price, (int) ($panel['product_id'] ?? 0), [
                 'panel_id' => $panelId,
                 'block' => $count, // سازگاری با فیلد قدیمی؛ شاخهٔ تحویل با unlimited_users تشخیص می‌دهد.
                 'sale_type' => PRODUCT_SALE_UNLIMITED_USERS,
                 'unlimited_users' => true,
+                'unlimited_billing_mode' => $hourly ? UNLIMITED_BILLING_HOURLY : UNLIMITED_BILLING_LEGACY,
                 'user_count' => $count,
                 'per_user_price' => $unit,
                 'min_users' => panel_unlimited_min_users($panel),
             ]);
-            Tg::send($chatId,
-                invoice_text($order, 'افزودن کاربر به پنل نامحدود',
-                    '📦 پنل <code>' . e((string) $panel['panel_username']) . "</code>\n"
-                    . '👥 تعداد کاربر: <b>' . fa_digits($count) . "</b>\n"
-                    . '💵 ' . fa_digits($count) . ' × ' . money($unit) . ' = <b>'
-                        . money($price) . '</b>'),
+            $detail = '📦 پنل <code>' . e((string) $panel['panel_username']) . "</code>\n"
+                . '👥 تعداد کاربر: <b>' . fa_digits($count) . "</b>\n"
+                . '💵 ' . fa_digits($count) . ' × ' . money($unit) . ' = <b>'
+                    . money($price) . '</b>';
+            if ($hourly) {
+                $detail .= "\n<i>این مبلغ ساعت اولِ کاربران تازه است؛ از ساعت بعد نرخ آن‌ها ساعتی از کیف پول کم می‌شود.</i>";
+            }
+            Tg::send($chatId, invoice_text($order, 'افزودن کاربر به پنل نامحدود', $detail),
                 invoice_kb($order, $uid));
             return;
 

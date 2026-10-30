@@ -23,6 +23,8 @@ const PAY_GATEWAYS = [
                         'hint' => 'توکن Bearer از cubevps.ir (همان کلید، امضای کال‌بک را می‌سازد).'],
     'iranpay4'      => ['label' => 'AbanPay', 'emoji' => '🟠', 'type' => 'online',
                         'hint' => 'API key + آدرس سرویس درگاه (https).'],
+    'tetrapay'      => ['label' => 'تتراپی', 'emoji' => '🔷', 'type' => 'online',
+                        'hint' => 'کلید API تتراپی + کلید اختیاری وب‌هوک؛ مبلغ‌ها خودکار از تومان به ریال تبدیل می‌شوند.'],
     'nowpayment'    => ['label' => 'NowPayments', 'emoji' => '₿', 'type' => 'crypto',
                         'hint' => 'x-api-key از nowpayments.io + IPN secret.'],
     'plisio'        => ['label' => 'Plisio', 'emoji' => '🪙', 'type' => 'crypto',
@@ -49,6 +51,7 @@ function pay_setting_defaults(): array
         /* اعداد پیش‌فرض درگاه‌ها */
         $minMax = [
             'card'       => ['20000', '10000000'],
+            'tetrapay'   => ['20000', '1000000'],
             'nowpayment' => ['250000', '1000000'],
             'plisio'     => ['250000', '100000000'],
             'stars'      => ['20000', '1000000'],
@@ -60,6 +63,8 @@ function pay_setting_defaults(): array
             $defaults["pay_{$id}_min_fiat"] = '0';    // ۰ = حداقل را از خود درگاه می‌خوانیم
         }
     }
+    /* محیط آزمایشی تتراپی فقط با انتخاب صریح مدیر فعال می‌شود؛ هرگز پیش‌فرض نیست. */
+    $defaults['pay_tetrapay_sandbox'] = '0';
     $defaults['swap_api_key'] = '';
     $defaults['usd_toman_rate'] = '0';                // فقط نرخ پشتیبان، وقتی سواپ‌ولت در دسترس نیست
     return $defaults;
@@ -95,6 +100,12 @@ function gw_key(string $gw): string
 function gw_key2(string $gw): string
 {
     return trim(set_get("pay_{$gw}_key2", ''));
+}
+
+/** تتراپی فقط با انتخاب صریح مدیر روی سندباکس می‌رود؛ کلید و وب‌هوک همان کلیدهای درگاه‌اند. */
+function tetrapay_sandbox(): bool
+{
+    return set_get('pay_tetrapay_sandbox', '0') === '1';
 }
 
 function gw_min(string $gw): int
@@ -191,6 +202,70 @@ function pay_find_by_authority(string $authority): ?array
         . 'ORDER BY id DESC LIMIT 1', [$authority]);
 }
 
+/** پیام استاندارد بعد از ساخت لینک؛ این پیام عمداً از شارژ شدن کیف پول حرف نمی‌زند. */
+function pay_created_notice(array $order, array $payment): string
+{
+    $gateway = PAY_GATEWAYS[(string) ($payment['method'] ?? '')]['label']
+        ?? (string) ($payment['method'] ?? '—');
+    $tracking = trim((string) ($payment['authority'] ?? ''));
+    if ($tracking === '') {
+        $tracking = (string) ($order['ref'] ?? '—');
+    }
+    $minutes = max(1, set_int('pay_expire_minutes', 30));
+    $support = support_username();
+    $supportLine = $support !== '' ? "
+☎️ پشتیبانی: @" . e($support) : '';
+    return '🏧 <b>تراکنش جدید در ' . e(bot_name()) . "</b>
+
+"
+        . '🧾 کد سفارش: <code>' . e((string) ($order['ref'] ?? '—')) . "</code>
+"
+        . '🔢 کد رهگیری: <code>' . e($tracking) . "</code>
+"
+        . '💳 روش پرداخت: ' . e($gateway) . "
+"
+        . '💰 مبلغ: <b>' . money((int) ($payment['amount'] ?? $order['payable'] ?? 0)) . "</b>
+"
+        . '⌛ مهلت پرداخت: ' . fa_digits($minutes) . " دقیقه
+
+"
+        . '⚠️ وضعیت: <b>در انتظار پرداخت و تأیید قطعی درگاه</b>' . "
+"
+        . '<i>تا قبل از Verify/Webhook معتبر، هیچ مبلغی به کیف پول اضافه نمی‌شود.</i>'
+        . $supportLine;
+}
+
+/** پیام تأیید نهایی فقط پس از پاسخ معتبر Verify/Webhook و تحویل موفق سفارش. */
+function pay_verified_notice(array $order, array $payment, string $deliveryText): string
+{
+    $gateway = PAY_GATEWAYS[(string) ($payment['method'] ?? '')]['label']
+        ?? (string) ($payment['method'] ?? '—');
+    $ref = trim((string) ($payment['ref'] ?? ''));
+    if ($ref === '') {
+        $ref = trim((string) ($payment['authority'] ?? ''));
+    }
+    $body = '✅ <b>پرداخت با موفقیت و به‌صورت قطعی تأیید شد</b>' . "
+
+"
+        . '🏧 ربات: <b>' . e(bot_name()) . "</b>
+"
+        . '🧾 کد سفارش: <code>' . e((string) ($order['ref'] ?? '—')) . "</code>
+"
+        . '🔢 کد رهگیری: <code>' . e($ref !== '' ? $ref : '—') . "</code>
+"
+        . '💳 روش پرداخت: ' . e($gateway) . "
+"
+        . '💰 مبلغ تأییدشده: <b>' . money((int) ($payment['amount'] ?? 0)) . "</b>
+
+";
+    if ((string) ($order['kind'] ?? '') === 'topup') {
+        $body .= '👛 <b>شارژ کیف پول پس از تأیید قطعی انجام شد.</b>' . "
+
+";
+    }
+    return $body . $deliveryText;
+}
+
 /**
  * تسویهٔ نهایی یک پرداخت (idempotent).
  * خروجی: ['ok' => bool, 'state' => success|already|notfound|failed, 'text' => پیام]
@@ -215,10 +290,14 @@ function pay_settle(int $paymentId, string $ref = '', array $extra = [], bool $f
     if ($order === null) {
         return ['ok' => false, 'state' => 'notfound', 'text' => 'سفارش پیدا نشد'];
     }
-    // قفل اتمی: فقط یک درخواست برنده می‌شود
+    // قفل اتمی: فقط یک درخواست برنده می‌شود. متادیتای ساخت فاکتور را نگه
+    // می‌داریم و پاسخ Verify را جداگانه ثبت می‌کنیم؛ حذف آن، verify/idempotency
+    // بعدی (به‌ویژه برای تتراپی) را کور می‌کرد.
+    $settledMeta = pay_meta($payment);
+    $settledMeta['verify'] = $extra;
     $changed = DB::update("UPDATE payments SET status='paid', ref=?, paid_at=?, payload=? "
         . "WHERE id=? AND status<>'paid'",
-        [$ref, now_ts(), json_encode($extra, JSON_UNESCAPED_UNICODE), $paymentId]);
+        [$ref, now_ts(), json_encode($settledMeta, JSON_UNESCAPED_UNICODE), $paymentId]);
     if ($changed === 0) {
         return ['ok' => true, 'state' => 'already', 'text' => 'قبلاً تأیید شده است'];
     }
@@ -230,7 +309,18 @@ function pay_settle(int $paymentId, string $ref = '', array $extra = [], bool $f
     [$ok, $text] = settle_payment($order, (string) $payment['method']);
     $tgId = (int) $payment['tg_id'];
 
-    /* کش‌بک درگاه */
+    /* پرداخت ممکن است در Verify قطعی شود ولی ساخت پنل/تحویلش خطا دهد.
+       در این حالت هیچ پیام «شارژ شد» یا کش‌بکِ زودرس نمی‌فرستیم. */
+    if (!$ok) {
+        Tg::send($tgId, '⚠️ <b>پرداخت تأیید شد، اما انجام سفارش نیاز به بررسی دارد</b>' . "\n\n"
+            . 'کد سفارش: <code>' . e((string) $order['ref']) . "</code>\n"
+            . 'هنوز پیام موفقیت یا شارژ کیف پول صادر نشده است. لطفاً با پشتیبانی هماهنگ کنید.');
+        post_report('⚠️ <b>پرداخت تأیید شد ولی تحویل ناموفق بود</b>' . "\n"
+            . 'کاربر <code>' . $tgId . '</code> · سفارش <code>' . e((string) $order['ref']) . '</code>', 'payment');
+        return ['ok' => false, 'state' => 'waiting', 'text' => $text];
+    }
+
+    /* کش‌بک فقط وقتی سفارش واقعاً تحویل/شارژ شد اضافه می‌شود. */
     $cashbackPercent = gw_cashback((string) $payment['method']);
     if ($cashbackPercent > 0) {
         $reward = intdiv((int) $payment['amount'] * $cashbackPercent, 100);
@@ -240,12 +330,13 @@ function pay_settle(int $paymentId, string $ref = '', array $extra = [], bool $f
             Tg::send($tgId, '🎁 ' . money($reward) . ' کش‌بک پرداخت به کیف پولتان اضافه شد.');
         }
     }
-    Tg::send($tgId, $text, home_kb($tgId));
+    $paidRow = pay_get($paymentId) ?? $payment;
+    Tg::send($tgId, pay_verified_notice($order, $paidRow, $text), home_kb($tgId));
     $gwLabel = PAY_GATEWAYS[(string) $payment['method']]['label'] ?? $payment['method'];
     post_report('💰 <b>پرداخت موفق</b>' . "\n" . 'درگاه: ' . e($gwLabel) . "\n"
         . 'کاربر <code>' . $tgId . '</code> · ' . money((int) $payment['amount']) . "\n"
         . 'سفارش <code>' . e((string) $order['ref']) . '</code>');
-    return ['ok' => $ok, 'state' => 'success', 'text' => $text];
+    return ['ok' => true, 'state' => 'success', 'text' => $text];
 }
 
 /** صفحهٔ نتیجهٔ پرداخت — ساده و بدون فونت بیرونی */
@@ -321,6 +412,19 @@ function pay_start(array $order, string $gw): array
     if ($gw === 'stars') {
         return pay_stars($order);
     }
+    /* لمس دوبارهٔ دکمه نباید برای یک سفارش چند فاکتور درگاه بسازد. */
+    $existing = DB::one("SELECT * FROM payments WHERE order_id=? AND method=? AND status='unpaid' "
+        . "AND authority<>'' ORDER BY id DESC LIMIT 1", [(int) $order['id'], $gw]);
+    if ($existing !== null) {
+        $existingMeta = pay_meta($existing);
+        $existingUrl = trim((string) ($existingMeta['checkout_url'] ?? ''));
+        if (preg_match('~^https://~i', $existingUrl) === 1) {
+            return ['ok' => true, 'url' => $existingUrl,
+                    'alt_url' => (string) ($existingMeta['telegram_checkout_url'] ?? ''),
+                    'text' => PAY_GATEWAYS[$gw]['label'] ?? $gw,
+                    'payment' => (int) $existing['id'], 'reused' => true];
+        }
+    }
     $payment = pay_new($order, $gw, $amount);
     if (!$payment) {
         return ['ok' => false, 'url' => '', 'text' => 'ثبت پرداخت ناموفق بود'];
@@ -333,6 +437,7 @@ function pay_start(array $order, string $gw): array
         'iranpay1'      => pay_floypay_create($payment, $order),
         'iranpay2'      => pay_cubepay_create($payment, $order),
         'iranpay4'      => pay_abanpay_create($payment, $order),
+        'tetrapay'      => pay_tetrapay_create($payment, $order),
         'nowpayment'    => pay_nowpay_create($payment, $order),
         'plisio'        => pay_plisio_create($payment, $order),
         'variza'        => pay_variza_create($payment, $order),
@@ -346,6 +451,17 @@ function pay_start(array $order, string $gw): array
         if ($raw !== '' && preg_match('/min|low|small|کم/i', $raw) === 1) {
             $created['text'] = gw_min_from_provider_text($gw, $amount, $raw);
         }
+    }
+    if (($created['ok'] ?? false) === true && ($created['url'] ?? '') !== '') {
+        /* URL را محلی نگه می‌داریم تا لمس دوبارهٔ دکمه همان فاکتور باز را باز کند. */
+        $fresh = pay_get((int) $payment['id']) ?? $payment;
+        $meta = pay_meta($fresh);
+        $meta['checkout_url'] = (string) $created['url'];
+        if (!empty($created['alt_url']) && preg_match('~^https://~i', (string) $created['alt_url']) === 1) {
+            $meta['telegram_checkout_url'] = (string) $created['alt_url'];
+        }
+        pay_save_meta((int) $payment['id'], $meta);
+        $created['payment'] = (int) $payment['id'];
     }
     return $created;
 }
@@ -715,6 +831,9 @@ function gw_endpoint_default(string $gw): string
         'iranpay1'      => 'https://tetra98.com',            // FloyPay
         'iranpay2'      => 'https://cubevps.ir',             // CubePay
         'iranpay4'      => '',                               // AbanPay: سرویس خودتان
+        'tetrapay'      => tetrapay_sandbox()
+            ? 'https://api.sandbox.tetra98.com/api/v1'
+            : 'https://api.tetra98.com/api/v1',
         'nowpayment'    => 'https://api.nowpayments.io',
         'plisio'        => 'https://api.plisio.net',
         'variza'        => 'https://variza.ir',
@@ -1135,6 +1254,266 @@ function pay_abanpay_verify(array $payment, array $params): array
     return pay_accept($payment, $paid > 0 ? $paid : (float) $payment['amount'], $orderRef, $res);
 }
 
+/* تتراپی v1 ───────────────────────────────────────────────────────────── */
+
+/**
+ * این درگاه در API مبلغ ریالی می‌گیرد، ولی همهٔ مبلغ‌های داخلی SIBIL تومان‌اند.
+ * URL ایجادکننده و محیط (تولید/سندباکس) همراه همان پرداخت snapshot می‌شوند تا
+ * تغییر بعدی تنظیمات، verify یک فاکتور قدیمی را به محیط دیگری نفرستد.
+ */
+function tetrapay_base_url(?bool $sandbox = null): string
+{
+    $sandbox = $sandbox ?? tetrapay_sandbox();
+    $custom = trim(set_get('pay_tetrapay_endpoint', ''));
+    if ($custom !== '' && preg_match('~^https://[^\s/?#]+(?:/[^\s?#]*)?$~i', $custom) === 1) {
+        return rtrim($custom, '/');
+    }
+    return $sandbox
+        ? 'https://api.sandbox.tetra98.com/api/v1'
+        : 'https://api.tetra98.com/api/v1';
+}
+
+/** فقط HTTPS دامنهٔ خود ربات برای callback قابل قبول است. */
+function tetrapay_callback_url(): string
+{
+    $url = pay_callback_url('tetrapay');
+    $parts = parse_url($url);
+    if (!is_array($parts) || strtolower((string) ($parts['scheme'] ?? '')) !== 'https'
+        || empty($parts['host']) || isset($parts['user']) || isset($parts['pass'])) {
+        return '';
+    }
+    return $url;
+}
+
+function tetrapay_webhook_url(): string
+{
+    if (gw_key2('tetrapay') === '') {
+        return '';
+    }
+    $base = web_base();
+    $parts = parse_url($base);
+    if (!is_array($parts) || strtolower((string) ($parts['scheme'] ?? '')) !== 'https'
+        || empty($parts['host']) || isset($parts['user']) || isset($parts['pass'])) {
+        return '';
+    }
+    return rtrim($base, '/') . '/pay/tetrapay/webhook';
+}
+
+function tetrapay_external_order_id(array $order, array $payment): string
+{
+    $ref = preg_replace('/[^A-Za-z0-9_-]/', '', (string) ($order['ref'] ?? '')) ?: 'order';
+    return mb_substr('sibil-' . $ref . '-' . (int) ($payment['id'] ?? 0), 0, 80);
+}
+
+function tetrapay_error(array $res, string $fallback = 'ساخت لینک تتراپی انجام نشد.'): string
+{
+    $error = is_array($res['error'] ?? null) ? $res['error'] : [];
+    $code = strtoupper(trim((string) ($error['code'] ?? '')));
+    $retry = max(0, (int) ($error['retryAfter'] ?? 0));
+    return match ($code) {
+        'UNAUTHORIZED' => 'کلید API تتراپی پذیرفته نشد یا باطل شده است.',
+        'GATEWAY_SUSPENDED' => 'درگاه تتراپی در پنل پذیرنده غیرفعال یا تعلیق شده است.',
+        'NO_METHOD_AVAILABLE' => 'هیچ روش پرداخت فعالی در پنل تتراپی روشن نیست.',
+        'INVALID_CALLBACK' => 'آدرس HTTPS بازگشت درگاه تتراپی پذیرفته نشد.',
+        'INVALID_WEBHOOK', 'WEBHOOK_NOT_CONFIGURED' => 'کلید یا آدرس وب‌هوک تتراپی پذیرفته نشد.',
+        'AMOUNT_OUT_OF_RANGE' => 'مبلغ خارج از بازهٔ مجاز تتراپی است.',
+        'SANDBOX_DISABLED' => 'سندباکس تتراپی در پنل پذیرنده روشن نیست.',
+        'RATE_LIMITED' => $retry > 0
+            ? 'تعداد درخواست‌های تتراپی زیاد است؛ ' . $retry . ' ثانیه دیگر دوباره تلاش کنید.'
+            : 'تعداد درخواست‌های تتراپی موقتاً زیاد است؛ کمی بعد دوباره تلاش کنید.',
+        'DAILY_LIMIT_REACHED' => 'سقف روزانهٔ درگاه تتراپی پر شده است.',
+        default => ($code !== '' ? 'تتراپی: ' . $code : pay_error_text($res, $fallback)),
+    };
+}
+
+function tetrapay_data(array $res): array
+{
+    return is_array($res['data'] ?? null) ? $res['data'] : $res;
+}
+
+function tetrapay_rial(int $toman): int
+{
+    return $toman > 0 && $toman <= intdiv(PHP_INT_MAX, 10) ? $toman * 10 : 0;
+}
+
+function tetrapay_same_amount(mixed $actual, int $expectedRial): bool
+{
+    $actual = trim((string) $actual);
+    if ($expectedRial <= 0 || preg_match('/^\d+$/', $actual) !== 1) {
+        return false;
+    }
+    return ltrim($actual, '0') === (string) $expectedRial
+        || ($expectedRial === 0 && $actual === '0');
+}
+
+function pay_tetrapay_create(array $payment, array $order): array
+{
+    if (gw_key('tetrapay') === '') {
+        return ['ok' => false, 'url' => '', 'text' => 'کلید API تتراپی ثبت نشده است.'];
+    }
+    $callback = tetrapay_callback_url();
+    if ($callback === '') {
+        return ['ok' => false, 'url' => '', 'text' => 'برای تتراپی باید «آدرس وب و کال‌بک» یک دامنهٔ HTTPS معتبر باشد.'];
+    }
+    $amountRial = tetrapay_rial((int) ($payment['amount'] ?? 0));
+    if ($amountRial <= 0) {
+        return ['ok' => false, 'url' => '', 'text' => 'مبلغ پرداخت تتراپی معتبر نیست.'];
+    }
+    $sandbox = tetrapay_sandbox();
+    $base = tetrapay_base_url($sandbox);
+    $externalOrder = tetrapay_external_order_id($order, $payment);
+    $meta = pay_meta($payment);
+    $meta['tetrapay_order_id'] = $externalOrder;
+    $meta['tetrapay_amount_rial'] = (string) $amountRial;
+    $meta['tetrapay_sandbox'] = $sandbox ? 1 : 0;
+    $meta['tetrapay_endpoint'] = $base;
+    $meta['tetrapay_callback'] = $callback;
+    pay_save_meta((int) $payment['id'], $meta);
+
+    $body = [
+        'amount'       => (string) $amountRial,
+        'order_id'     => $externalOrder,
+        'callback_url' => $callback,
+        'description'  => 'SIBIL order ' . (string) ($order['ref'] ?? ''),
+        'allow_partial' => false,
+    ];
+    $webhook = tetrapay_webhook_url();
+    if ($webhook !== '') {
+        $body['webhook_url'] = $webhook;
+    }
+    $res = pay_json_post($base . '/payments', $body,
+        ['Authorization: Bearer ' . gw_key('tetrapay')]);
+    $data = tetrapay_data($res);
+    $token = trim((string) ($data['token'] ?? ''));
+    $url = trim((string) ($data['payment_url'] ?? ''));
+    $botUrl = trim((string) ($data['bot_payment_url'] ?? ''));
+    if (preg_match('/^[A-Za-z0-9_-]{6,191}$/', $token) !== 1
+        || preg_match('~^https://~i', $url) !== 1) {
+        return ['ok' => false, 'url' => '', 'text' => tetrapay_error($res)];
+    }
+    pay_set_authority((int) $payment['id'], $token, $res);
+    $fresh = pay_get((int) $payment['id']) ?? $payment;
+    $meta = pay_meta($fresh);
+    $meta['checkout_url'] = $url;
+    if (preg_match('~^https://~i', $botUrl) === 1) {
+        $meta['telegram_checkout_url'] = $botUrl;
+    }
+    pay_save_meta((int) $payment['id'], $meta);
+    return ['ok' => true, 'url' => $url, 'alt_url' => $meta['telegram_checkout_url'] ?? '',
+            'text' => 'تتراپی', 'payment' => (int) $payment['id']];
+}
+
+function pay_tetrapay_verify(array $payment, array $params = []): array
+{
+    $token = trim((string) ($params['token'] ?? $params['Token'] ?? $payment['authority'] ?? ''));
+    if ($token === '' || !hash_equals((string) ($payment['authority'] ?? ''), $token)) {
+        return ['ok' => false, 'state' => 'notfound', 'text' => 'توکن تتراپی با پرداخت ربات مطابقت ندارد.'];
+    }
+    $meta = pay_meta($payment);
+    $sandbox = !empty($meta['tetrapay_sandbox']);
+    $base = trim((string) ($meta['tetrapay_endpoint'] ?? ''));
+    if (preg_match('~^https://~i', $base) !== 1) {
+        $base = tetrapay_base_url($sandbox);
+    }
+    $res = pay_json_post(rtrim($base, '/') . '/payments/' . rawurlencode($token) . '/verify', [],
+        ['Authorization: Bearer ' . gw_key('tetrapay')]);
+    $data = tetrapay_data($res);
+    $state = strtolower(trim((string) ($data['status'] ?? '')));
+    if ($state === 'expired') {
+        DB::exec("UPDATE payments SET status='expire' WHERE id=? AND status='unpaid'", [(int) $payment['id']]);
+        return ['ok' => false, 'state' => 'expired', 'text' => 'لینک پرداخت تتراپی منقضی شده است.'];
+    }
+    if ($state !== 'paid') {
+        if ((int) ($res['_status'] ?? 0) >= 400) {
+            return ['ok' => false, 'state' => 'waiting', 'text' => tetrapay_error($res, 'استعلام تتراپی انجام نشد.')];
+        }
+        return ['ok' => false, 'state' => 'waiting', 'text' => 'پرداخت تتراپی هنوز تأیید نشده است.'];
+    }
+    $expectedOrder = (string) ($meta['tetrapay_order_id'] ?? '');
+    $expectedRial = (int) ($meta['tetrapay_amount_rial'] ?? tetrapay_rial((int) $payment['amount']));
+    if ($expectedOrder === '' || !hash_equals($expectedOrder, (string) ($data['order_id'] ?? ''))
+        || !tetrapay_same_amount($data['amount'] ?? '', $expectedRial)) {
+        log_payment('tetrapay verify mismatch', ['payment' => (int) $payment['id']]);
+        return ['ok' => false, 'state' => 'failed', 'text' => 'مبلغ یا شمارهٔ سفارش تتراپی با فاکتور مطابقت ندارد.'];
+    }
+    if (isset($data['received_amount']) && $data['received_amount'] !== null
+        && (string) $data['received_amount'] !== ''
+        && (!tetrapay_same_amount($data['received_amount'], $expectedRial))) {
+        return ['ok' => false, 'state' => 'failed', 'text' => 'پرداخت تتراپی ناقص است و شارژ نشد.'];
+    }
+    return pay_accept($payment, (float) ((int) $expectedRial / 10),
+        (string) ($data['transaction_id'] ?? $data['reference'] ?? $token), $res);
+}
+
+/** امضای وب‌هوک v1: X-TetraPay-Signature: t=unix,v1=HMAC_SHA256(t.raw_body). */
+function tetrapay_webhook_signature_ok(string $raw, string $signature, string $secret): bool
+{
+    if ($raw === '' || $signature === '' || $secret === '') {
+        return false;
+    }
+    $parts = [];
+    foreach (explode(',', $signature) as $piece) {
+        [$key, $value] = array_pad(explode('=', trim($piece), 2), 2, '');
+        if ($key !== '' && $value !== '') {
+            $parts[trim($key)] = trim($value);
+        }
+    }
+    $timestamp = (string) ($parts['t'] ?? '');
+    $given = strtolower((string) ($parts['v1'] ?? ''));
+    if (preg_match('/^\d+$/', $timestamp) !== 1 || preg_match('/^[a-f0-9]{64}$/', $given) !== 1
+        || abs(now_ts() - (int) $timestamp) > 300) {
+        return false;
+    }
+    return hash_equals(hash_hmac('sha256', $timestamp . '.' . $raw, $secret), $given);
+}
+
+function pay_tetrapay_webhook(array $body, string $raw, string $signature, string $sandboxHeader = ''): array
+{
+    $secret = gw_key2('tetrapay');
+    if ($secret === '') {
+        return ['ok' => false, 'code' => 500, 'text' => 'webhook not configured'];
+    }
+    if (!tetrapay_webhook_signature_ok($raw, $signature, $secret)) {
+        return ['ok' => false, 'code' => 403, 'text' => 'invalid signature'];
+    }
+    $event = is_array($body['data'] ?? null) ? ($body['data'] + $body) : $body;
+    $type = strtolower((string) ($event['event'] ?? $event['type'] ?? ''));
+    $state = strtolower((string) ($event['status'] ?? ''));
+    if ($type !== 'payment.paid' && $state !== 'paid') {
+        return ['ok' => true, 'code' => 200, 'text' => 'ignored'];
+    }
+    $token = trim((string) ($event['token'] ?? ''));
+    $payment = $token !== '' ? DB::one('SELECT * FROM payments WHERE authority=? AND method=? '
+        . 'ORDER BY id DESC LIMIT 1', [$token, 'tetrapay']) : null;
+    if ($payment === null) {
+        return ['ok' => false, 'code' => 404, 'text' => 'payment not found'];
+    }
+    if ((string) $payment['status'] === 'paid') {
+        return ['ok' => true, 'code' => 200, 'text' => 'already'];
+    }
+    if ((string) $payment['status'] !== 'unpaid') {
+        return ['ok' => false, 'code' => 409, 'text' => 'payment closed'];
+    }
+    $meta = pay_meta($payment);
+    $sandbox = !empty($event['sandbox']) || strtolower(trim($sandboxHeader)) === 'true';
+    if ($sandbox !== !empty($meta['tetrapay_sandbox'])) {
+        return ['ok' => false, 'code' => 400, 'text' => 'sandbox mismatch'];
+    }
+    $expectedOrder = (string) ($meta['tetrapay_order_id'] ?? '');
+    $expectedRial = (int) ($meta['tetrapay_amount_rial'] ?? tetrapay_rial((int) $payment['amount']));
+    if (($event['order_id'] ?? '') !== $expectedOrder
+        || !tetrapay_same_amount($event['amount'] ?? '', $expectedRial)) {
+        return ['ok' => false, 'code' => 400, 'text' => 'payment mismatch'];
+    }
+    /* وب‌هوک امضاشده سریع است، ولی نتیجه را یک بار دیگر از verify می‌خوانیم. */
+    $result = pay_tetrapay_verify($payment, ['token' => $token]);
+    $state = (string) ($result['state'] ?? 'waiting');
+    return ['ok' => (bool) ($result['ok'] ?? false),
+            'code' => ($result['ok'] ?? false) ? 200 : ($state === 'waiting' ? 500 : 400),
+            'text' => $state];
+}
+
+
 /* NowPayments ──────────────────────────────────────────────────────────── */
 
 function pay_nowpay_create(array $payment, array $order): array
@@ -1470,54 +1849,59 @@ function pay_trx_verify(array $payment): array
 }
 
 /**
- * تست زندهٔ یک درگاه: یک فاکتور واقعی با کمترین مبلغ مجاز می‌سازد و
- * پاسخ خام درگاه را برمی‌گرداند. هیچ ردیفی در دیتابیس ثبت نمی‌شود.
+ * بررسی امن پیکربندی درگاه.
+ *
+ * نسخه‌های پیشین برای «تست زنده» یک فاکتور واقعی می‌ساختند؛ این رفتار هم
+ * ناخواسته بود و هم می‌توانست سهمیه/تراکنش واقعی بسازد. این بررسی فقط
+ * تنظیمات محلی، URL و آدرس callback را می‌سنجد و هیچ درخواست پرداختی ارسال
+ * نمی‌کند. verify واقعی فقط از callback/webhook یک پرداختی که خود کاربر آغاز
+ * کرده اجرا می‌شود.
  */
 function gw_live_test(string $gw): array
 {
     if (!isset(PAY_GATEWAYS[$gw]) || in_array($gw, ['wallet', 'card', 'stars'], true)) {
         return ['ok' => false, 'title' => 'درگاه نامعتبر',
-                'body' => 'برای این نوع پرداخت تست خودکار وجود ندارد.'];
+                'body' => 'برای این نوع پرداخت بررسی خودکار لازم نیست.'];
     }
+    $issues = [];
+    $notes = [];
+    $endpoint = $gw === 'tetrapay' ? tetrapay_base_url()
+        : gw_endpoint($gw, gw_endpoint_default($gw));
     if (gw_key($gw) === '') {
-        return ['ok' => false, 'title' => 'کلید ثبت نشده',
-                'body' => 'اول کلید درگاه را وارد کن، بعد تست بگیرید.'];
-    }
-    if (gw_is_fiat($gw) && gw_min_fiat($gw) > 0) {
-        $amount = (int) ceil(gw_min_fiat($gw) * usd_toman_rate());
+        $issues[] = 'کلید درگاه ثبت نشده است.';
     } else {
-        $amount = max(gw_min($gw), 50000);
+        $notes[] = 'کلید درگاه ثبت شده است.';
     }
-    $order = ['id' => 0, 'ref' => 'TEST' . now_ts(), 'payable' => $amount,
-              'amount' => $amount, 'tg_id' => 0, 'kind' => 'topup'];
-    $payment = ['id' => 0, 'order_id' => 0, 'method' => $gw, 'amount' => $amount,
-                'authority' => 'TEST' . now_ts(), 'status' => 'unpaid',
-                'payload' => json_encode(['order_ref' => $order['ref'],
-                    'fiat_amount' => gw_is_fiat($gw) ? gw_fiat_amount($gw, $amount) : $amount])];
-    try {
-        $res = match ($gw) {
-            'zarinpal'      => pay_zarinpal_create($payment, $order),
-            'aqayepardakht' => pay_aqaye_create($payment, $order),
-            'iranpay1'      => pay_floypay_create($payment, $order),
-            'iranpay2'      => pay_cubepay_create($payment, $order),
-            'iranpay4'      => pay_abanpay_create($payment, $order),
-            'nowpayment'    => pay_nowpay_create($payment, $order),
-            'plisio'        => pay_plisio_create($payment, $order),
-            'variza'        => pay_variza_create($payment, $order),
-            'trx'           => pay_trx_create($payment, $order),
-            default         => ['ok' => false, 'text' => 'پشتیبانی نمی‌شود'],
-        };
-    } catch (Throwable $ex) {
-        return ['ok' => false, 'title' => 'خطای اجرای تست', 'body' => $ex->getMessage()];
+    if (preg_match('~^https://~i', $endpoint) !== 1) {
+        $issues[] = 'آدرس سرویس باید HTTPS معتبر باشد.';
+    } else {
+        $notes[] = 'آدرس HTTPS سرویس معتبر است.';
     }
-    $ok = (bool) ($res['ok'] ?? false);
+    $callback = pay_callback_url($gw);
+    $parts = parse_url($callback);
+    $callbackOk = is_array($parts) && strtolower((string) ($parts['scheme'] ?? '')) === 'https'
+        && !empty($parts['host']) && !isset($parts['user']) && !isset($parts['pass']);
+    if (!$callbackOk) {
+        $issues[] = 'آدرس وب ربات باید یک دامنهٔ HTTPS عمومی باشد تا callback درگاه کار کند.';
+    } else {
+        $notes[] = 'callback HTTPS آماده است: ' . $callback;
+    }
+    if ($gw === 'tetrapay') {
+        $notes[] = tetrapay_sandbox() ? 'محیط: سندباکس (بدون پول واقعی).' : 'محیط: تولید.';
+        if (gw_key2('tetrapay') === '') {
+            $notes[] = 'وب‌هوک اختیاری است؛ در نبود secret، بازگشت کاربر و poll سمت سرور Verify می‌شوند.';
+        } elseif (tetrapay_webhook_url() === '') {
+            $issues[] = 'کلید وب‌هوک ثبت شده اما دامنهٔ HTTPS برای وب‌هوک معتبر نیست.';
+        } else {
+            $notes[] = 'وب‌هوک امضاشده آماده است: ' . tetrapay_webhook_url();
+        }
+    }
     return [
-        'ok'    => $ok,
-        'title' => $ok ? 'درگاه سالم است' : 'درگاه پاسخ درست نداد',
-        'body'  => (string) ($res['text'] ?? ''),
-        'url'   => (string) ($res['url'] ?? ''),
-        'amount' => $amount,
-        'endpoint' => gw_endpoint($gw, gw_endpoint_default($gw)),
+        'ok'       => $issues === [],
+        'title'    => $issues === [] ? 'پیکربندی برای استفاده آماده است' : 'پیکربندی کامل نیست',
+        'body'     => implode("\n", array_merge($issues, $notes)),
+        'endpoint' => $endpoint,
+        'amount'   => 0,
     ];
 }
 
@@ -1717,7 +2101,7 @@ function payments_poll(): int
 {
     $settled = 0;
     $rows = DB::all("SELECT * FROM payments WHERE status='unpaid' "
-        . "AND method IN ('trx','plisio','nowpayment') AND authority<>'' "
+        . "AND method IN ('trx','plisio','nowpayment','tetrapay') AND authority<>'' "
         . 'ORDER BY id LIMIT 15');
     foreach ($rows as $row) {
         try {
@@ -1725,6 +2109,7 @@ function payments_poll(): int
                 'trx'        => pay_trx_verify($row),
                 'plisio'     => pay_plisio_status($row),
                 'nowpayment' => pay_nowpay_status($row),
+                'tetrapay'   => pay_tetrapay_verify($row),
                 default      => ['ok' => false, 'state' => 'waiting'],
             };
         } catch (Throwable $ex) {

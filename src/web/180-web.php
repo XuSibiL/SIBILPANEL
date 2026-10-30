@@ -4,7 +4,7 @@ declare(strict_types=1);
 /*
    22) WEB ENDPOINT — کال‌بک درگاه‌ها (php -S):
        /pay/zarinpal · /pay/aqayepardakht · /pay/iranpay1|2|4 ·
-       /pay/nowpayment (IPN) · /pay/plisio · /pay/variza + webhook · /pay/trx
+       /pay/nowpayment (IPN) · /pay/plisio · /pay/variza + webhook · /pay/tetrapay + webhook · /pay/trx
 */
 
 function web_input(): array
@@ -97,6 +97,18 @@ function web_handle(): void
         return;
     }
 
+    /* وب‌هوک امضاشدهٔ تتراپی؛ قبل از هر پردازش، HMAC و محیط sandbox بررسی می‌شود. */
+    if ($gw === 'tetrapay/webhook') {
+        $signature = web_header('X-TetraPay-Signature');
+        if ($signature === '') {
+            $signature = web_header('X-Webhook-Signature'); // سازگاری پراکسی‌های قدیمی
+        }
+        $result = pay_tetrapay_webhook($input['json'], $input['raw'], $signature,
+            web_header('X-TetraPay-Sandbox'));
+        web_json((int) ($result['code'] ?? 200), ['status' => $result['text'] ?? 'ok']);
+        return;
+    }
+
     if (!isset(PAY_GATEWAYS[$gw])) {
         web_status(404);
         web_html(pay_result_page('notfound'));
@@ -122,7 +134,8 @@ function web_handle(): void
     /* ── بازگشت کاربر از درگاه: پیدا کردن پرداخت ──────────────────────── */
     $payment = null;
     $authority = (string) ($input['get']['Authority'] ?? $input['get']['authority']
-        ?? $input['post']['authority'] ?? $input['get']['txn_id'] ?? '');
+        ?? $input['post']['authority'] ?? $input['get']['token'] ?? $input['post']['token']
+        ?? $input['get']['txn_id'] ?? '');
     if ($authority !== '') {
         $payment = pay_find_by_authority($authority);
     }
@@ -172,6 +185,7 @@ function web_handle(): void
             'iranpay1'      => pay_floypay_verify($payment, $input['json'] + $input['get'] + $input['post']),
             'iranpay2'      => pay_cubepay_verify($payment, $input['json'] + $input['get'] + $input['post']),
             'iranpay4'      => pay_abanpay_verify($payment, $input['get'] + $input['post']),
+            'tetrapay'      => pay_tetrapay_verify($payment, $input['get'] + $input['post']),
             'plisio'        => pay_plisio_status($payment),
             'nowpayment'    => pay_nowpay_status($payment),
             'variza'        => ['ok' => false, 'state' => 'waiting',

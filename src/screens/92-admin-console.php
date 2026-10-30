@@ -459,8 +459,14 @@ function screen_category(int|string $chat, ?int $messageId, int $catId): void
         $text .= ((int) $product['active'] === 1 ? '✅' : '⛔️') . ' ' . $product['emoji'] . ' <b>'
             . e($product['name']) . "</b>\n";
         if (product_is_unlimited($product)) {
-            $text .= '   ♾️ نامحدود · 💵 هر کاربر ' . money(unlimited_user_price($product))
-                . ' · 👥 حداقل ' . fa_digits(unlimited_min_users($product)) . "\n\n";
+            if (product_is_hourly_unlimited($product)) {
+                $text .= '   ♾️ ساعتی · 👤 ' . money(unlimited_user_price($product)) . '/ساعت'
+                    . ' · 🏷 ' . money(unlimited_fixed_hourly_price($product)) . '/ساعت'
+                    . ' · 👥 حداقل ' . fa_digits(unlimited_min_users($product)) . "\n\n";
+            } else {
+                $text .= '   ♾️ قدیمی · 💵 هر کاربر ' . money(unlimited_user_price($product))
+                    . ' · 👥 حداقل ' . fa_digits(unlimited_min_users($product)) . "\n\n";
+            }
         } else {
             $cap = (float) $product['data_cap_gb'] > 0
                 ? fa_digits((float) $product['data_cap_gb']) . 'GB' : 'نامحدود';
@@ -501,20 +507,32 @@ function screen_product_admin(int|string $chat, ?int $messageId, int $productId)
         . '🗂 دسته: ' . cat_label($cat) . ' · 🔌 پنل: '
         . e($panel['name'] ?? 'پیش‌فرض') . "\n\n";
     if (product_is_unlimited($product)) {
+        $hourlyUnlimited = product_is_hourly_unlimited($product);
         $text = $base
-            . '♾️ <b>نوع فروش: پنل نامحدود بر پایهٔ تعداد کاربر</b>' . "\n"
-            . '💵 قیمت هر کاربر: <b>' . money(unlimited_user_price($product)) . "</b>\n"
+            . '♾️ <b>نوع فروش: پنل نامحدود بر پایهٔ تعداد کاربر'
+                . ($hourlyUnlimited ? ' با صورتحساب ساعتی' : ' (روش قدیمی)') . '</b>' . "\n"
+            . ($hourlyUnlimited
+                ? ('💵 نرخ هر کاربر / ساعت: <b>' . money(unlimited_user_price($product)) . "</b>\n"
+                    . '🏷 اجارهٔ ثابت پنل / ساعت: <b>' . money(unlimited_fixed_hourly_price($product)) . "</b>\n"
+                    . '<i>ساعت اول با خرید پرداخت می‌شود؛ ادامهٔ سرویس ساعتی از کیف پول کسر می‌شود.</i>' . "\n")
+                : ('💵 قیمت هر کاربر: <b>' . money(unlimited_user_price($product)) . "</b>\n"
+                    . '<i>این محصول/فروش‌های قبلی با مدل پیش‌پرداخت حفظ شده‌اند.</i>' . "\n"))
             . '👥 حداقل تعداد کاربر در هر خرید/شارژ: <b>'
                 . fa_digits(unlimited_min_users($product)) . "</b>\n"
+            . '📱 دستگاهِ نمایش محصول: ' . fa_digits((int) ($product['device_limit'] ?? 0)) . "\n"
             . '🎭 نقش پنل: '
             . role_title((int) $product['panel_id'], (int) $product['role_id']) . "\n\n"
             . UNLIMITED_ROLE_GUIDE;
         $rows = [
-            [btn('💵 قیمت هر کاربر', "ad:pf:$productId:peruser"),
-             btn('👥 حداقل تعداد کاربر', "ad:pf:$productId:minusers")],
+            [btn($hourlyUnlimited ? '💵 نرخ ساعتی هر کاربر' : '💵 قیمت هر کاربر', "ad:pf:$productId:peruser"),
+             btn('🏷 اجارهٔ ثابت ساعتی', "ad:pf:$productId:hourly")],
+            [btn('👥 حداقل تعداد کاربر', "ad:pf:$productId:minusers"),
+             btn('📱 دستگاه', "ad:pf:$productId:devices")],
             [btn('✏️ نام', "ad:pf:$productId:name"), btn('🎨 ایموجی', "ad:pf:$productId:emoji")],
             [btn('🔌 پنل مقصد', "ad:prod:$productId:sp"),
              btn('🎭 نقش پنل', 'ad:rolep:' . $productId)],
+            ...($hourlyUnlimited ? [] : [[btn('⏱ فعال‌سازی مدل ساعتی (فقط فروش جدید)',
+                "ad:prod:$productId:hourlymode", null, 'success')]]),
             [btn((int) $product['active'] === 1 ? '🔴 خاموش کنید' : '🟢 روشن کنید',
                 "ad:prod:$productId:toggle", null, (int) $product['active'] === 1 ? 'danger' : 'success')],
             [btn('🗑 حذف محصول', "ad:prod:$productId:del", null, 'danger')],
@@ -561,9 +579,9 @@ function screen_product_admin(int|string $chat, ?int $messageId, int $productId)
 const PRODUCT_FIELDS = [
     'name'      => ['نام محصول', 'text', 'name'],
     'emoji'     => ['ایموجی', 'text', 'emoji'],
-    'hourly'    => ['اجارهٔ ساعتی پنل (تومان) — 0 = بدون اجاره', 'int', 'hourly_price'],
+    'hourly'    => ['اجارهٔ ثابت ساعتی پنل (تومان) — 0 = بدون اجارهٔ ثابت', 'int', 'hourly_price'],
     'pergb'     => ['قیمت هر گیگ مصرف (تومان)', 'int', 'per_gb_price'],
-    'peruser'   => ['قیمت هر کاربر پنل نامحدود (تومان)', 'int', 'per_user_price'],
+    'peruser'   => ['نرخ هر کاربر پنل نامحدود (تومان؛ برای مدل جدید در هر ساعت)', 'int', 'per_user_price'],
     'minusers'  => ['حداقل تعداد کاربر پنل نامحدود', 'int', 'min_users'],
     'minbal'    => ['حداقل موجودی کیف پول (تومان)', 'int', 'min_balance'],
     'users'     => ['سقف کاربر پنل', 'int', 'max_users'],

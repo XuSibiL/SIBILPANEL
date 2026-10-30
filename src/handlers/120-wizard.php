@@ -312,9 +312,11 @@ function wiz_finish(int $uid, array $data): void
                 return;
             }
             $perUser = (int) ($values['per_user_price'] ?? 0);
+            $fixedHourly = max(0, (int) ($values['hourly_price'] ?? 0));
+            $deviceLimit = max(0, (int) ($values['device_limit'] ?? 0));
             $minUsers = (int) ($values['min_users'] ?? 0);
             if ($perUser <= 0 || $minUsers < 1 || $minUsers > UNLIMITED_USERS_MAX) {
-                Tg::send($uid, '❌ قیمت هر کاربر باید بیشتر از صفر و حداقل تعداد کاربر معتبر باشد.',
+                Tg::send($uid, '❌ نرخ ساعتی هر کاربر باید بیشتر از صفر و حداقل تعداد کاربر معتبر باشد.',
                     [[btn('➕ محصول نامحدود', 'ad:cat:' . $catId . ':new:unlimited', null, 'success')]]);
                 return;
             }
@@ -325,20 +327,26 @@ function wiz_finish(int $uid, array $data): void
                     break;
                 }
             }
+            /* مدل جدید فقط برای محصول تازه فعال می‌شود. محصولات/پنل‌های قدیمی
+               عمداً legacy می‌مانند تا اقتصاد فروخته‌شده‌شان تغییر نکند. */
             $productId = DB::exec('INSERT INTO products(name, emoji, category, category_id, '
                 . 'role_id, group_ids, max_users, device_limit, days, data_cap_gb, per_gb_price, '
                 . 'hourly_price, min_balance, renew_price, slots_needed, panel_prefix, trial, '
-                . 'active, created_at, panel_id, sale_type, per_user_price, min_users) '
-                . 'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                . 'active, created_at, panel_id, sale_type, per_user_price, min_users, unlimited_billing_mode) '
+                . 'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                 [trim((string) $values['name']), $values['emoji'] ?: '♾️', 'v2ray', $catId,
-                 $roleId, '[]', 0, 0, 0, 0, 0, 0, 0, 0, 1, '', 0, 1, now_ts(),
-                 (int) $panelRow['id'], PRODUCT_SALE_UNLIMITED_USERS, $perUser, $minUsers]);
-            $text = '✅ محصول نامحدود #' . $productId . " ساخته شد.\n\n"
+                 $roleId, '[]', 0, $deviceLimit, 0, 0, 0, $fixedHourly, 0, 0, 1, '', 0, 1,
+                 now_ts(), (int) $panelRow['id'], PRODUCT_SALE_UNLIMITED_USERS, $perUser,
+                 $minUsers, UNLIMITED_BILLING_HOURLY]);
+            $text = '✅ محصول نامحدود ساعتی #' . $productId . " ساخته شد.\n\n"
                 . ($values['emoji'] ?: '♾️') . ' <b>' . e((string) $values['name']) . "</b>\n"
                 . '🔌 پنل: ' . e((string) $panelRow['name']) . "\n"
                 . '🎭 نقش: ' . e($roleName !== '' ? $roleName : (string) $roleId) . "\n"
-                . '💵 قیمت هر کاربر: <b>' . money($perUser) . "</b>\n"
+                . '💵 نرخ هر کاربر / ساعت: <b>' . money($perUser) . "</b>\n"
+                . '🏷 اجارهٔ ثابت پنل / ساعت: <b>' . money($fixedHourly) . "</b>\n"
+                . '📱 دستگاهِ نمایش محصول: <b>' . fa_digits($deviceLimit) . "</b>\n"
                 . '👥 حداقل تعداد کاربر: <b>' . fa_digits($minUsers) . "</b>\n\n"
+                . 'ساعت اول با خرید پرداخت می‌شود؛ از ساعت بعد کسر خودکار از کیف پول آغاز می‌شود.\n'
                 . UNLIMITED_ROLE_GUIDE;
             Tg::send($uid, $text, [
                 [btn('👁 پیش‌نمایش محصول', 'ad:prod:' . $productId)],
@@ -396,12 +404,15 @@ function wiz_finish(int $uid, array $data): void
                 set_put('pay_' . $gw . '_min_cache', '0');
                 set_put('pay_' . $gw . '_min_at', '0');
             }
-            if (in_array($field, ['key', 'key2'], true) && (string) $value !== ''
+            /* فقط کلید اصلی می‌تواند درگاه را آماده کند؛ secret وب‌هوک به‌تنهایی کافی نیست. */
+            if ($field === 'key' && (string) $value !== ''
                 && set_get('pay_' . $gw . '_on') !== '1' && $gw !== 'card') {
                 set_put('pay_' . $gw . '_on', '1');
             }
-            Tg::send($uid, '✅ ذخیره شد: <b>'
-                . e((string) $value) . '</b>',
+            $saved = in_array($field, ['key', 'key2'], true)
+                ? 'کلید محرمانه ثبت شد و نمایش داده نمی‌شود.'
+                : e((string) $value);
+            Tg::send($uid, '✅ ذخیره شد: <b>' . $saved . '</b>',
                 [[btn('« درگاه', 'ad:pay:' . $gw, null, 'success')]]);
             return;
 
