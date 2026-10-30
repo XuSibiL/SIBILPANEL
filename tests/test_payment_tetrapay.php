@@ -15,6 +15,9 @@ db_bootstrap();
 settings_bootstrap();
 Tg::$dry = true;
 Tg::$outbox = [];
+/* Tetra's documented bot callback must name this exact merchant bot. */
+set_put('bot_username', 'SibilTestBot');
+unset($GLOBALS['__bot_username_cache']);
 
 $pass = 0;
 $fail = 0;
@@ -37,16 +40,8 @@ set_put('pay_tetrapay_key', 'test-api-key');
 set_put('pay_tetrapay_key2', 'test-webhook-secret');
 set_put('pay_tetrapay_on', '1');
 
-/* The installed public domain is canonical; legacy web URL paths cannot become
-   custom Tetra callback routes. */
-putenv('PANEL_WEB_URL=https://runtime.example.test/sibil');
-putenv('PANEL_DOMAIN=domain.example.test');
-$trustedCallback = tetrapay_callback_url();
-putenv('PANEL_WEB_URL');
-putenv('PANEL_DOMAIN');
-
-/* Tetra probes the public callback before checkout creation. A no-token probe
-   must answer normally but may never turn into a wallet/payment settlement. */
+/* Keep the older public website callback harmless for pre-existing links. New
+   Tetra bot checkouts use Telegram's documented t.me return URL instead. */
 $balanceBeforeProbe = balance_of(771001);
 $_SERVER = ['REQUEST_URI' => '/pay/tetrapay', 'REQUEST_METHOD' => 'GET'];
 $_GET = [];
@@ -68,21 +63,17 @@ web_handle();
 $unknownProbeHtml = (string) ob_get_clean();
 echo "\n== callback preflight ==\n";
 okpay(str_contains($probeHtml, 'payment return is online'),
-    'public no-token Tetra callback probe receives a healthy response');
+    'legacy public Tetra callback probe receives a healthy response');
 okpay(str_contains($probeHtml, 'No wallet or order has been credited')
     && balance_of(771001) === $balanceBeforeProbe,
     'callback health response cannot credit a wallet or claim payment success');
 okpay(http_response_code() === 200 && str_contains($unknownProbeHtml, 'payment return is online')
     && balance_of(771001) === $balanceBeforeProbe,
-    'unknown token callback probe receives non-settling HTTP 200');
-okpay(tetrapay_public_https_url('https://public.example.test/pay/tetrapay')
-    && !tetrapay_public_https_url('https://localhost/pay/tetrapay')
-    && !tetrapay_public_https_url('https://127.0.0.1/pay/tetrapay'),
-    'Tetra callback selection rejects non-public localhost and IP return hosts');
-okpay(tetrapay_callback_from_base('https://legacy.example.test/old/panel')
-    === 'https://legacy.example.test/pay/tetrapay'
-    && tetrapay_callback_from_base('https://legacy.example.test:8443') === '',
-    'Tetra callback strips legacy paths and rejects non-standard HTTPS ports');
+    'unknown legacy token callback receives non-settling HTTP 200');
+okpay(tetrapay_bot_username() === 'SibilTestBot'
+    && tetrapay_start_payload_valid('tp_17_abcdefghijklmnop')
+    && !tetrapay_start_payload_valid('paid-17'),
+    'Tetra bot callback requires a valid exact Telegram username and start payload');
 
 $calls = [];
 $GLOBALS['panel_http_mock'] = static function (string $method, string $url, array $headers, ?string $body) use (&$calls): array {
@@ -126,11 +117,22 @@ okpay(($created['ok'] ?? false) === true, 'TetraPay creates a hosted checkout');
 okpay(($created['url'] ?? '') === 'https://pay.example.test/tp_token_123456', 'hosted URL is preserved');
 okpay(($created['alt_url'] ?? '') === 'https://t.me/TetraBot?start=tp_token_123456', 'Telegram checkout URL is available');
 okpay(($request['amount'] ?? '') === '250000', 'internal toman amount is sent to TetraPay as Rial');
-okpay(str_starts_with((string) ($request['order_id'] ?? ''), 'sibil-'), 'provider order ID is payment-specific');
-okpay(tetrapay_base_url() === 'https://api.tetra98.com/api/v1'
-    && $trustedCallback === 'https://domain.example.test/pay/tetrapay',
-    'TetraPay uses fixed production v1 and the canonical public domain callback');
-okpay(($request['callback_url'] ?? '') === 'https://panel.example.test/pay/tetrapay', 'public HTTPS callback is generated');
+okpay(str_starts_with((string) ($request['order_id'] ?? ''), 'sibil-')
+    && strlen((string) ($request['order_id'] ?? '')) <= 64
+    && preg_match('/^[A-Za-z0-9_.:-]+$/D', (string) ($request['order_id'] ?? '')) === 1,
+    'provider order ID is payment-specific and meets Tetra v1 syntax/length');
+$longTetraOrder = tetrapay_external_order_id(['ref' => str_repeat('A', 120)], ['id' => 987654]);
+okpay(strlen($longTetraOrder) <= 64 && str_ends_with($longTetraOrder, '-987654'),
+    'long legacy order references retain the local payment id inside Tetra’s 64-character limit');
+$startPayload = (string) ($meta['tetrapay_start'] ?? '');
+okpay(tetrapay_base_url() === 'https://api.tetra98.com/api/v1',
+    'TetraPay uses its fixed production v1 API endpoint');
+okpay(tetrapay_start_payload_valid($startPayload)
+    && ($request['callback_url'] ?? '') === 'https://t.me/SibilTestBot?start=' . $startPayload,
+    'TetraPay receives the documented registered-bot Telegram callback URL');
+okpay(!str_contains((string) ($request['callback_url'] ?? ''), '/pay/tetrapay')
+    && strlen((string) ($request['callback_url'] ?? '')) <= 128,
+    'Tetra bot callback never substitutes the public website return path');
 okpay(array_keys($request) === ['amount', 'order_id', 'callback_url']
     && !isset($request['webhook_url']) && !isset($request['allow_partial']),
     'Tetra v1 create request contains only documented amount, order_id, and callback_url fields');
@@ -144,24 +146,45 @@ okpay(str_contains($createdNotice, 'Verify/Webhook')
 $again = pay_start($order, 'tetrapay');
 okpay(($again['reused'] ?? false) === true && count($calls) === 1, 'reselecting gateway reuses the same unpaid checkout');
 
-$verified = pay_tetrapay_verify($payment ?? [], ['token' => 'tp_token_123456']);
+Tg::$outbox = [];
+handle_message([
+    'from' => ['id' => $uid, 'first_name' => 'تستر', 'username' => 'tester'],
+    'chat' => ['id' => $uid, 'type' => 'private'], 'message_id' => 11,
+    'text' => '/start ' . $startPayload,
+]);
 $paid = $payment ? pay_get((int) $payment['id']) : null;
-echo "\n== verify and idempotence ==\n";
-okpay(($verified['ok'] ?? false) === true && ($verified['state'] ?? '') === 'success', 'provider verify settles the payment');
-okpay(($paid['status'] ?? '') === 'paid', 'settlement marks the payment as paid');
-okpay(balance_of($uid) === 25000, 'verified top-up credits exactly once');
+echo "\n== Telegram return, verify and idempotence ==\n";
+okpay(($paid['status'] ?? '') === 'paid', 'Telegram callback settles only after provider verify');
+okpay(balance_of($uid) === 25000, 'verified Telegram return credits exactly once');
 $outboxText = implode("\n", array_map(static fn(array $row): string => (string) ($row[1]['text'] ?? ''), Tg::$outbox));
 okpay(str_contains($outboxText, 'پرداخت شما با موفقیت و به‌صورت قطعی تأیید شد')
     && str_contains($outboxText, 'به کیف پول شما واریز گردید'),
     'success and wallet-credit notices are emitted only after verify');
 $repeat = pay_tetrapay_verify($paid ?? [], ['token' => 'tp_token_123456']);
 okpay(($repeat['state'] ?? '') === 'already' && balance_of($uid) === 25000, 'repeat verify cannot credit the wallet twice');
+Tg::$outbox = [];
+handle_message([
+    'from' => ['id' => $uid, 'first_name' => 'تستر', 'username' => 'tester'],
+    'chat' => ['id' => $uid, 'type' => 'private'], 'message_id' => 12,
+    'text' => '/start ' . $startPayload,
+]);
+okpay(balance_of($uid) === 25000, 'reopened Telegram return cannot credit a second time');
 
 /* A legacy signed webhook remains server-verified and idempotent, even though new v1 checkout creation no longer sends a webhook_url. */
 $order2 = create_order($uid, 'topup', 25000, null, ['topup' => 25000]);
 $created2 = pay_start($order2, 'tetrapay');
 $payment2 = DB::one("SELECT * FROM payments WHERE order_id=? AND method='tetrapay'", [(int) $order2['id']]);
 $meta2 = $payment2 ? pay_meta($payment2) : [];
+$otherUid = $uid + 1;
+$beforeForeignStart = count($calls);
+handle_message([
+    'from' => ['id' => $otherUid, 'first_name' => 'دیگری', 'username' => 'other'],
+    'chat' => ['id' => $otherUid, 'type' => 'private'], 'message_id' => 13,
+    'text' => '/start ' . (string) ($meta2['tetrapay_start'] ?? ''),
+]);
+$payment2AfterForeign = $payment2 ? pay_get((int) $payment2['id']) : null;
+okpay(($payment2AfterForeign['status'] ?? '') === 'unpaid' && count($calls) === $beforeForeignStart,
+    'another Telegram user cannot inspect or verify a buyer-bound Tetra return');
 $event = [
     'event_id' => 'evt_test_1',
     'event' => 'payment.paid',
@@ -196,8 +219,9 @@ $adminUi = json_encode(Tg::$outbox, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLAS
 okpay(str_contains($adminUi, 'کلید اصلی') && !str_contains($adminUi, ':endpoint')
     && !str_contains($adminUi, ':key2') && !str_contains($adminUi, 'سندباکس'),
     'TetraPay admin setup exposes one API key with no endpoint, key2, or sandbox control');
-okpay(str_contains(tetrapay_error(['error' => ['code' => 'INVALID_CALLBACK']]), '/pay/tetrapay'),
-    'provider callback rejection receives a practical public-return remedy');
+$callbackError = tetrapay_error(['error' => ['code' => 'INVALID_CALLBACK']]);
+okpay(str_contains($callbackError, 'https://t.me/') && str_contains($callbackError, '@SibilTestBot'),
+    'provider callback rejection names the documented Telegram-bot return and actual bot');
 
 unset($GLOBALS['panel_http_mock']);
 DB::close();

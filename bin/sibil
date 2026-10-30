@@ -1376,22 +1376,24 @@ cmd_domain_health() {
     step "Domain health: $dom"
     domain_dns_check "$dom" || return 1
     if command -v curl >/dev/null 2>&1; then
-        local code tetrapayCode
-        # Do not use curl -k here: Tetra validates a publicly trusted HTTPS
-        # certificate, so an insecure local probe would create a false pass.
+        local code tetrapayLegacyCode
+        # Do not use curl -k here: a public website callback, where one is used,
+        # needs a trusted certificate. New TetraPay bot gateways return through
+        # Telegram's t.me deep link, not through this website path.
         code="$(curl -sS --connect-timeout 6 --max-time 15 -o /dev/null -w '%{http_code}' \
             "https://$dom/" 2>/dev/null || true)"
         [[ "$code" =~ ^[1-5][0-9][0-9]$ ]] && ok "HTTPS responds with HTTP $code" \
             || warn "HTTPS endpoint did not answer with a trusted TLS connection yet"
-        # This direct GET is intentionally non-settling. No redirect is followed:
-        # the provider must reach this exact public HTTPS callback URL itself.
-        tetrapayCode="$(curl -sS --connect-timeout 6 --max-time 15 -o /dev/null -w '%{http_code}' \
+        # Retain this non-settling probe for pre-existing website-style Tetra
+        # links. Its result does not determine readiness of the current bot
+        # callback, which is checked from the bot username in the dashboard.
+        tetrapayLegacyCode="$(curl -sS --connect-timeout 6 --max-time 15 -o /dev/null -w '%{http_code}' \
             "https://$dom/pay/tetrapay" 2>/dev/null || true)"
-        if [[ "$tetrapayCode" =~ ^2[0-9][0-9]$ ]]; then
-            ok "TetraPay callback is direct, trusted HTTPS (HTTP $tetrapayCode)"
+        if [[ "$tetrapayLegacyCode" =~ ^2[0-9][0-9]$ ]]; then
+            ok "TetraPay legacy website callback path is direct HTTPS (HTTP $tetrapayLegacyCode)"
         else
-            warn "TetraPay callback is not publicly healthy: https://$dom/pay/tetrapay (HTTP ${tetrapayCode:-000})"
-            say "  needs a public trusted HTTPS 2xx on port 443; check Caddy, local UFW and the cloud/provider firewall"
+            warn "TetraPay legacy website callback path is not publicly healthy: https://$dom/pay/tetrapay (HTTP ${tetrapayLegacyCode:-000})"
+            say "  this does not block the current Telegram-bot callback; check the bot username in Gateway → TetraPay"
         fi
     fi
     cert_expiry_status "$dom" || true

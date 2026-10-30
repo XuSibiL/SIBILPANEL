@@ -79,6 +79,13 @@ function handle_message_inner(array $message): void
     /* ── /start و /help ─────────────────────────────────────────────── */
     if ($text !== '' && str_starts_with($text, '/start')) {
         $payload = trim(substr($text, 6));
+        /* Tetra's bot-gateway callback starts this exact bot with an opaque
+           local handle. The handler calls provider verify; Telegram's start
+           value alone can never settle a payment. */
+        if (pay_tetrapay_start_return($uid, $chatId, $payload)) {
+            State::clear($uid);
+            return;
+        }
         $referrer = ref_parse_start($payload);
         if ($referrer > 0) {
             /* فقط کاربر تازه دعوت ثبت می‌کند؛ کاربر قدیمی پاداش دوباره نمی‌گیرد */

@@ -251,13 +251,16 @@ function gw_readiness(string $gw): array
     if ($gw === 'trx' && gw_key2($gw) === '') {
         $missing[] = 'آدرس کیف پول TRX ثبت نشده';
     }
-    if (in_array((string) $meta['type'], ['online', 'crypto'], true)) {
-        $callback = $gw === 'tetrapay' ? tetrapay_callback_url() : pay_callback_url($gw);
-        if (!gw_https_url($callback)) {
-            $missing[] = $gw === 'tetrapay'
-                ? 'سامانهٔ بازگشت پرداخت تتراپی آماده نیست'
-                : 'آدرس HTTPS کال‌بک ثبت نشده';
+    if ($gw === 'tetrapay') {
+        /* Tetra registers this merchant as a Telegram bot gateway. Its documented
+           return URL is the exact t.me deep link for this bot, not a guessed web
+           callback domain. */
+        if (tetrapay_bot_username() === '') {
+            $missing[] = 'نام کاربری معتبر ربات تلگرام برای بازگشت تتراپی پیدا نشد';
         }
+    } elseif (in_array((string) $meta['type'], ['online', 'crypto'], true)
+        && !gw_https_url(pay_callback_url($gw))) {
+        $missing[] = 'آدرس HTTPS کال‌بک ثبت نشده';
     }
     return [$missing === [], $missing];
 }
@@ -1549,103 +1552,85 @@ function tetrapay_base_url(): string
 }
 
 /**
- * Tetra v1 accepts only a genuinely public HTTPS return URL. A syntactically
- * valid localhost URL is still unreachable by the provider, so do not let it
- * pass merely because it has an HTTPS scheme.
+ * TetraPay's current v1 contract has two callback forms: a registered website
+ * may return to that website, while a Telegram-bot gateway must return to the
+ * exact t.me deep link for the registered merchant bot. SIBIL is the latter.
+ * The provider rejects an arbitrary HTTPS site with INVALID_CALLBACK even when
+ * TLS and /pay/tetrapay are healthy.
  */
-function tetrapay_public_https_url(string $url): bool
+function tetrapay_bot_username(): string
 {
-    if (!gw_https_url($url)) {
-        return false;
-    }
-    $parts = parse_url($url);
-    $host = strtolower(trim((string) ($parts['host'] ?? '')));
-    $host = trim($host, '[]');
-    if ($host === '' || filter_var($host, FILTER_VALIDATE_IP) !== false
-        || !str_contains($host, '.')
-        || preg_match('~(^|\.)(?:localhost|local)$~i', $host) === 1) {
-        return false;
-    }
-    return true;
+    $handle = trim(ltrim(bot_username(), '@'));
+    /* Telegram deep-link usernames are 5..32 ASCII characters. Refuse a bad
+       cached value rather than sending a callback URL that Tetra must reject. */
+    return preg_match('/^[A-Za-z][A-Za-z0-9_]{4,31}$/D', $handle) === 1 ? $handle : '';
+}
+
+function tetrapay_start_payload_valid(string $payload): bool
+{
+    return preg_match('/^tp_[1-9][0-9]*_[A-Za-z0-9_-]{16}$/D', $payload) === 1
+        && strlen($payload) <= 64;
 }
 
 /**
- * Reduce a configured public website to its canonical HTTPS origin. Tetra's
- * documented callback is always /pay/tetrapay at the public hostname; legacy
- * PANEL_WEB_URL values may contain an application path, which must never leak
- * into that provider callback. Non-standard ports are intentionally rejected:
- * a public provider callback needs normal HTTPS on 443.
+ * Store an opaque return handle before checkout creation. Tetra's Telegram
+ * callback does not give this bot the provider token, so the locally stored
+ * handle selects the pending payment; settlement still requires server verify.
  */
-function tetrapay_public_origin(string $base): string
+function tetrapay_start_payload(array $payment): string
 {
-    $base = trim($base);
-    if ($base === '' || str_contains($base, '?') || str_contains($base, '#')
-        || !gw_https_url($base)) {
+    $meta = pay_meta($payment);
+    $saved = trim((string) ($meta['tetrapay_start'] ?? ''));
+    if (tetrapay_start_payload_valid($saved)) {
+        return $saved;
+    }
+    $paymentId = (int) ($payment['id'] ?? 0);
+    if ($paymentId <= 0) {
         return '';
     }
-    $parts = parse_url($base);
-    if (!is_array($parts) || isset($parts['port']) && (int) $parts['port'] !== 443) {
+    try {
+        $nonce = rtrim(strtr(base64_encode(random_bytes(12)), '+/', '-_'), '=');
+    } catch (Throwable) {
         return '';
     }
-    $host = strtolower(rtrim(trim((string) ($parts['host'] ?? '')), '.'));
-    // This also rejects IPs/localhost and keeps the callback rooted at a real
-    // public DNS hostname rather than a local test or internal service URL.
-    if (!tetrapay_public_https_url('https://' . $host . '/')) {
+    $payload = 'tp_' . $paymentId . '_' . $nonce;
+    if (!tetrapay_start_payload_valid($payload)) {
         return '';
     }
-    return 'https://' . $host;
+    $meta['tetrapay_start'] = $payload;
+    pay_save_meta($paymentId, $meta);
+    return $payload;
 }
 
-/** Build the documented fixed callback route from a canonical public origin. */
-function tetrapay_callback_from_base(string $base): string
+/** Build Tetra's documented callback form for the registered SIBIL Telegram bot. */
+function tetrapay_callback_url(array $payment): string
 {
-    $origin = tetrapay_public_origin($base);
-    return $origin === '' ? '' : $origin . '/pay/tetrapay';
+    $handle = tetrapay_bot_username();
+    $payload = tetrapay_start_payload($payment);
+    if ($handle === '' || $payload === '') {
+        return '';
+    }
+    return 'https://t.me/' . $handle . '?start=' . $payload;
 }
 
-/**
- * Tetra validates the callback against the installed public domain. PANEL_DOMAIN
- * is the canonical deployment source; PANEL_WEB_URL and the old database value
- * are fallback discovery only. Paths in those legacy values are stripped rather
- * than becoming a custom Tetra endpoint.
- */
-function tetrapay_callback_url(): string
-{
-    $candidates = [];
-    $domain = trim((string) cfg('PANEL_DOMAIN', ''));
-    if ($domain !== '') {
-        $candidates[] = str_contains($domain, '://') ? $domain : 'https://' . $domain;
-    }
-    $web = trim((string) cfg('PANEL_WEB_URL', ''));
-    if ($web !== '') {
-        $candidates[] = $web;
-    }
-    $legacy = trim(web_base());
-    if ($legacy !== '') {
-        $candidates[] = $legacy;
-    }
-    foreach ($candidates as $base) {
-        $url = tetrapay_callback_from_base($base);
-        if ($url !== '') {
-            return $url;
-        }
-    }
-    return '';
-}
-
+/* New v1 checkouts deliberately send no webhook_url: SIBIL needs only the API
+   key and its Telegram callback; any old signed webhook endpoint stays handled
+   for already-configured installations. */
 function tetrapay_webhook_url(): string
 {
-    if (gw_key2('tetrapay') === '') {
-        return '';
-    }
-    $callback = tetrapay_callback_url();
-    return $callback === '' ? '' : $callback . '/webhook';
+    return '';
 }
 
 function tetrapay_external_order_id(array $order, array $payment): string
 {
-    $ref = preg_replace('/[^A-Za-z0-9_-]/', '', (string) ($order['ref'] ?? '')) ?: 'order';
-    return mb_substr('sibil-' . $ref . '-' . (int) ($payment['id'] ?? 0), 0, 80);
+    /* Tetra v1 permits 1..64 ASCII letters, digits, underscores, dots, colons
+       and hyphens. Keep the local payment id at the end even if a legacy order
+       reference is unusually long, so two checkouts cannot collide on a prefix. */
+    $paymentId = max(1, (int) ($payment['id'] ?? 0));
+    $suffix = '-' . $paymentId;
+    $room = max(1, 64 - strlen('sibil-') - strlen($suffix));
+    $ref = preg_replace('/[^A-Za-z0-9_.:-]/', '', (string) ($order['ref'] ?? '')) ?: 'order';
+    return 'sibil-' . mb_substr($ref, 0, $room) . $suffix;
 }
 
 function tetrapay_error(array $res, string $fallback = 'ساخت لینک تتراپی انجام نشد.'): string
@@ -1653,11 +1638,15 @@ function tetrapay_error(array $res, string $fallback = 'ساخت لینک تتر
     $error = is_array($res['error'] ?? null) ? $res['error'] : [];
     $code = strtoupper(trim((string) ($error['code'] ?? '')));
     $retry = max(0, (int) ($error['retryAfter'] ?? 0));
+    $bot = tetrapay_bot_username();
+    $returnHint = $bot !== ''
+        ? ' ربات این نصب @' . $bot . ' است.'
+        : ' نام کاربری ربات این نصب پیدا نشد.';
     return match ($code) {
         'UNAUTHORIZED' => 'کلید API تتراپی پذیرفته نشد یا باطل شده است.',
         'GATEWAY_SUSPENDED' => 'درگاه تتراپی در پنل پذیرنده غیرفعال یا تعلیق شده است.',
         'NO_METHOD_AVAILABLE' => 'هیچ روش پرداخت فعالی در پنل تتراپی روشن نیست.',
-        'INVALID_CALLBACK' => 'تتراپی callback_url را نپذیرفت. API طبق مستندات به api.tetra98.com/api/v1 می‌رود؛ callback_url نباید API باشد و باید URL عمومی HTTPS ربات در مسیر /pay/tetrapay باشد.',
+        'INVALID_CALLBACK' => 'تتراپی callback_url را نپذیرفت. API همچنان api.tetra98.com/api/v1 است؛ برای درگاه رباتی callback باید دقیقاً لینک https://t.me/ همین ربات با start باشد. نام کاربری ثبت‌شده در پنل تتراپی را با ربات این نصب تطبیق دهید.' . $returnHint,
         'INVALID_WEBHOOK', 'WEBHOOK_NOT_CONFIGURED' => 'وب‌هوک اختیاری تتراپی پذیرفته نشد؛ بررسی بازگشت پرداخت ادامه دارد.',
         'AMOUNT_OUT_OF_RANGE' => 'مبلغ خارج از بازهٔ مجاز تتراپی است.',
         'RATE_LIMITED' => $retry > 0
@@ -1693,10 +1682,13 @@ function pay_tetrapay_create(array $payment, array $order): array
     if (gw_key('tetrapay') === '') {
         return ['ok' => false, 'url' => '', 'text' => 'کلید API تتراپی ثبت نشده است.'];
     }
-    $callback = tetrapay_callback_url();
+    $callback = tetrapay_callback_url($payment);
     if ($callback === '') {
-        return ['ok' => false, 'url' => '', 'text' => 'سامانهٔ بازگشت امن تتراپی در این نصب آماده نیست؛ با پشتیبانی تماس بگیرید.'];
+        return ['ok' => false, 'url' => '', 'text' => 'نام کاربری معتبر همین ربات برای بازگشت تتراپی پیدا نشد؛ نام کاربری ربات را در تنظیمات یا BotFather بررسی کنید.'];
     }
+    /* tetrapay_callback_url persists the opaque start handle. Reload before
+       adding creation metadata so a stale in-memory payload cannot erase it. */
+    $payment = pay_get((int) $payment['id']) ?? $payment;
     $amountRial = tetrapay_rial((int) ($payment['amount'] ?? 0));
     if ($amountRial <= 0) {
         return ['ok' => false, 'url' => '', 'text' => 'مبلغ پرداخت تتراپی معتبر نیست.'];
@@ -1780,6 +1772,49 @@ function pay_tetrapay_verify(array $payment, array $params = []): array
     }
     return pay_accept($payment, (float) ((int) $expectedRial / 10),
         (string) ($data['transaction_id'] ?? $data['reference'] ?? $token), $res);
+}
+
+/**
+ * Resolve a Telegram deep-link callback only for the buyer who owns it. A
+ * start payload is merely a local lookup handle; it is never a payment claim
+ * and never contains or replaces Tetra's provider token.
+ */
+function pay_tetrapay_start_return(int $tgId, int|string $chatId, string $payload): bool
+{
+    if ($tgId <= 0 || !tetrapay_start_payload_valid($payload)) {
+        return false;
+    }
+    /* The opaque payload carries the local row id only as a lookup hint. Query
+       that exact row and buyer first, then compare the full random payload in
+       PHP. This needs no SQLite JSON extension and never scans another buyer’s
+       payment history. */
+    preg_match('/^tp_([1-9][0-9]*)_/', $payload, $parts);
+    $paymentId = (int) ($parts[1] ?? 0);
+    $payment = $paymentId > 0 ? DB::one("SELECT * FROM payments WHERE id=? AND method='tetrapay' "
+        . "AND tg_id=? AND status IN ('unpaid','paid','expire')", [$paymentId, $tgId]) : null;
+    $saved = is_array($payment) ? (string) (pay_meta($payment)['tetrapay_start'] ?? '') : '';
+    if ($payment === null || $saved === '' || !hash_equals($saved, $payload)) {
+        return false;
+    }
+    if ((string) $payment['status'] === 'paid') {
+        Tg::send($chatId, '✅ این پرداخت تتراپی قبلاً به‌صورت قطعی تأیید شده است.', home_kb($tgId));
+        return true;
+    }
+    $result = pay_tetrapay_verify($payment);
+    $state = (string) ($result['state'] ?? 'waiting');
+    /* pay_settle already sends the final receipt/delivery message after a
+       successful authoritative verify, so never present a second success claim. */
+    if ($state === 'success') {
+        return true;
+    }
+    if ($state === 'already') {
+        Tg::send($chatId, '✅ این پرداخت تتراپی قبلاً به‌صورت قطعی تأیید شده است.', home_kb($tgId));
+        return true;
+    }
+    Tg::send($chatId, '🔎 <b>بررسی بازگشت تتراپی</b>' . "\n\n"
+        . e((string) ($result['text'] ?? 'وضعیت پرداخت هنوز نهایی نشده است.')),
+        home_kb($tgId));
+    return true;
 }
 
 /** امضای وب‌هوک v1: X-TetraPay-Signature: t=unix,v1=HMAC_SHA256(t.raw_body). */
@@ -2240,17 +2275,21 @@ function gw_live_test(string $gw): array
     } else {
         $notes[] = 'آدرس HTTPS سرویس معتبر است.';
     }
-    $callback = $gw === 'tetrapay' ? tetrapay_callback_url() : pay_callback_url($gw);
-    if (!gw_https_url($callback)) {
-        $issues[] = $gw === 'tetrapay'
-            ? 'آدرس عمومی HTTPS نصب برای بازگشت تتراپی آماده نیست.'
-            : 'آدرس وب ربات باید یک دامنهٔ HTTPS عمومی باشد تا callback درگاه کار کند.';
-    } else {
-        $notes[] = 'callback HTTPS آماده است: ' . $callback;
-    }
     if ($gw === 'tetrapay') {
-        $notes[] = 'تتراپی با API رسمی production v1 و بازگشت HTTPS آماده است.';
-        $notes[] = 'برای اطمینان از دسترس‌پذیری عمومی، سلامت /pay/tetrapay را از SIBIL Domain / SSL بررسی کنید.';
+        $handle = tetrapay_bot_username();
+        if ($handle === '') {
+            $issues[] = 'نام کاربری معتبر همین ربات برای callback تلگرام پیدا نشد.';
+        } else {
+            $notes[] = 'بازگشت تتراپی با لینک ثبت‌شدهٔ https://t.me/' . $handle . '?start=… آماده است.';
+        }
+        $notes[] = 'تتراپی با API رسمی production v1 و verify سروری آماده است.';
+    } else {
+        $callback = pay_callback_url($gw);
+        if (!gw_https_url($callback)) {
+            $issues[] = 'آدرس وب ربات باید یک دامنهٔ HTTPS عمومی باشد تا callback درگاه کار کند.';
+        } else {
+            $notes[] = 'callback HTTPS آماده است: ' . $callback;
+        }
     }
     return [
         'ok'       => $issues === [],

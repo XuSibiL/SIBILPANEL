@@ -60,9 +60,9 @@ function web_status(int $code): void
 }
 
 /**
- * Tetra validates callback_url before it creates a checkout. This deliberate
- * no-token response proves that the public HTTPS endpoint is alive, but it is
- * never a payment success and cannot reach settlement code.
+ * This is the legacy website-style Tetra callback landing page. Current
+ * SIBIL Tetra bot checkouts return through Telegram; this harmless response is
+ * retained for older website-style links and can never reach settlement code.
  */
 function tetrapay_callback_ready_page(): string
 {
@@ -82,10 +82,10 @@ function web_handle(): void
     $path = rtrim($path, '/');
 
     /*
-     * Tetra probes the bare, public callback before it creates a checkout.
-     * Answer this exact no-token GET/HEAD route before loading .env or SQLite.
-     * Any query/post/body callback still follows the normal authoritative
-     * lookup + provider verification path below; this probe can never settle.
+     * Keep older website-style callbacks harmless and dependency-free. New
+     * bot-gateway checkouts return by Telegram deep link instead. Any query/
+     * post/body callback still follows authoritative lookup + provider verify;
+     * this bare route can never settle.
      */
     $method = strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET'));
     if ($path === '/pay/tetrapay' && ($method === 'GET' || $method === 'HEAD')
@@ -196,12 +196,9 @@ function web_handle(): void
 
     if ($payment === null && $gw === 'tetrapay') {
         /*
-         * Tetra can probe the documented callback_url with a generated token
-         * before that token has been returned to (and stored by) SIBIL. A 404
-         * here makes a healthy public callback look invalid to the provider.
-         * Acknowledge an unknown token with the same non-settling health page;
-         * only a locally bound authority below ever reaches provider verify or
-         * wallet settlement.
+         * Older website-style Tetra links may carry an unbound token. Keep
+         * their response non-settling and successful; only a locally bound
+         * authority below ever reaches provider verify or wallet settlement.
          */
         web_html(tetrapay_callback_ready_page());
         return;

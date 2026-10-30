@@ -279,11 +279,12 @@ function screen_pay_web(int|string $chat, ?int $messageId): void
 {
     /* Kept only for older callbacks. Payment origins are installation-owned,
        not a per-gateway HTTP control in the bot UI. */
+    $tetraBot = tetrapay_bot_username();
     $text = "🛡 <b>بازگشت امن پرداخت</b>\n\n"
         . 'آدرس بازگشت از تنظیمات نصب خوانده می‌شود و در این بخش تغییر نمی‌کند.' . "\n"
-        . (gw_https_url(tetrapay_callback_url())
-            ? '✅ آدرس عمومی HTTPS نصب آماده است.'
-            : '⚠️ آدرس عمومی HTTPS نصب آماده نیست؛ با مدیر سرور تماس بگیرید.');
+        . ($tetraBot !== ''
+            ? '✅ بازگشت تتراپی با لینک تلگرام همین ربات آماده است: <code>@' . e($tetraBot) . '</code>'
+            : '⚠️ نام کاربری معتبر ربات برای بازگشت تتراپی پیدا نشد؛ با مدیر سرور تماس بگیرید.');
     Tg::show($chat, $messageId, $text, [
         [btn('« درگاه‌ها', 'ad:pay', null, 'danger')],
     ]);

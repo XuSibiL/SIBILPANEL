@@ -296,8 +296,8 @@ require_contains "$TMP/domain-cancel.log" "cancelled" && require_contains "$HOME
 cli domain change example.org --yes >"$TMP/domain-ok.log" 2>&1
 require_contains "$HOME1/.env" 'PANEL_DOMAIN="example.org"' && require_contains "$HOME1/.env" 'PANEL_WEB_URL="https://example.org"' && pass "confirmed domain change updates callback values"
 cli domain health example.org >"$TMP/domain-health.log" 2>&1
-require_contains "$TMP/domain-health.log" "TetraPay callback"
-require_contains "$TMP/curl.log" "https://example.org/pay/tetrapay" && pass "domain health checks the public non-settling TetraPay callback path"
+require_contains "$TMP/domain-health.log" "TetraPay legacy website callback"
+require_contains "$TMP/curl.log" "https://example.org/pay/tetrapay" && pass "domain health checks the legacy non-settling TetraPay website path"
 cli domain change bad.invalid --force --yes >"$TMP/domain-force.log" 2>&1
 require_contains "$HOME1/.env" 'PANEL_DOMAIN="bad.invalid"' && pass "DNS bypass requires explicit --force and accepts either option order"
 cli domain change example.org --yes >/dev/null 2>&1

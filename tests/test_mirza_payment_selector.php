@@ -41,6 +41,9 @@ function selector_last_keyboard(): array
 }
 
 set_put('web_url', 'https://panel.example.test');
+/* Tetra's route is ready only when the same merchant bot has a Telegram username. */
+set_put('bot_username', 'SibilTestBot');
+unset($GLOBALS['__bot_username_cache']);
 $uid = 885001;
 user_ensure($uid, 'Mirza Selector', 'mirza_selector');
 set_put('card_number', '6104331002032630');
