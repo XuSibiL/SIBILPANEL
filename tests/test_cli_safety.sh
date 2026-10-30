@@ -53,6 +53,13 @@ case " $* " in
 esac
 exit 0
 EOF
+cat >"$MOCKBIN/curl" <<'EOF'
+#!/usr/bin/env bash
+# Tests are offline: callers see a reachable curl binary but no remote payload.
+# The dashboard must fall back cleanly without waiting for GitHub.
+[[ -n "${SIBIL_TEST_CURL_LOG:-}" ]] && printf '%s\n' "$*" >>"$SIBIL_TEST_CURL_LOG"
+exit 0
+EOF
 chmod 755 "$MOCKBIN"/*
 export PATH="$MOCKBIN:$PATH"
 
@@ -66,7 +73,7 @@ NGINX_CONF="$TMP/nginx/conf.d"
 CRON="$TMP/cron.d"
 CLI_DST="$TMP/bin/sibil"
 BACKUPS="$TMP/backups"
-mkdir -p "$HOME1" "$SYSTEMD" "$CADCONF" "$NGINX_ENABLED" "$NGINX_AVAILABLE" "$NGINX_CONF" "$CRON" "$(dirname "$CLI_DST")" "$BACKUPS"
+mkdir -p "$HOME1" "$HOME1/bin" "$SYSTEMD" "$CADCONF" "$NGINX_ENABLED" "$NGINX_AVAILABLE" "$NGINX_CONF" "$CRON" "$(dirname "$CLI_DST")" "$BACKUPS"
 printf '{}\n# legacy example.org must survive\n' >"$CADDY"
 printf 'SIBILPANEL-OWNED\n' >"$HOME1/.sibil-owned"
 cat >"$HOME1/.env" <<'EOF'
@@ -106,9 +113,67 @@ cli() {
   SIBIL_CRON_DIR="$CRON" \
   SIBIL_UNINSTALL_BACKUP_DIR="$BACKUPS" \
   PANEL_BACKUP_DIR="$BACKUPS" \
+  SIBIL_TEST_CURL_LOG="$TMP/curl.log" \
   SIBIL_DISABLE_SYSTEMD=1 \
   bash "$CLI" "$@"
 }
+
+# The read-only dashboard is also what the interactive SIBIL menu renders.
+# It must carry the new branded status view rather than the old plain menu.
+cli dashboard >"$TMP/dashboard.log" 2>&1
+require_contains "$TMP/dashboard.log" "SIBIL PANEL"
+require_contains "$TMP/dashboard.log" "advanced server dashboard"
+require_contains "$TMP/dashboard.log" "SIBIL"
+if grep -qF "Panel Service" "$TMP/dashboard.log"; then
+  fail "dashboard retained the obsolete Panel Service branding"
+else
+  pass "dashboard renders the advanced SIBIL PANEL status view"
+fi
+
+# Option 2 runs update from the old process, then must exec the freshly written
+# $PANEL_HOME/bin/sibil instead of redrawing the stale menu. Stub only the
+# download/update internals; cmd_menu and its re-exec path are the real source.
+OLD_MENU_CLI="$TMP/old-menu-sibil"
+cp "$CLI" "$OLD_MENU_CLI"
+python3 - "$OLD_MENU_CLI" <<'PY'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+s = p.read_text()
+start = s.index('github_update() {')
+end = s.index('\n}\n\ncmd_update()', start) + 3
+stub = '''github_update() {
+    cat > "$PANEL_HOME/bin/sibil" <<'NEWCLI'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "menu" ]]; then
+  printf 'NEW-CLI-DASHBOARD\\n'
+fi
+NEWCLI
+    chmod 700 "$PANEL_HOME/bin/sibil"
+    return 0
+}
+'''
+p.write_text(s[:start] + stub + s[end:])
+PY
+if command -v script >/dev/null 2>&1; then
+  if ! printf '2\n' | env \
+    PATH="$PATH" PANEL_HOME="$HOME1" PANEL_CLI_PATH="$CLI_DST" \
+    SIBIL_SYSTEMD_DIR="$SYSTEMD" SIBIL_CADDYFILE="$CADDY" SIBIL_CADDY_CONF_DIR="$CADCONF" \
+    SIBIL_NGINX_SITES_ENABLED_DIR="$NGINX_ENABLED" SIBIL_NGINX_SITES_AVAILABLE_DIR="$NGINX_AVAILABLE" \
+    SIBIL_NGINX_CONF_DIR="$NGINX_CONF" SIBIL_CRON_DIR="$CRON" \
+    SIBIL_UNINSTALL_BACKUP_DIR="$BACKUPS" PANEL_BACKUP_DIR="$BACKUPS" \
+    SIBIL_TEST_CURL_LOG="$TMP/curl.log" SIBIL_DISABLE_SYSTEMD=1 PANEL_NO_PAUSE=1 TERM=xterm \
+    script -qec "bash '$OLD_MENU_CLI' menu" "$TMP/update-menu.typescript" >"$TMP/update-menu.log" 2>&1; then
+    cat "$TMP/update-menu.log" >&2
+    fail "menu update simulation failed"
+  elif grep -qF "NEW-CLI-DASHBOARD" "$TMP/update-menu.log"; then
+    pass "interactive option 2 execs the freshly installed SIBIL CLI"
+  else
+    fail "option 2 did not execute the freshly installed CLI"
+  fi
+else
+  require_contains "$CLI" 'exec bash "$fresh" menu' && pass "update option contains the fresh-CLI re-exec guard"
+fi
 
 # Domain validation/confirmation logic must never silently write a bad domain.
 old_env="$(cat "$HOME1/.env")"
@@ -121,6 +186,9 @@ cli domain change example.org >"$TMP/domain-cancel.log" 2>&1
 require_contains "$TMP/domain-cancel.log" "cancelled" && require_contains "$HOME1/.env" 'PANEL_DOMAIN="example.com"' && pass "domain change requires confirmation"
 cli domain change example.org --yes >"$TMP/domain-ok.log" 2>&1
 require_contains "$HOME1/.env" 'PANEL_DOMAIN="example.org"' && require_contains "$HOME1/.env" 'PANEL_WEB_URL="https://example.org"' && pass "confirmed domain change updates callback values"
+cli domain health example.org >"$TMP/domain-health.log" 2>&1
+require_contains "$TMP/domain-health.log" "TetraPay return endpoint"
+require_contains "$TMP/curl.log" "https://example.org/pay/tetrapay" && pass "domain health checks the public non-settling TetraPay return path"
 cli domain change bad.invalid --force --yes >"$TMP/domain-force.log" 2>&1
 require_contains "$HOME1/.env" 'PANEL_DOMAIN="bad.invalid"' && pass "DNS bypass requires explicit --force and accepts either option order"
 cli domain change example.org --yes >/dev/null 2>&1

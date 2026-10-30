@@ -6,7 +6,7 @@
 #  Run:             sibil
 #  Direct:          sibil status | update | restart | start | stop | logs
 #                   sibil backup | restore | domain | config | doctor | deps
-#                   sibil ssl | fix | install | remove | uninstall | help | version
+#                   sibil ssl | fix | install | remove | uninstall | dashboard | help | version
 # ═══════════════════════════════════════════════════════════════════════════════
 set -uo pipefail
 
@@ -23,7 +23,7 @@ export PANEL_WEB_PORT="${PANEL_WEB_PORT:-${SIBIL_WEB_PORT:-}}"
 export PANEL_DOMAIN="${PANEL_DOMAIN:-${SIBIL_DOMAIN:-}}"
 export PANEL_PHP_BIN="${PANEL_PHP_BIN:-${SIBIL_PHP_BIN:-}}"
 PANEL="${PANEL_HOME}"
-CLI_BRAND="Sibil"
+CLI_BRAND="SIBIL PANEL"
 # نسخه از خودِ ربات خوانده می‌شود؛ هیچ عددی در این اسکریپت هاردکد نیست
 detect_version() {
     local v=""
@@ -239,16 +239,69 @@ ensure_primary_owner_anchor() {
     fi
 }
 
+ui_measure() {
+    local cols=""
+    cols="$(tput cols 2>/dev/null || true)"
+    [[ "$cols" =~ ^[0-9]+$ ]] || cols=80
+    ((cols > 100)) && cols=100
+    ((cols < 40)) && cols=40
+    UI_W="$cols"
+}
+
+ui_repeat() {
+    local char="$1" count="$2" out="" i
+    for ((i = 0; i < count; i++)); do out+="$char"; done
+    printf '%s' "$out"
+}
+
+ui_visible_len() {
+    local plain
+    plain="$(printf '%b' "$1" | sed -E $'s/\x1B\\[[0-9;?]*[ -\/]*[@-~]//g')"
+    printf '%s' "${#plain}"
+}
+
+ui_rule()  { printf '%s%s%s\n' "$CYN" "$(ui_repeat '─' "$UI_W")" "$R"; }
+ui_drule() { printf '%s%s%s\n' "$CYN$B" "$(ui_repeat '━' "$UI_W")" "$R"; }
+
+ui_lr() {
+    local left="$1" right="${2:-}" gap
+    gap=$((UI_W - $(ui_visible_len "$left") - $(ui_visible_len "$right")))
+    ((gap < 1)) && gap=1
+    printf '%b%*s%b\n' "$left" "$gap" '' "$right"
+}
+
+ui_cols() {
+    local out='' width value pad
+    while (($# >= 2)); do
+        width="$1"; value="$2"
+        out+="$value"
+        if (($# > 2)); then
+            pad=$((width - $(ui_visible_len "$value")))
+            ((pad < 1)) && pad=1
+            out+="$(printf '%*s' "$pad" '')"
+        fi
+        shift 2
+    done
+    printf '%b\n' "$out"
+}
+
+ui_bar() {
+    local percent="${1:-0}" width="${2:-14}" filled
+    [[ "$percent" =~ ^[0-9]+$ ]] || percent=0
+    ((percent > 100)) && percent=100
+    ((percent < 0)) && percent=0
+    filled=$((percent * width / 100))
+    printf '%s%s%s%s%s' "$CYN" "$(ui_repeat '█' "$filled")" "$DIM" \
+        "$(ui_repeat '░' "$((width - filled))")" "$R"
+}
+
+# SIBIL identity header; intentionally no legacy Panel Service branding.
 banner() {
-    local title="$CLI_BRAND · v$VERSION"
-    local width=38 len pad_l pad_r inner
-    len=${#title}
-    pad_l=$(( (width - len) / 2 ))
-    pad_r=$(( width - len - pad_l ))
-    inner="$(printf '%*s%s%*s' "$pad_l" '' "$title" "$pad_r" '')"
-    printf '%s%s\n' "$MAG$B" "  ╔══════════════════════════════════════╗"
-    printf '%s\n' "  ║${inner}║"
-    printf '%s\n' "  ╚══════════════════════════════════════╝$R"
+    ui_measure
+    printf '\n'
+    ui_lr " ${GRN}${B}▌${R} ${B}SIBIL PANEL${R}  ${DIM}secure server control${R}" \
+        "${DIM}v${VERSION}${R} "
+    ui_drule
 }
 
 # ── بررسی نسخهٔ منتشرشده ────────────────────────────────────────────────────
@@ -1253,10 +1306,15 @@ cmd_domain_health() {
     step "Domain health: $dom"
     domain_dns_check "$dom" || return 1
     if command -v curl >/dev/null 2>&1; then
-        local code
+        local code tetrapayCode
         code="$(curl -ksSIL --max-time 12 -o /dev/null -w '%{http_code}' "https://$dom/" 2>/dev/null || true)"
         [[ "$code" =~ ^[1-5][0-9][0-9]$ ]] && ok "HTTPS responds with HTTP $code" \
             || warn "HTTPS endpoint did not answer yet (DNS/TLS/proxy may still be propagating)"
+        # A no-token probe is intentionally non-settling; it only proves the public return path.
+        tetrapayCode="$(curl -ksSIL --max-time 12 -o /dev/null -w '%{http_code}' "https://$dom/pay/tetrapay" 2>/dev/null || true)"
+        [[ "$tetrapayCode" =~ ^2[0-9][0-9]$ ]] \
+            && ok "TetraPay return endpoint responds with HTTP $tetrapayCode" \
+            || warn "TetraPay return endpoint is not publicly healthy yet: https://$dom/pay/tetrapay"
     fi
     cert_expiry_status "$dom" || true
 }
@@ -1884,7 +1942,7 @@ cmd_help() {
     say "    ${B}backup${R}           create a database snapshot"
     say "    ${B}import <file>${R}    validate, safety-copy and restore a database"
     say "    ${B}migrate${R}          run compatible database migrations"
-    say "    ${B}status${R} / ${B}doctor${R} / ${B}web${R} / ${B}logs${R}"
+    say "    ${B}dashboard${R} / ${B}status${R} / ${B}doctor${R} / ${B}web${R} / ${B}logs${R}"
     say "    ${B}config${R} / ${B}deps${R} / ${B}fix${R} / ${B}check${R}"
     say ""
     say "  Safety: uninstall and proxy cleanup only remove files with explicit Sibil"
@@ -1892,43 +1950,161 @@ cmd_help() {
     say ""
 }
 
-dashboard_health_row() {
-    local bot='● stopped' web='● down' db='● missing' tls='● unset' dom
-    service_active && bot='● running'
-    if has_systemd && web_unit_is_owned && systemctl is-active --quiet "$WEB_SERVICE" 2>/dev/null; then web='● online'; fi
-    [[ -f "$DB_FILE" ]] && db='● ready'
+dashboard_cert_days() {
+    local dom="$1" cert="/etc/letsencrypt/live/$1/cert.pem" end
+    [[ -n "$dom" && -f "$cert" ]] || return 0
+    command -v openssl >/dev/null 2>&1 || return 0
+    end="$(openssl x509 -enddate -noout -in "$cert" 2>/dev/null | cut -d= -f2)"
+    [[ -n "$end" ]] || return 0
+    printf '%s' "$(( ( $(date -d "$end" +%s 2>/dev/null || echo 0) - $(date +%s) ) / 86400 ))"
+}
+
+dashboard_render() {
+    ui_measure
+    local remote dom callback certDays bot web db tls phpVer phpState os now
+    local users panels pending dataLine memTotal memUsed memPct diskTotal diskUsed diskPct load cores uptime
+    local updateLine=''
+    remote="$(remote_version)"
     dom="$(normalize_domain "$(env_get PANEL_DOMAIN)")"
-    [[ -n "$dom" ]] && tls="● $dom"
-    printf '  %sBOT %s  %sWEB %s  %sDB %s  %sTLS %s%s\n' \
-        "$DIM" "$bot" "$DIM" "$web" "$DIM" "$db" "$DIM" "$tls" "$R"
+    callback="$(env_get PANEL_WEB_URL)"
+    now="$(date '+%Y-%m-%d %H:%M' 2>/dev/null || true)"
+    os="$( ( . /etc/os-release 2>/dev/null; printf '%s %s' "${NAME:-Linux}" "${VERSION_ID:-}" ) )"
+
+    if service_active; then
+        bot="${GRN}${B}●${R} running"
+    else
+        bot="${RED}${B}▲${R} stopped"
+    fi
+    if has_systemd && web_unit_is_owned && systemctl is-active --quiet "$WEB_SERVICE" 2>/dev/null; then
+        web="${GRN}${B}●${R} online"
+    elif [[ -f "$(web_unit_file)" ]] && ! web_unit_is_owned; then
+        web="${YEL}${B}▲${R} unowned"
+    else
+        web="${RED}${B}▲${R} down"
+    fi
+    if [[ -f "$DB_FILE" ]]; then
+        db="${GRN}${B}●${R} ready"
+        users="$(db_query 'SELECT COUNT(*) FROM users' | head -1)"
+        panels="$(db_query "SELECT COUNT(*) FROM panels WHERE status<>'deleted'" | head -1)"
+        pending="$(db_query "SELECT COUNT(*) FROM receipts WHERE status='pending'" | head -1)"
+        [[ "$users" =~ ^[0-9]+$ ]] || users=0
+        [[ "$panels" =~ ^[0-9]+$ ]] || panels=0
+        [[ "$pending" =~ ^[0-9]+$ ]] || pending=0
+        dataLine="${users} users · ${panels} panels"
+        ((pending > 0)) && dataLine+=" · ${pending} receipts"
+    else
+        db="${RED}${B}▲${R} missing"
+        dataLine='database not created'
+    fi
+    certDays="$(dashboard_cert_days "$dom" 2>/dev/null || true)"
+    if [[ -z "$dom" ]]; then
+        tls="${DIM}○ not configured${R}"
+    elif [[ "$certDays" =~ ^-?[0-9]+$ ]] && ((certDays > 14)); then
+        tls="${GRN}${B}●${R} ${certDays} days left"
+    elif [[ "$certDays" =~ ^-?[0-9]+$ ]] && ((certDays >= 0)); then
+        tls="${YEL}${B}●${R} ${certDays} days · renew"
+    else
+        tls="${YEL}${B}▲${R} needs check"
+    fi
+    phpVer="$("$PHP_BIN" -r 'echo PHP_VERSION;' 2>/dev/null || true)"
+    if [[ -n "$phpVer" ]] && "$PHP_BIN" -r 'exit(extension_loaded("pdo_sqlite") ? 0 : 1);' >/dev/null 2>&1; then
+        phpState="${GRN}${B}●${R} ${phpVer}"
+    else
+        phpState="${RED}${B}▲${R} ${phpVer:-missing}"
+    fi
+
+    read -r memTotal memUsed < <(free -m 2>/dev/null | awk '/^Mem:/{print $2, $3}') || true
+    [[ "$memTotal" =~ ^[0-9]+$ && "$memUsed" =~ ^[0-9]+$ && "$memTotal" -gt 0 ]] \
+        && memPct=$((memUsed * 100 / memTotal)) || { memTotal=0; memUsed=0; memPct=0; }
+    read -r diskUsed diskTotal diskPct < <(df -P "$PANEL_HOME" 2>/dev/null | awk 'NR==2{gsub("%","",$5); print $3, $2, $5}') || true
+    [[ "$diskPct" =~ ^[0-9]+$ ]] || { diskUsed=0; diskTotal=0; diskPct=0; }
+    load="$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null || printf '%s' 'n/a')"
+    cores="$(nproc 2>/dev/null || printf '%s' '?')"
+    uptime="$(uptime -p 2>/dev/null | sed 's/^up //' | cut -d, -f1-2)"
+    [[ -n "$uptime" ]] || uptime='n/a'
+
+    if [[ -n "$remote" ]] && version_gt "$remote" "$VERSION"; then
+        updateLine="${YEL}${B}●${R} ${B}SIBIL v${remote} is available.${R} ${DIM}You have v${VERSION}.${R}  ${YEL}[2] update${R}"
+    elif [[ "$bot" == *running* && "$web" == *online* && "$db" == *ready* ]]; then
+        updateLine="${GRN}${B}●${R} All core SIBIL services look healthy."
+    else
+        updateLine="${YEL}${B}▲${R} Review highlighted service or TLS status before enabling online payments."
+    fi
+
+    printf '\n'
+    ui_lr " ${GRN}${B}▌${R} ${B}SIBIL PANEL${R}  ${DIM}advanced server dashboard${R}" \
+        "${DIM}installed${R} ${GRN}v${VERSION}${R}  ${DIM}latest${R} ${YEL}v${remote:-?}${R} "
+    ui_lr "   ${DIM}${callback:-${dom:+https://$dom}}${R}" "${DIM}${os} · ${now}${R} "
+    ui_drule
+    ui_lr " ${updateLine}" ''
+    ui_rule
+    if ((UI_W >= 76)); then
+        ui_cols 49 " ${CYN}${B}SIBIL${R}" 51 "${CYN}${B}SERVER${R}"
+        ui_cols 49 " ${DIM}Bot       ${R} ${bot}" 51 "${DIM}PHP       ${R} ${phpState}"
+        ui_cols 49 " ${DIM}Web       ${R} ${web}" 51 "${DIM}Database  ${R} ${db}"
+        ui_cols 49 " ${DIM}Domain    ${R} ${dom:-not set}" 51 "${DIM}TLS       ${R} ${tls}"
+        ui_cols 49 " ${DIM}Data      ${R} ${dataLine}" 51 "${DIM}Callback  ${R} ${callback:-not set}"
+        printf '\n'
+        ui_cols 49 " ${DIM}RAM   ${R} $(ui_bar "$memPct" 14) ${memPct}% ${DIM}${memUsed}/${memTotal}M${R}" \
+            51 "${DIM}Disk  ${R} $(ui_bar "$diskPct" 14) ${diskPct}% ${DIM}${diskUsed}/${diskTotal}K${R}"
+        ui_cols 49 " ${DIM}Load  ${R} ${load} ${DIM}· ${cores} cores${R}" \
+            51 "${DIM}Up    ${R} ${uptime}"
+    else
+        printf ' ${DIM}Bot${R} %b   ${DIM}Web${R} %b   ${DIM}DB${R} %b\n' "$bot" "$web" "$db"
+        printf ' ${DIM}Domain${R} %s   ${DIM}TLS${R} %b\n' "${dom:-not set}" "$tls"
+        printf ' ${DIM}PHP${R} %b\n' "$phpState"
+        printf ' ${DIM}RAM${R} %s%%  ${DIM}Disk${R} %s%%  ${DIM}Load${R} %s\n' "$memPct" "$diskPct" "${load%% *}"
+    fi
+    ui_rule
+}
+
+cmd_dashboard() {
+    dashboard_render
 }
 
 cmd_menu() {
-    local choice remote
+    local choice remote rc fresh
     if [[ ! -e /dev/tty ]] || { [[ ! -t 0 ]] && [[ ! -t 1 ]]; }; then
-        banner
+        dashboard_render
         warn "no interactive terminal — run: sibil help"
         return 0
     fi
     while true; do
         clear 2>/dev/null || true
-        banner
-        dashboard_health_row
+        dashboard_render
         remote="$(remote_version)"
-        if [[ -n "$remote" ]] && version_gt "$remote" "$VERSION"; then
-            printf '\n  %s● Update v%s is available. You have v%s.%s\n' "$YEL$B" "$remote" "$VERSION" "$R"
+        if ((UI_W >= 76)); then
+            ui_cols 31 " ${CYN}${B}SIBIL${R}" 34 "${CYN}${B}MAINTENANCE${R}" 35 "${CYN}${B}TOOLS${R}"
+            ui_cols 31 " ${YEL}${B}[1]${R} Install / repair" 34 "${YEL}${B}[4]${R} Update PHP" 35 "${YEL}${B}[7]${R} Database migration"
+            ui_cols 31 " ${YEL}${B}[2]${R} Update${remote:+ ${YEL}●${R}}" 34 "${YEL}${B}[5]${R} Domain / SSL" 35 "${YEL}${B}[8]${R} Status / health"
+            ui_cols 31 " ${YEL}${B}[3]${R} Remove service" 34 "${YEL}${B}[6]${R} Backup / import" 35 "${YEL}${B}[9]${R} Help / parameters"
+            ui_cols 31 "" 34 "${YEL}${B}[10]${R} Config / logs" 35 "${YEL}${B}[0]${R} Exit"
+        else
+            printf ' ${YEL}${B}[1]${R} Install / repair     ${YEL}${B}[6]${R} Backup / import\n'
+            printf ' ${YEL}${B}[2]${R} Update               ${YEL}${B}[7]${R} Database migration\n'
+            printf ' ${YEL}${B}[3]${R} Remove service       ${YEL}${B}[8]${R} Status / health\n'
+            printf ' ${YEL}${B}[4]${R} PHP update           ${YEL}${B}[9]${R} Help / parameters\n'
+            printf ' ${YEL}${B}[5]${R} Domain / SSL         ${YEL}${B}[10]${R} Config / logs   ${YEL}${B}[0]${R} Exit\n'
         fi
-        say ""
-        say "  ${B}[1]${R} Install / repair       ${B}[2]${R} Update              ${B}[3]${R} Remove service"
-        say "  ${B}[4]${R} PHP update             ${B}[5]${R} Domain / SSL        ${B}[6]${R} Backup / DB import"
-        say "  ${B}[7]${R} Database migration     ${B}[8]${R} Status / health     ${B}[9]${R} Help / parameters"
-        say "  ${B}[10]${R} Config / logs          ${B}[0]${R} Exit"
-        say ""
-        read -r -p "  choose: " choice </dev/tty || return 0
-        say ""
+        ui_rule
+        printf ' %s%s❯%s Select %s[0-10]%s: ' "$CYN" "$B" "$R" "$DIM" "$R"
+        read -r choice </dev/tty || return 0
+        say ''
         case "$choice" in
             1) cmd_install ;;
-            2) cmd_update ;;
+            2)
+                cmd_update; rc=$?
+                # The old process has the previous script parsed in memory. Re-exec
+                # the freshly installed CLI so option 2 immediately opens the new
+                # SIBIL PANEL dashboard rather than redrawing the old menu.
+                if [[ $rc -eq 0 ]]; then
+                    fresh="$PANEL_HOME/bin/sibil"
+                    if [[ -f "$fresh" ]]; then
+                        say "  ${GRN}✓${R} Opening the updated SIBIL PANEL dashboard…"
+                        exec bash "$fresh" menu
+                    fi
+                fi
+                ;;
             3) cmd_remove ;;
             4) cmd_php_update ;;
             5) cmd_domain ;;
@@ -1936,17 +2112,18 @@ cmd_menu() {
             7) cmd_migrate ;;
             8) cmd_status; cmd_doctor ;;
             9) cmd_help ;;
-            10) cmd_config ; cmd_logs "" ;;
+            10) cmd_config; cmd_logs "" ;;
             0|q|exit|'') return 0 ;;
             *) warn "unknown choice: $choice" ;;
         esac
         [[ -n "${PANEL_NO_PAUSE:-}" ]] && continue
-        say ""
-        read -r -p "  press Enter to return to the menu… " _ </dev/tty 2>/dev/null || true
+        say ''
+        read -r -p "  press Enter to return to the SIBIL PANEL dashboard… " _ </dev/tty 2>/dev/null || true
     done
 }
 
 case "${1:-menu}" in
+    dashboard) cmd_dashboard ;;
     status)  cmd_status ;;
     update)  shift; cmd_update "${1:-}" ;;
     restart) cmd_restart ;;

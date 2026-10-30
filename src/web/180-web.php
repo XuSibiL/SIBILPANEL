@@ -59,6 +59,21 @@ function web_status(int $code): void
     }
 }
 
+/**
+ * Tetra validates callback_url before it creates a checkout. This deliberate
+ * no-token response proves that the public HTTPS endpoint is alive, but it is
+ * never a payment success and cannot reach settlement code.
+ */
+function tetrapay_callback_ready_page(): string
+{
+    $name = e(bot_name());
+    return '<!doctype html><meta charset="utf-8"><title>' . $name . ' payment return</title>'
+        . '<body style="font-family:Tahoma,sans-serif;text-align:center;padding:60px">'
+        . '<h2>' . $name . ' payment return is online.</h2>'
+        . '<p>This endpoint verifies a payment server-side after a provider token arrives.</p>'
+        . '<p>No wallet or order has been credited by this health response.</p></body>';
+}
+
 /** مسیریابی درخواست وب */
 function web_handle(): void
 {
@@ -164,6 +179,11 @@ function web_handle(): void
         }
     }
 
+    if ($payment === null && $gw === 'tetrapay' && $authority === '') {
+        /* Provider callback preflight: 200 is intentional, but does not settle anything. */
+        web_html(tetrapay_callback_ready_page());
+        return;
+    }
     if ($payment === null) {
         web_status(404);
         web_html(pay_result_page('notfound'));

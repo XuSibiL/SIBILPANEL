@@ -143,6 +143,40 @@ okhu($short['insufficient'] && ($shortPanel['status'] ?? '') === 'suspended'
 okhu($recovered['resumed'] && ($recoveredPanel['status'] ?? '') === 'active',
     'after sufficient wallet funding, paid hourly component resumes the service');
 
+/* Real sale timing: first paid hour starts at the actual delivery instant, and a
+   later cap purchase starts only at its own instant. This protects the approved
+   unlimited behavior when a customer grows their user count. */
+$actualStart = $now + 177;
+$growthPanelId = DB::exec('INSERT INTO panels(tg_id, product_id, panel_username, panel_password, '
+    . 'label, max_users, user_cap, status, created_at, is_unlimited, unlimited_user_price, '
+    . 'unlimited_min_users, unlimited_billing_mode, hourly_price, billing_start_at) '
+    . 'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+    [$uid, $hourlyProductId, 'growth881', 'Pass#883', 'رشد', 4, 4, 'active', $actualStart - 1, 1,
+     125, 3, UNLIMITED_BILLING_HOURLY, 42, $actualStart]);
+unlimited_billing_unit_add($growthPanelId, 10003, 'base', 1, 42, $actualStart);
+unlimited_billing_unit_add($growthPanelId, 10003, 'users', 4, 125, $actualStart);
+add_balance($uid, 10000, 'test', 'growth-seed', 'test wallet');
+$growthPanel = DB::one('SELECT * FROM panels WHERE id=?', [$growthPanelId]) ?? [];
+$beforeStart = unlimited_hourly_charge_once($growthPanel, $actualStart - 1);
+$atStart = unlimited_hourly_charge_once($growthPanel, $actualStart);
+$growthPaidUntil = $actualStart + 4200; // cap bought 10 minutes after the initial hourly boundary
+unlimited_billing_unit_add($growthPanelId, 10004, 'users', 2, 125, $growthPaidUntil);
+$atOriginalNextHour = unlimited_hourly_charge_once($growthPanel, $actualStart + 3600);
+$atGrowthDue = unlimited_hourly_charge_once($growthPanel, $growthPaidUntil);
+$atGrowthDueAgain = unlimited_hourly_charge_once($growthPanel, $growthPaidUntil);
+$growthUnitAfter = DB::one('SELECT * FROM unlimited_billing_units WHERE panel_id=? AND source_order_id=?',
+    [$growthPanelId, 10004]) ?? [];
+echo "\n== exact start and growth billing ==\n";
+okhu($beforeStart['charged'] === 0 && $beforeStart['hours'] === 0,
+    'hourly unlimited charges nothing before its actual paid-through start time');
+okhu($atStart['charged'] === 542 && $atStart['hours'] === 2,
+    'at the actual start boundary, only the configured fixed and initial-user hourly rates are charged');
+okhu($atOriginalNextHour['charged'] === 542,
+    'the original capacity is billed at its next exact hourly boundary');
+okhu($atGrowthDue['charged'] === 250 && $atGrowthDueAgain['charged'] === 0
+    && (int) ($growthUnitAfter['paid_until'] ?? 0) === $growthPaidUntil + 3600,
+    'new user capacity begins on its own paid-through clock and cannot be back-billed or double-debited');
+
 /* Legacy unlimited panels remain economically untouched by the new meter. */
 $legacyPanelId = DB::exec('INSERT INTO panels(tg_id, product_id, panel_username, panel_password, '
     . 'label, max_users, user_cap, status, created_at, is_unlimited, unlimited_user_price, '

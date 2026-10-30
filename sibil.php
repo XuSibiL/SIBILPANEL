@@ -21,7 +21,7 @@
 
 declare(strict_types=1);
 
-const PANEL_VERSION = '3.18.3';
+const PANEL_VERSION = '3.18.4';
 const IRAN_OFFSET   = 3.5 * 3600;
 const DAY           = 86400;
 
@@ -4296,7 +4296,7 @@ function product_detail_text(array $product): string
     $daily = ((int) $product['hourly_price']) * 24;
     $prepaid = panel_prepaid_amount($product);
     $setup = max(0, set_int('panel_setup_fee', 0));
-    return $product['emoji'] . ' <b>' . e($product['name']) . "\n\n"
+    return $product['emoji'] . ' <b>' . e($product['name']) . "</b>\n\n"
         . '👤 تعداد کاربر: ' . fa_digits((int) $product['max_users']) . "\n"
         . '📦 سقف حجم پنل: ' . $cap . "\n"
         . '📱 دستگاه هر کاربر: ' . fa_digits((int) $product['device_limit']) . "\n"
@@ -4422,10 +4422,16 @@ function panel_order_breakdown(array $product, int $setupFee, int $prepaid): str
 
 function invoice_text(array $order, string $title, string $detail = ''): string
 {
+    $isTopup = (string) ($order['kind'] ?? '') === 'topup';
     $text = '🧾 <b>' . e($title) . "</b>\n\n"
         . 'کد سفارش: <code>' . e($order['ref']) . "</code>\n"
         . 'مبلغ: <b>' . money((int) $order['payable']) . "</b>\n"
-        . order_expiry_line($order);
+        . order_expiry_line($order)
+        . "\n<i>این مرحله فقط پیش‌فاکتور و انتخاب روش پرداخت است؛ "
+        . ($isTopup
+            ? 'تا تأیید قطعی درگاه، هیچ مبلغی به کیف پول اضافه نمی‌شود.'
+            : 'تا تأیید قطعی درگاه، سفارش یا سرویس فعال نمی‌شود.')
+        . '</i>' . "\n";
     if ((int) $order['discount'] > 0) {
         $text .= 'تخفیف: ' . money((int) $order['discount']) . "\n";
     }
@@ -4434,7 +4440,6 @@ function invoice_text(array $order, string $title, string $detail = ''): string
     }
     return $text;
 }
-
 /** کد تخفیف فقط برای خرید است، هرگز برای شارژ کیف پول */
 function discount_allowed_for(string $orderKind): bool
 {
@@ -21167,6 +21172,38 @@ function tetrapay_base_url(): string
 }
 
 /**
+ * Tetra v1 accepts only a genuinely public HTTPS return URL. A syntactically
+ * valid localhost URL is still unreachable by the provider, so do not let it
+ * pass merely because it has an HTTPS scheme.
+ */
+function tetrapay_public_https_url(string $url): bool
+{
+    if (!gw_https_url($url)) {
+        return false;
+    }
+    $parts = parse_url($url);
+    $host = strtolower(trim((string) ($parts['host'] ?? '')));
+    $host = trim($host, '[]');
+    if ($host === '' || filter_var($host, FILTER_VALIDATE_IP) !== false
+        || !str_contains($host, '.')
+        || preg_match('~(^|\.)(?:localhost|local)$~i', $host) === 1) {
+        return false;
+    }
+    return true;
+}
+
+/** Build the documented callback path without carrying an unsafe query/fragment. */
+function tetrapay_callback_from_base(string $base): string
+{
+    $base = trim($base);
+    if ($base === '' || str_contains($base, '?') || str_contains($base, '#')) {
+        return '';
+    }
+    $url = rtrim($base, '/') . '/pay/tetrapay';
+    return tetrapay_public_https_url($url) ? $url : '';
+}
+
+/**
  * Tetra validates the callback against the installed public website. Prefer
  * the installer/runtime URL, then PANEL_DOMAIN, before the legacy public-web
  * setting used by older SIBIL deployments.
@@ -21187,8 +21224,8 @@ function tetrapay_callback_url(): string
         $candidates[] = $legacy;
     }
     foreach ($candidates as $base) {
-        $url = rtrim($base, '/') . '/pay/tetrapay';
-        if (gw_https_url($url)) {
+        $url = tetrapay_callback_from_base($base);
+        if ($url !== '') {
             return $url;
         }
     }
@@ -21219,7 +21256,7 @@ function tetrapay_error(array $res, string $fallback = 'ساخت لینک تتر
         'UNAUTHORIZED' => 'کلید API تتراپی پذیرفته نشد یا باطل شده است.',
         'GATEWAY_SUSPENDED' => 'درگاه تتراپی در پنل پذیرنده غیرفعال یا تعلیق شده است.',
         'NO_METHOD_AVAILABLE' => 'هیچ روش پرداخت فعالی در پنل تتراپی روشن نیست.',
-        'INVALID_CALLBACK' => 'تتراپی آدرس بازگشت این نصب را نپذیرفت. آدرس عمومی HTTPS ربات را در نصب بررسی کنید.',
+        'INVALID_CALLBACK' => 'تتراپی آدرس بازگشت را نپذیرفت. دامنهٔ عمومی HTTPS ربات و مسیر /pay/tetrapay را در SIBIL بررسی کنید.',
         'INVALID_WEBHOOK', 'WEBHOOK_NOT_CONFIGURED' => 'وب‌هوک اختیاری تتراپی پذیرفته نشد؛ بررسی بازگشت پرداخت ادامه دارد.',
         'AMOUNT_OUT_OF_RANGE' => 'مبلغ خارج از بازهٔ مجاز تتراپی است.',
         'RATE_LIMITED' => $retry > 0
@@ -21272,17 +21309,14 @@ function pay_tetrapay_create(array $payment, array $order): array
     $meta['tetrapay_callback'] = $callback;
     pay_save_meta((int) $payment['id'], $meta);
 
+    /* Tetra v1 documents these exact create fields. Do not send an inherited
+       optional webhook/key2 field: current SIBIL setup is one API key plus the
+       provider-validated HTTPS return URL; settlement remains server-side verify. */
     $body = [
         'amount'       => (string) $amountRial,
         'order_id'     => $externalOrder,
         'callback_url' => $callback,
-        'description'  => 'SIBIL order ' . (string) ($order['ref'] ?? ''),
-        'allow_partial' => false,
     ];
-    $webhook = tetrapay_webhook_url();
-    if ($webhook !== '') {
-        $body['webhook_url'] = $webhook;
-    }
     $res = pay_json_post($base . '/payments', $body,
         ['Authorization: Bearer ' . gw_key('tetrapay')]);
     $data = tetrapay_data($res);
@@ -21814,10 +21848,8 @@ function gw_live_test(string $gw): array
         $notes[] = 'callback HTTPS آماده است: ' . $callback;
     }
     if ($gw === 'tetrapay') {
-        $notes[] = 'تتراپی با API رسمی تولید آماده است.';
-        if (gw_key2('tetrapay') !== '' && tetrapay_webhook_url() !== '') {
-            $notes[] = 'وب‌هوک امضاشدهٔ سازگار با نصب فعلی آماده است.';
-        }
+        $notes[] = 'تتراپی با API رسمی production v1 و بازگشت HTTPS آماده است.';
+        $notes[] = 'برای اطمینان از دسترس‌پذیری عمومی، سلامت /pay/tetrapay را از SIBIL Domain / SSL بررسی کنید.';
     }
     return [
         'ok'       => $issues === [],
@@ -22160,6 +22192,21 @@ function web_status(int $code): void
     }
 }
 
+/**
+ * Tetra validates callback_url before it creates a checkout. This deliberate
+ * no-token response proves that the public HTTPS endpoint is alive, but it is
+ * never a payment success and cannot reach settlement code.
+ */
+function tetrapay_callback_ready_page(): string
+{
+    $name = e(bot_name());
+    return '<!doctype html><meta charset="utf-8"><title>' . $name . ' payment return</title>'
+        . '<body style="font-family:Tahoma,sans-serif;text-align:center;padding:60px">'
+        . '<h2>' . $name . ' payment return is online.</h2>'
+        . '<p>This endpoint verifies a payment server-side after a provider token arrives.</p>'
+        . '<p>No wallet or order has been credited by this health response.</p></body>';
+}
+
 /** مسیریابی درخواست وب */
 function web_handle(): void
 {
@@ -22265,6 +22312,11 @@ function web_handle(): void
         }
     }
 
+    if ($payment === null && $gw === 'tetrapay' && $authority === '') {
+        /* Provider callback preflight: 200 is intentional, but does not settle anything. */
+        web_html(tetrapay_callback_ready_page());
+        return;
+    }
     if ($payment === null) {
         web_status(404);
         web_html(pay_result_page('notfound'));

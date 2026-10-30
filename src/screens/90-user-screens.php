@@ -200,7 +200,7 @@ function product_detail_text(array $product): string
     $daily = ((int) $product['hourly_price']) * 24;
     $prepaid = panel_prepaid_amount($product);
     $setup = max(0, set_int('panel_setup_fee', 0));
-    return $product['emoji'] . ' <b>' . e($product['name']) . "\n\n"
+    return $product['emoji'] . ' <b>' . e($product['name']) . "</b>\n\n"
         . '👤 تعداد کاربر: ' . fa_digits((int) $product['max_users']) . "\n"
         . '📦 سقف حجم پنل: ' . $cap . "\n"
         . '📱 دستگاه هر کاربر: ' . fa_digits((int) $product['device_limit']) . "\n"
@@ -326,10 +326,16 @@ function panel_order_breakdown(array $product, int $setupFee, int $prepaid): str
 
 function invoice_text(array $order, string $title, string $detail = ''): string
 {
+    $isTopup = (string) ($order['kind'] ?? '') === 'topup';
     $text = '🧾 <b>' . e($title) . "</b>\n\n"
         . 'کد سفارش: <code>' . e($order['ref']) . "</code>\n"
         . 'مبلغ: <b>' . money((int) $order['payable']) . "</b>\n"
-        . order_expiry_line($order);
+        . order_expiry_line($order)
+        . "\n<i>این مرحله فقط پیش‌فاکتور و انتخاب روش پرداخت است؛ "
+        . ($isTopup
+            ? 'تا تأیید قطعی درگاه، هیچ مبلغی به کیف پول اضافه نمی‌شود.'
+            : 'تا تأیید قطعی درگاه، سفارش یا سرویس فعال نمی‌شود.')
+        . '</i>' . "\n";
     if ((int) $order['discount'] > 0) {
         $text .= 'تخفیف: ' . money((int) $order['discount']) . "\n";
     }
@@ -338,7 +344,6 @@ function invoice_text(array $order, string $title, string $detail = ''): string
     }
     return $text;
 }
-
 /** کد تخفیف فقط برای خرید است، هرگز برای شارژ کیف پول */
 function discount_allowed_for(string $orderKind): bool
 {
