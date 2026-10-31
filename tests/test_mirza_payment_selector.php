@@ -118,10 +118,10 @@ okselector(in_array('inv:gw:' . $order['id'], $invoiceCallbacks, true)
     'pre-invoice opens one payment selector instead of a divergent direct gateway layout');
 $preInvoice = invoice_text($order, 'شارژ کیف پول', 'مبلغ شارژ: ' . money(50000));
 okselector(str_contains($preInvoice, (string) $order['ref'])
-    && str_contains($preInvoice, '1440 دقیقه')
+    && str_contains($preInvoice, '30 دقیقه')
     && str_contains($preInvoice, 'فقط پیش‌فاکتور')
     && str_contains($preInvoice, 'هیچ مبلغی به کیف پول اضافه نمی‌شود'),
-    'wallet top-up pre-invoice clearly gives code, amount, 1440-minute expiry, and no-early-credit warning');
+    'wallet top-up pre-invoice clearly gives code, amount, 30-minute expiry, and no-early-credit warning');
 
 echo "\n== focused gateway administration ==\n";
 Tg::$outbox = [];

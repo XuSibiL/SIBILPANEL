@@ -290,7 +290,7 @@ function cli_poll(int $seconds = 0): void
             }
             try {
                 payments_poll();
-                payments_expire(set_int('pay_expire_minutes', 1440));
+                payments_expire(set_int('pay_expire_minutes', 30));
             } catch (Throwable $ex) {
                 log_line('warning', 'payment sweep failed: ' . $ex->getMessage());
             }
@@ -382,7 +382,7 @@ function cli_main(array $argv): int
             return $ok ? 0 : 1;
         case '--pay-poll':
             $settled = payments_poll();
-            $expired = payments_expire(set_int('pay_expire_minutes', 1440));
+            $expired = payments_expire(set_int('pay_expire_minutes', 30));
             echo json_encode(['settled' => $settled, 'expired' => $expired]) . "\n";
             return 0;
         case '--meter':

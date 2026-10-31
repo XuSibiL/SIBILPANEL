@@ -355,7 +355,7 @@ function order_payment_expired(array $order, ?int $at = null): bool
     if ($created <= 0) {
         return true;
     }
-    $minutes = max(1, set_int('pay_expire_minutes', 1440));
+    $minutes = max(1, set_int('pay_expire_minutes', 30));
     return $created + $minutes * 60 <= ($at ?? now_ts());
 }
 

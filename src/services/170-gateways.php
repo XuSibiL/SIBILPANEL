@@ -413,20 +413,18 @@ function pay_find_by_authority(string $authority): ?array
 /** عبارت مهلت پرداخت برای پیام مشتری. */
 function pay_expiry_human(): string
 {
-    $minutes = max(1, set_int('pay_expire_minutes', 1440));
-    if ($minutes === 1440) {
-        return 'یک روز';
-    }
+    $minutes = max(1, set_int('pay_expire_minutes', 30));
     if ($minutes % 60 === 0) {
         return fa_digits(intdiv($minutes, 60)) . ' ساعت';
     }
     return fa_digits($minutes) . ' دقیقه';
 }
 
-/** Variza uses compact documented durations; the SIBIL one-day policy is 1d. */
+/** Variza accepts compact hourly/day durations. Local settlement is still
+    closed at the configured 30-minute deadline. */
 function pay_variza_expiry(): string
 {
-    $minutes = max(1, set_int('pay_expire_minutes', 1440));
+    $minutes = max(1, set_int('pay_expire_minutes', 30));
     if ($minutes % 1440 === 0) {
         return intdiv($minutes, 1440) . 'd';
     }
@@ -784,7 +782,7 @@ function pay_start(array $order, string $gw): array
             $created['text'] = gw_min_from_provider_text($gw, $amount, $raw);
         }
     }
-    if (($created['ok'] ?? false) === true && ($created['url'] ?? '') !== '') {
+    if (($created['ok'] ?? false) === true && gw_https_url((string) ($created['url'] ?? ''))) {
         /* URL را محلی نگه می‌داریم تا لمس دوبارهٔ دکمه همان فاکتور باز را باز کند. */
         $fresh = pay_get((int) $payment['id']) ?? $payment;
         $meta = pay_meta($fresh);
@@ -794,6 +792,12 @@ function pay_start(array $order, string $gw): array
         }
         pay_save_meta((int) $payment['id'], $meta);
         $created['payment'] = (int) $payment['id'];
+    } else {
+        /* A rejected or malformed provider response must not leave an unpaid
+           local row behind. Otherwise each retry accumulates another invoice
+           and later produces another expiry sweep. */
+        DB::update("UPDATE payments SET status='expire' WHERE id=? AND status='unpaid'",
+            [(int) $payment['id']]);
     }
     return $created;
 }
@@ -2197,7 +2201,7 @@ function pay_plisio_create(array $payment, array $order): array
         'callback_url'    => pay_callback_url('plisio') . '?json=true',
         'success_callback_url' => web_base() . '/pay/plisio?return=1',
         'fail_callback_url'    => web_base() . '/pay/plisio?fail=1',
-        'expire_min'      => 60,
+        'expire_min'      => max(1, set_int('pay_expire_minutes', 30)),
         'plugin'          => 'panel-service',
         'version'         => PANEL_VERSION,
     ]);
@@ -2614,7 +2618,7 @@ function pay_error_text(array $res, string $fallback): string
 }
 
 /** منقضی کردن پرداخت‌های رهاشده */
-function payments_expire(int $minutes = 1440): int
+function payments_expire(int $minutes = 30): int
 {
     $minutes = max(1, $minutes);
     $limit = now_ts() - $minutes * 60;
@@ -2632,10 +2636,12 @@ function payments_expire(int $minutes = 1440): int
 }
 
 /**
- * بستن یک تراکنش: اول تلاش می‌کنیم خودِ درگاه تراکنش را لغو کند، بعد
- * ردیف را قفل می‌کنیم، پیام فاکتور را از چت کاربر پاک می‌کنیم و به او خبر
- * می‌دهیم. بعد از این لحظه حتی اگر درگاه «پرداخت شد» بفرستد، ربات خودش
- * پول را شارژ نمی‌کند و پرونده را برای تصمیم ادمین بالا می‌فرستد.
+ * بستن یک تراکنش: اول تلاش می‌کنیم خودِ درگاه تراکنش را لغو کنیم، سپس
+ * ردیف را قفل و لینک پرداخت را از چت کاربر حذف می‌کنیم. sweep زمان‌بندی‌شده
+ * هیچ پیام خودکاری ارسال نمی‌کند؛ بنابراین فاکتورهای رهاشده یا تلاش‌های
+ * تکراری، کاربر و مدیر را با پیام انقضا بمباران نمی‌کنند. بعد از این لحظه
+ * حتی اگر درگاه «پرداخت شد» بفرستد، ربات خودش پول را شارژ نمی‌کند و پرونده
+ * برای تصمیم ادمین بالا می‌رود.
  */
 function pay_expire_one(array $row): bool
 {
@@ -2657,14 +2663,9 @@ function pay_expire_one(array $row): bool
     if ($msgId > 0) {
         Tg::delete((int) $row['tg_id'], $msgId);
     }
-    /* ۳) اطلاع به کاربر */
-    $minutes = max(1, set_int('pay_expire_minutes', 1440));
-    Tg::send((int) $row['tg_id'],
-        '⌛️ <b>مهلت پرداخت تمام شد</b>' . "\n\n"
-        . 'فاکتور ' . fa_digits($minutes) . ' دقیقه‌ای این سفارش بسته شد و لینک پرداختش '
-        . 'غیرفعال شد.' . "\n"
-        . 'اگر پولی واریز کرده‌ای، همین‌جا به پشتیبانی بگو تا بررسی شود.',
-        [[btn('📦 پنل‌های من', 'menu:panels'), btn('💰 کیف پول', 'menu:wallet')]]);
+    /* No automatic expiration message: the invoice itself displays its
+       30-minute deadline, and an expired button still receives a direct,
+       on-demand explanation from its callback handler. */
     return true;
 }
 

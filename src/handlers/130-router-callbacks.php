@@ -487,13 +487,12 @@ function handle_callback_inner(array $cb): void
             $gw = (string) ($parts[3] ?? '');
             /* مهلت پرداخت واقعاً اعمال می‌شود: اگر فاکتور از حد گذشته باشد هیچ
                درگاهی باز نمی‌شود و سفارش بسته می‌شود — نه فقط یک نوشته. */
-            payments_expire(set_int('pay_expire_minutes', 1440));
+            payments_expire(set_int('pay_expire_minutes', 30));
             $fresh = order_get((int) $order['id']);
             if ($fresh === null || $fresh['status'] !== 'pending') {
-                $minutes = max(1, set_int('pay_expire_minutes', 1440));
                 Tg::show($chatId, $messageId,
                     '⌛️ <b>مهلت پرداخت تمام شد</b>' . "\n\n"
-                    . 'این فاکتور ' . fa_digits($minutes) . ' دقیقه اعتبار داشت و اکنون بسته شد.'
+                    . 'مهلت پرداخت این فاکتور ' . pay_expiry_human() . ' بود و اکنون بسته شده است.'
                     . "\n" . 'هیچ مبلغی از کیف پولتان کم نشد.' . "\n\n"
                     . 'یک سفارش تازه بساز تا فاکتور جدید بگیرید.',
                     [[btn('🔁 سفارش تازه', 'home', null, 'success')],

@@ -242,7 +242,7 @@ function screen_product(int|string $chat, ?int $messageId, int $productId): void
 /** ثانیه‌های باقی‌مانده تا بسته‌شدن فاکتور (۰ = بسته شده) */
 function order_seconds_left(array $order): int
 {
-    $minutes = max(1, set_int('pay_expire_minutes', 1440));
+    $minutes = max(1, set_int('pay_expire_minutes', 30));
     $made = (int) ($order['created_at'] ?? now_ts());
     return max(0, ($made + $minutes * 60) - now_ts());
 }
@@ -256,7 +256,7 @@ function order_expiry_line(array $order): string
     }
     /* شمارش پله‌پله: هر ۱۵ دقیقه یک پله کم می‌شود (۳۰ → ۱۵ → ۰) */
     $step = 15;
-    $minutes = max(1, set_int('pay_expire_minutes', 1440));
+    $minutes = max(1, set_int('pay_expire_minutes', 30));
     $remaining = (int) ceil($left / ($step * 60)) * $step;
     $remaining = min($remaining, $minutes);
     if ($remaining <= 0) {
@@ -825,7 +825,7 @@ function crypto_links_list(): array
 
 function crypto_invoice_text(array $order, string $label, string $invoiceNo, float $paidUsd = 0.0): string
 {
-    $minutes = max(1, set_int('pay_expire_minutes', 1440));
+    $minutes = max(1, set_int('pay_expire_minutes', 30));
     $links = '';
     $mark = ['🔹', '🔸'];
     foreach (crypto_links_list() as $i => $host) {

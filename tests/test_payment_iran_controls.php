@@ -1,7 +1,7 @@
 <?php
 /**
  * Focused payment regressions: Iranian gateways, daily ceilings, card receipt
- * approval/cashback, one-day expiry, safe endpoint validation and Stars.
+ * approval/cashback, 30-minute expiry, safe endpoint validation and Stars.
  */
 declare(strict_types=1);
 
@@ -39,18 +39,18 @@ function outbox_control_text(): string
 }
 
 set_put('web_url', 'https://panel.example.test');
-/* Existing untouched 30-minute installations are migrated exactly once. */
-set_put('pay_expire_minutes', '30');
-DB::exec("DELETE FROM settings WHERE key='pay_expiry_policy_24h'");
+/* Existing standard 24-hour installations are migrated once to 30 minutes. */
+set_put('pay_expire_minutes', '1440');
+DB::exec("DELETE FROM settings WHERE key='pay_expiry_policy_30m'");
 settings_bootstrap();
 
 echo "\n== URL, expiry and buyer guidance ==\n";
 okcontrol(gw_https_url('https://gateway.example.test/api') === true, 'valid HTTPS endpoint is accepted');
 okcontrol(gw_https_url('https:///missing-host') === false, 'HTTPS endpoint needs a host');
 okcontrol(gw_https_url('https://user:pass@gateway.example.test') === false, 'endpoint credentials are rejected');
-okcontrol(set_int('pay_expire_minutes') === 1440 && pay_expiry_human() === 'یک روز'
-    && pay_variza_expiry() === '1d',
-    'legacy default migrates to one day and Variza maps it to 1d');
+okcontrol(set_int('pay_expire_minutes') === 30 && pay_expiry_human() === '30 دقیقه'
+    && pay_variza_expiry() === '1h',
+    'standard payment expiry migrates to 30 minutes and local deadline is enforced');
 set_put('pay_iranpay4_help', '<b>راهنمای امن</b>');
 $help = pay_gateway_help_notice('iranpay4');
 okcontrol(str_contains($help, '&lt;b&gt;راهنمای امن&lt;/b&gt;') && !str_contains($help, '<b>راهنمای امن</b>'),
@@ -58,9 +58,9 @@ okcontrol(str_contains($help, '&lt;b&gt;راهنمای امن&lt;/b&gt;') && !st
 $noticeOrder = ['ref' => 'ORDER-ONE', 'payable' => 25000, 'kind' => 'topup'];
 $noticePayment = ['method' => 'iranpay4', 'authority' => 'ab-token', 'amount' => 25000];
 $notice = pay_created_notice($noticeOrder, $noticePayment) . $help;
-okcontrol(str_contains($notice, 'یک روز') && str_contains($notice, 'Verify/Webhook')
+okcontrol(str_contains($notice, '30 دقیقه') && str_contains($notice, 'Verify/Webhook')
     && !str_contains($notice, 'به کیف پول شما واریز گردید'),
-    'created notice is one-day pending guidance with no premature credit claim');
+    'created notice is 30-minute pending guidance with no premature credit claim');
 
 /* PDO SQLite builds disagree on whether raw BEGIN IMMEDIATE is visible through
    inTransaction(). Nested project transactions must therefore remain safe on
@@ -143,7 +143,7 @@ okcontrol(str_contains(outbox_control_text(), 'خارج از بازهٔ کارت
     'direct card screen enforces the configured card minimum before receipt upload');
 
 $expiredCardOrder = create_order($cardUid, 'topup', 40000, null, ['topup' => 40000]);
-DB::exec('UPDATE orders SET created_at=? WHERE id=?', [now_ts() - 1441 * 60, (int) $expiredCardOrder['id']]);
+DB::exec('UPDATE orders SET created_at=? WHERE id=?', [now_ts() - 31 * 60, (int) $expiredCardOrder['id']]);
 $expiredCardOrder = order_get((int) $expiredCardOrder['id']) ?? [];
 Tg::$outbox = [];
 screen_card_payment($cardUid, null, $cardUid, $expiredCardOrder);
@@ -153,7 +153,7 @@ okcontrol(($expiredCardAfter['status'] ?? '') === 'canceled'
     'expired card selection cannot start a receipt flow or revive its order');
 
 $expiredReceiptButtonOrder = create_order($cardUid, 'topup', 40000, null, ['topup' => 40000]);
-DB::exec('UPDATE orders SET created_at=? WHERE id=?', [now_ts() - 1441 * 60,
+DB::exec('UPDATE orders SET created_at=? WHERE id=?', [now_ts() - 31 * 60,
     (int) $expiredReceiptButtonOrder['id']]);
 Tg::$outbox = [];
 handle_callback(['id' => 'expired-receipt-button', 'from' => ['id' => $cardUid],
@@ -166,7 +166,7 @@ okcontrol(($expiredReceiptButtonAfter['status'] ?? '') === 'canceled'
     'expired receipt button cannot place a buyer back into the upload flow');
 
 $expiredReceiptOrder = create_order($cardUid, 'topup', 40000, null, ['topup' => 40000]);
-DB::exec('UPDATE orders SET created_at=? WHERE id=?', [now_ts() - 1441 * 60, (int) $expiredReceiptOrder['id']]);
+DB::exec('UPDATE orders SET created_at=? WHERE id=?', [now_ts() - 31 * 60, (int) $expiredReceiptOrder['id']]);
 State::set($cardUid, 'receipt', ['order_id' => (int) $expiredReceiptOrder['id']]);
 handle_message(['from' => ['id' => $cardUid, 'first_name' => 'Card'],
     'chat' => ['id' => $cardUid, 'type' => 'private'],
@@ -182,7 +182,7 @@ $expiryUid = 810006;
 user_ensure($expiryUid, 'Expiry Tester', 'expiry');
 add_balance($expiryUid, 50000, 'test', 'expiry-seed', 'wallet seed');
 $expiredWalletOrder = create_order($expiryUid, 'topup', 10000, null, ['topup' => 10000]);
-DB::exec('UPDATE orders SET created_at=? WHERE id=?', [now_ts() - 1441 * 60, (int) $expiredWalletOrder['id']]);
+DB::exec('UPDATE orders SET created_at=? WHERE id=?', [now_ts() - 31 * 60, (int) $expiredWalletOrder['id']]);
 $expiryBalanceBefore = balance_of($expiryUid);
 Tg::$outbox = [];
 handle_callback(['id' => 'expired-wallet-callback', 'from' => ['id' => $expiryUid],
@@ -192,6 +192,31 @@ $expiredWalletAfter = order_get((int) $expiredWalletOrder['id']) ?? [];
 okcontrol(($expiredWalletAfter['status'] ?? '') === 'canceled' && balance_of($expiryUid) === $expiryBalanceBefore
     && str_contains(outbox_control_text(), 'مهلت پرداخت تمام شد'),
     'an expired invoice cannot be paid from the wallet through a stale callback');
+
+/* A sweep may encounter duplicate abandoned payment rows from an older retry,
+   but it must close them silently and never repeat a chat notification. */
+echo "\n== silent abandoned-invoice expiry ==\n";
+$sweepUid = 810007;
+user_ensure($sweepUid, 'Sweep Tester', 'sweep');
+$sweepOrder = create_order($sweepUid, 'topup', 25000, null, ['topup' => 25000]);
+$sweepPaymentA = pay_new($sweepOrder, 'iranpay4', 25000);
+$sweepPaymentB = pay_new($sweepOrder, 'iranpay4', 25000);
+$expiredAt = now_ts() - 31 * 60;
+DB::exec('UPDATE orders SET created_at=? WHERE id=?', [$expiredAt, (int) $sweepOrder['id']]);
+DB::exec('UPDATE payments SET created_at=? WHERE id IN (?,?)', [$expiredAt,
+    (int) $sweepPaymentA['id'], (int) $sweepPaymentB['id']]);
+Tg::$outbox = [];
+$firstSweep = payments_expire(30);
+$secondSweep = payments_expire(30);
+$sweepOrderAfter = order_get((int) $sweepOrder['id']) ?? [];
+$sweepPaymentAAfter = pay_get((int) $sweepPaymentA['id']) ?? [];
+$sweepPaymentBAfter = pay_get((int) $sweepPaymentB['id']) ?? [];
+okcontrol($firstSweep >= 2 && $secondSweep === 0
+    && ($sweepOrderAfter['status'] ?? '') === 'canceled'
+    && ($sweepPaymentAAfter['status'] ?? '') === 'expire'
+    && ($sweepPaymentBAfter['status'] ?? '') === 'expire'
+    && !str_contains(outbox_control_text(), 'مهلت پرداخت تمام شد'),
+    'abandoned invoices close once, without periodic customer or admin spam');
 
 /* AbanPay follows public Mirza's create/verify contract but trusts only the
    server-side verify response for settlement. */
@@ -222,6 +247,16 @@ set_put('pay_iranpay4_endpoint', 'https://aban.example.test/api');
 set_put('pay_iranpay4_daily_limit', '0');
 $abanUid = 810003;
 user_ensure($abanUid, 'Aban Tester', 'aban');
+$failedAbanOrder = create_order($abanUid, 'topup', 25000, null, ['topup' => 25000]);
+set_put('pay_iranpay4_endpoint', 'https://aban.example.test/reject');
+$failedAbanCreate = pay_start($failedAbanOrder, 'iranpay4');
+$failedAbanPayment = DB::one('SELECT * FROM payments WHERE order_id=? AND method=?',
+    [(int) $failedAbanOrder['id'], 'iranpay4']);
+okcontrol(($failedAbanCreate['ok'] ?? true) === false
+    && ($failedAbanPayment['status'] ?? '') === 'expire',
+    'a rejected provider creation leaves no unpaid local invoice behind');
+$abanCalls = [];
+set_put('pay_iranpay4_endpoint', 'https://aban.example.test/api');
 $abanOrder = create_order($abanUid, 'topup', 25000, null, ['topup' => 25000]);
 $abanCreate = pay_start($abanOrder, 'iranpay4');
 $abanPayment = DB::one("SELECT * FROM payments WHERE order_id=? AND method='iranpay4'", [(int) $abanOrder['id']]);
@@ -342,7 +377,7 @@ $abanLateOrder = create_order($abanUid, 'topup', 25000, null, ['topup' => 25000]
 $abanLateCreate = pay_start($abanLateOrder, 'iranpay4');
 $abanLatePayment = DB::one("SELECT * FROM payments WHERE order_id=? AND method='iranpay4'",
     [(int) $abanLateOrder['id']]);
-DB::exec('UPDATE orders SET created_at=? WHERE id=?', [now_ts() - 1441 * 60, (int) $abanLateOrder['id']]);
+DB::exec('UPDATE orders SET created_at=? WHERE id=?', [now_ts() - 31 * 60, (int) $abanLateOrder['id']]);
 $abanBalanceBeforeLateVerify = balance_of($abanUid);
 $abanLateVerify = pay_abanpay_verify($abanLatePayment ?? [], [
     'order_id' => (string) $abanLateOrder['ref'], 'authority' => 'aban-token',
@@ -353,11 +388,11 @@ okcontrol(($abanLateCreate['ok'] ?? false) === true && ($abanLateVerify['state']
     && ($abanLatePaymentAfter['status'] ?? '') === 'expire'
     && ($abanLateOrderAfter['status'] ?? '') === 'canceled'
     && balance_of($abanUid) === $abanBalanceBeforeLateVerify,
-    'a provider-confirmed AbanPay callback after the one-day deadline expires and cancels without auto-credit');
+    'a provider-confirmed AbanPay callback after the 30-minute deadline expires and cancels without auto-credit');
 
-/* Variza maps SIBIL's default one-day policy to the documented 1d expiry and
+/* Variza rounds the local 30-minute deadline to its documented hourly expiry and
    accepts only a signed payment.paid webhook. */
-echo "\n== Variza one-day signed webhook ==\n";
+echo "\n== Variza signed webhook ==\n";
 $varizaCalls = [];
 $GLOBALS['panel_http_mock'] = static function (string $method, string $url, array $headers, ?string $body) use (&$varizaCalls): array {
     $varizaCalls[] = [$method, $url, $headers, $body];
@@ -383,8 +418,8 @@ $hookSignature = 'sha256=' . hash_hmac('sha256', (string) $hookRaw, 'variza-secr
 $varizaHook = pay_variza_webhook($hookBody, (string) $hookRaw, $hookSignature);
 $varizaAgain = pay_variza_webhook($hookBody, (string) $hookRaw, $hookSignature);
 $varizaBad = pay_variza_webhook($hookBody, (string) $hookRaw, 'sha256=' . str_repeat('0', 64));
-okcontrol(($varizaCreate['ok'] ?? false) === true && ($varizaPayload['expires_in'] ?? '') === '1d',
-    'Variza creation uses its documented one-day expiry value');
+okcontrol(($varizaCreate['ok'] ?? false) === true && ($varizaPayload['expires_in'] ?? '') === '1h',
+    'Variza creation uses its documented hourly expiry value');
 okcontrol(($varizaPayload['return_url'] ?? '') === 'https://panel.example.test/payment/variza.php?order=' . urlencode((string) $varizaOrder['ref'])
     && ($varizaPayment['authority'] ?? '') === 'variza-slug',
     'Variza stores its slug and return route without trusting browser settlement');

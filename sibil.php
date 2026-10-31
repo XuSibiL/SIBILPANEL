@@ -1144,7 +1144,7 @@ const SETTING_DEFAULTS = [
     'web_url'              => '',
     'web_port'             => '8080',
     'stars_rate'           => '1000',
-    'pay_expire_minutes'   => '1440', // یک روز؛ پرداخت تازه باید یک روز فرصت داشته باشد
+    'pay_expire_minutes'   => '30', // همهٔ فاکتورهای پرداخت ۳۰ دقیقه اعتبار دارند
     'trial_on'             => '1',
     'trial_gb'             => '1',
     'trial_hours'          => '24',
@@ -1239,13 +1239,12 @@ function settings_bootstrap(): void
             set_put($key, $value);
         }
     }
-    /* v3.18.3 policy: the historical untouched 30-minute default becomes one
-       day.  Deliberate custom values remain untouched. */
-    if (DB::one("SELECT key FROM settings WHERE key='pay_expiry_policy_24h'") === null) {
-        if (set_get('pay_expire_minutes', '') === '30') {
-            set_put('pay_expire_minutes', '1440');
-        }
-        set_put('pay_expiry_policy_24h', '1');
+    /* Payment policy: all checkout invoices have a 30-minute deadline. Apply
+       it once to existing installations that still carry the former 24-hour
+       default; later administrator changes remain explicit. */
+    if (DB::one("SELECT key FROM settings WHERE key='pay_expiry_policy_30m'") === null) {
+        set_put('pay_expire_minutes', '30');
+        set_put('pay_expiry_policy_30m', '1');
     }
 }
 
@@ -3090,7 +3089,7 @@ function order_payment_expired(array $order, ?int $at = null): bool
     if ($created <= 0) {
         return true;
     }
-    $minutes = max(1, set_int('pay_expire_minutes', 1440));
+    $minutes = max(1, set_int('pay_expire_minutes', 30));
     return $created + $minutes * 60 <= ($at ?? now_ts());
 }
 
@@ -4350,7 +4349,7 @@ function screen_product(int|string $chat, ?int $messageId, int $productId): void
 /** ثانیه‌های باقی‌مانده تا بسته‌شدن فاکتور (۰ = بسته شده) */
 function order_seconds_left(array $order): int
 {
-    $minutes = max(1, set_int('pay_expire_minutes', 1440));
+    $minutes = max(1, set_int('pay_expire_minutes', 30));
     $made = (int) ($order['created_at'] ?? now_ts());
     return max(0, ($made + $minutes * 60) - now_ts());
 }
@@ -4364,7 +4363,7 @@ function order_expiry_line(array $order): string
     }
     /* شمارش پله‌پله: هر ۱۵ دقیقه یک پله کم می‌شود (۳۰ → ۱۵ → ۰) */
     $step = 15;
-    $minutes = max(1, set_int('pay_expire_minutes', 1440));
+    $minutes = max(1, set_int('pay_expire_minutes', 30));
     $remaining = (int) ceil($left / ($step * 60)) * $step;
     $remaining = min($remaining, $minutes);
     if ($remaining <= 0) {
@@ -4933,7 +4932,7 @@ function crypto_links_list(): array
 
 function crypto_invoice_text(array $order, string $label, string $invoiceNo, float $paidUsd = 0.0): string
 {
-    $minutes = max(1, set_int('pay_expire_minutes', 1440));
+    $minutes = max(1, set_int('pay_expire_minutes', 30));
     $links = '';
     $mark = ['🔹', '🔸'];
     foreach (crypto_links_list() as $i => $host) {
@@ -6011,7 +6010,7 @@ function help_body(string $key, array $item): string
     if ($key !== 'pay') {
         return (string) ($item['body'] ?? '');
     }
-    $minutes = max(1, set_int('pay_expire_minutes', 1440));
+    $minutes = max(1, set_int('pay_expire_minutes', 30));
     return "در " . e(bot_name()) . ' جهت رفاه حال شما، روش‌های متنوع و آنی برای پرداخت '
         . 'و خرید سرویس‌ها فراهم شده است:' . "\n\n"
         . "💎 <b>روش اول: شارژ کیف پول (پیشنهادی و آنی)</b>\n"
@@ -7022,7 +7021,7 @@ function screen_finance(int|string $chat, ?int $messageId): void
  */
 function screen_fin_settings(int|string $chat, ?int $messageId): void
 {
-    $expire = set_int('pay_expire_minutes', 1440);
+    $expire = set_int('pay_expire_minutes', 30);
     $disc = set_bool('discount_enabled', true);
     $minTop = set_int('min_topup', 50000);
     $maxTop = set_int('max_topup', 20000000);
@@ -15439,13 +15438,12 @@ function handle_callback_inner(array $cb): void
             $gw = (string) ($parts[3] ?? '');
             /* مهلت پرداخت واقعاً اعمال می‌شود: اگر فاکتور از حد گذشته باشد هیچ
                درگاهی باز نمی‌شود و سفارش بسته می‌شود — نه فقط یک نوشته. */
-            payments_expire(set_int('pay_expire_minutes', 1440));
+            payments_expire(set_int('pay_expire_minutes', 30));
             $fresh = order_get((int) $order['id']);
             if ($fresh === null || $fresh['status'] !== 'pending') {
-                $minutes = max(1, set_int('pay_expire_minutes', 1440));
                 Tg::show($chatId, $messageId,
                     '⌛️ <b>مهلت پرداخت تمام شد</b>' . "\n\n"
-                    . 'این فاکتور ' . fa_digits($minutes) . ' دقیقه اعتبار داشت و اکنون بسته شد.'
+                    . 'مهلت پرداخت این فاکتور ' . pay_expiry_human() . ' بود و اکنون بسته شده است.'
                     . "\n" . 'هیچ مبلغی از کیف پولتان کم نشد.' . "\n\n"
                     . 'یک سفارش تازه بساز تا فاکتور جدید بگیرید.',
                     [[btn('🔁 سفارش تازه', 'home', null, 'success')],
@@ -19206,7 +19204,7 @@ function cli_poll(int $seconds = 0): void
             }
             try {
                 payments_poll();
-                payments_expire(set_int('pay_expire_minutes', 1440));
+                payments_expire(set_int('pay_expire_minutes', 30));
             } catch (Throwable $ex) {
                 log_line('warning', 'payment sweep failed: ' . $ex->getMessage());
             }
@@ -19298,7 +19296,7 @@ function cli_main(array $argv): int
             return $ok ? 0 : 1;
         case '--pay-poll':
             $settled = payments_poll();
-            $expired = payments_expire(set_int('pay_expire_minutes', 1440));
+            $expired = payments_expire(set_int('pay_expire_minutes', 30));
             echo json_encode(['settled' => $settled, 'expired' => $expired]) . "\n";
             return 0;
         case '--meter':
@@ -20151,20 +20149,18 @@ function pay_find_by_authority(string $authority): ?array
 /** عبارت مهلت پرداخت برای پیام مشتری. */
 function pay_expiry_human(): string
 {
-    $minutes = max(1, set_int('pay_expire_minutes', 1440));
-    if ($minutes === 1440) {
-        return 'یک روز';
-    }
+    $minutes = max(1, set_int('pay_expire_minutes', 30));
     if ($minutes % 60 === 0) {
         return fa_digits(intdiv($minutes, 60)) . ' ساعت';
     }
     return fa_digits($minutes) . ' دقیقه';
 }
 
-/** Variza uses compact documented durations; the SIBIL one-day policy is 1d. */
+/** Variza accepts compact hourly/day durations. Local settlement is still
+    closed at the configured 30-minute deadline. */
 function pay_variza_expiry(): string
 {
-    $minutes = max(1, set_int('pay_expire_minutes', 1440));
+    $minutes = max(1, set_int('pay_expire_minutes', 30));
     if ($minutes % 1440 === 0) {
         return intdiv($minutes, 1440) . 'd';
     }
@@ -20522,7 +20518,7 @@ function pay_start(array $order, string $gw): array
             $created['text'] = gw_min_from_provider_text($gw, $amount, $raw);
         }
     }
-    if (($created['ok'] ?? false) === true && ($created['url'] ?? '') !== '') {
+    if (($created['ok'] ?? false) === true && gw_https_url((string) ($created['url'] ?? ''))) {
         /* URL را محلی نگه می‌داریم تا لمس دوبارهٔ دکمه همان فاکتور باز را باز کند. */
         $fresh = pay_get((int) $payment['id']) ?? $payment;
         $meta = pay_meta($fresh);
@@ -20532,6 +20528,12 @@ function pay_start(array $order, string $gw): array
         }
         pay_save_meta((int) $payment['id'], $meta);
         $created['payment'] = (int) $payment['id'];
+    } else {
+        /* A rejected or malformed provider response must not leave an unpaid
+           local row behind. Otherwise each retry accumulates another invoice
+           and later produces another expiry sweep. */
+        DB::update("UPDATE payments SET status='expire' WHERE id=? AND status='unpaid'",
+            [(int) $payment['id']]);
     }
     return $created;
 }
@@ -21935,7 +21937,7 @@ function pay_plisio_create(array $payment, array $order): array
         'callback_url'    => pay_callback_url('plisio') . '?json=true',
         'success_callback_url' => web_base() . '/pay/plisio?return=1',
         'fail_callback_url'    => web_base() . '/pay/plisio?fail=1',
-        'expire_min'      => 60,
+        'expire_min'      => max(1, set_int('pay_expire_minutes', 30)),
         'plugin'          => 'panel-service',
         'version'         => PANEL_VERSION,
     ]);
@@ -22352,7 +22354,7 @@ function pay_error_text(array $res, string $fallback): string
 }
 
 /** منقضی کردن پرداخت‌های رهاشده */
-function payments_expire(int $minutes = 1440): int
+function payments_expire(int $minutes = 30): int
 {
     $minutes = max(1, $minutes);
     $limit = now_ts() - $minutes * 60;
@@ -22370,10 +22372,12 @@ function payments_expire(int $minutes = 1440): int
 }
 
 /**
- * بستن یک تراکنش: اول تلاش می‌کنیم خودِ درگاه تراکنش را لغو کند، بعد
- * ردیف را قفل می‌کنیم، پیام فاکتور را از چت کاربر پاک می‌کنیم و به او خبر
- * می‌دهیم. بعد از این لحظه حتی اگر درگاه «پرداخت شد» بفرستد، ربات خودش
- * پول را شارژ نمی‌کند و پرونده را برای تصمیم ادمین بالا می‌فرستد.
+ * بستن یک تراکنش: اول تلاش می‌کنیم خودِ درگاه تراکنش را لغو کنیم، سپس
+ * ردیف را قفل و لینک پرداخت را از چت کاربر حذف می‌کنیم. sweep زمان‌بندی‌شده
+ * هیچ پیام خودکاری ارسال نمی‌کند؛ بنابراین فاکتورهای رهاشده یا تلاش‌های
+ * تکراری، کاربر و مدیر را با پیام انقضا بمباران نمی‌کنند. بعد از این لحظه
+ * حتی اگر درگاه «پرداخت شد» بفرستد، ربات خودش پول را شارژ نمی‌کند و پرونده
+ * برای تصمیم ادمین بالا می‌رود.
  */
 function pay_expire_one(array $row): bool
 {
@@ -22395,14 +22399,9 @@ function pay_expire_one(array $row): bool
     if ($msgId > 0) {
         Tg::delete((int) $row['tg_id'], $msgId);
     }
-    /* ۳) اطلاع به کاربر */
-    $minutes = max(1, set_int('pay_expire_minutes', 1440));
-    Tg::send((int) $row['tg_id'],
-        '⌛️ <b>مهلت پرداخت تمام شد</b>' . "\n\n"
-        . 'فاکتور ' . fa_digits($minutes) . ' دقیقه‌ای این سفارش بسته شد و لینک پرداختش '
-        . 'غیرفعال شد.' . "\n"
-        . 'اگر پولی واریز کرده‌ای، همین‌جا به پشتیبانی بگو تا بررسی شود.',
-        [[btn('📦 پنل‌های من', 'menu:panels'), btn('💰 کیف پول', 'menu:wallet')]]);
+    /* No automatic expiration message: the invoice itself displays its
+       30-minute deadline, and an expired button still receives a direct,
+       on-demand explanation from its callback handler. */
     return true;
 }
 
