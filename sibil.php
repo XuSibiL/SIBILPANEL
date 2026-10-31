@@ -23086,14 +23086,14 @@ function screen_pay_gateway(int|string $chat, ?int $messageId, string $gw): void
         if ($gw === 'iranpay4') {
             $endpoint = pay_abanpay_endpoint();
             $callback = pay_callback_url('iranpay4');
-            $text .= '🌐 آدرس ابان‌پی: <code>' . e($endpoint !== '' ? $endpoint : 'ثبت نشده') . "</code>\n"
-                . '🧩 سازگاری میرزا: <code>' . e($callback !== '' ? $callback : 'آدرس وب ثبت نشده') . "</code>\n"
-                . 'آدرس و کلید باید همان دو مقداری باشند که اتصال «میرزا آپدیت‌شده» آبان می‌دهد.\n';
+            $text .= 'نشانی اتصال: <code>' . e($endpoint !== '' ? $endpoint : 'ثبت نشده') . "</code>\n"
+                . 'نشانی بازگشت در حالت سازگار: <code>' . e($callback !== '' ? $callback : 'آدرس وب ثبت نشده') . "</code>\n"
+                . 'نشانی و کلید اتصال را مطابق مقادیر ارائه‌شده برای گزینهٔ «میرزا آپدیت‌شده» در سرویس Aban ثبت کنید.' . "\n";
         }
         if (in_array($gw, ['iranpay1', 'iranpay2', 'zarinpal', 'aqayepardakht'], true)) {
             $callback = pay_callback_url($gw);
             if ($callback !== '') {
-                $text .= '🧩 کال‌بک سازگار با میرزا: <code>' . e($callback) . "</code>\n";
+                $text .= 'نشانی بازگشت در حالت سازگار: <code>' . e($callback) . "</code>\n";
             }
         }
         if ($gw === 'variza') {
@@ -23102,10 +23102,10 @@ function screen_pay_gateway(int|string $chat, ?int $messageId, string $gw): void
             $hook = gw_https_url($base . '/payment/variza_webhook.php')
                 ? $base . '/payment/variza_webhook.php' : '';
             if ($return !== '') {
-                $text .= '🧩 بازگشت سازگار با میرزا: <code>' . e($return) . "</code>\n";
+                $text .= 'نشانی بازگشت در حالت سازگار: <code>' . e($return) . "</code>\n";
             }
             if ($hook !== '') {
-                $text .= '🔐 وب‌هوک سازگار با میرزا: <code>' . e($hook) . "</code>\n";
+                $text .= 'وب‌هوک در حالت سازگار: <code>' . e($hook) . "</code>\n";
             }
         }
         if ($gw === 'tetrapay') {
