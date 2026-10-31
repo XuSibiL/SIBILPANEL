@@ -236,7 +236,7 @@ okcontrol(($abanCreate['ok'] ?? false) === true && ($abanCreate['url'] ?? '') ==
     'AbanPay creates the hosted payment link');
 okcontrol(($abanCreateBody['order_id'] ?? '') === (string) $abanOrder['ref']
     && ($abanCreateBody['user_id'] ?? '') === (string) $abanUid
-    && ($abanCreateBody['callback_url'] ?? '') === 'https://panel.example.test/pay/iranpay4'
+    && ($abanCreateBody['callback_url'] ?? '') === 'https://panel.example.test/payment/iranpay4.php'
     && str_contains($abanHeaders, 'Authorization: Bearer aban-api-key'),
     'AbanPay create payload, buyer binding, and bearer authorization match Mirza adapter contract');
 okcontrol($abanBalanceBeforeVerify === 0 && (int) ($abanInvoiceLookup['id'] ?? 0) === (int) ($abanPayment['id'] ?? 0),
@@ -385,7 +385,7 @@ $varizaAgain = pay_variza_webhook($hookBody, (string) $hookRaw, $hookSignature);
 $varizaBad = pay_variza_webhook($hookBody, (string) $hookRaw, 'sha256=' . str_repeat('0', 64));
 okcontrol(($varizaCreate['ok'] ?? false) === true && ($varizaPayload['expires_in'] ?? '') === '1d',
     'Variza creation uses its documented one-day expiry value');
-okcontrol(($varizaPayload['return_url'] ?? '') === 'https://panel.example.test/pay/variza?order=' . urlencode((string) $varizaOrder['ref'])
+okcontrol(($varizaPayload['return_url'] ?? '') === 'https://panel.example.test/payment/variza.php?order=' . urlencode((string) $varizaOrder['ref'])
     && ($varizaPayment['authority'] ?? '') === 'variza-slug',
     'Variza stores its slug and return route without trusting browser settlement');
 okcontrol(($varizaHook['state'] ?? '') === 'success' && balance_of($varizaUid) === 25000,

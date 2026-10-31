@@ -321,9 +321,54 @@ function web_base(): string
     return rtrim($url, '/');
 }
 
+/**
+ * Updated Mirza installs expose gateway callbacks as files under /payment/.
+ * SIBIL is a single-router service, but publishing these exact public paths
+ * lets connector bots use the same callback contract without a copied or
+ * writable PHP file.  Keep this list strictly to the documented Rial/Mirza
+ * adapters: TetraPay deliberately remains on its own Telegram callback flow.
+ */
+const MIRZA_PAYMENT_CALLBACK_PATHS = [
+    'iranpay1'      => '/payment/iranpay1.php',
+    'iranpay2'      => '/payment/iranpay2.php',
+    'iranpay4'      => '/payment/iranpay4.php',
+    'zarinpal'      => '/payment/zarinpal.php',
+    'aqayepardakht' => '/payment/aqayepardakht.php',
+    'variza'        => '/payment/variza.php',
+];
+
+/** These file-shaped ingress aliases are accepted in addition to /pay/<gw>.
+ * Variza's signed webhook is a distinct Mirza file and therefore gets its own
+ * route instead of treating a browser return as payment proof. */
+const MIRZA_PAYMENT_ROUTE_ALIASES = [
+    '/payment/iranpay1.php'       => 'iranpay1',
+    '/payment/iranpay2.php'       => 'iranpay2',
+    '/payment/iranpay4.php'       => 'iranpay4',
+    '/payment/zarinpal.php'       => 'zarinpal',
+    '/payment/aqayepardakht.php'  => 'aqayepardakht',
+    '/payment/variza.php'         => 'variza',
+    '/payment/variza_webhook.php' => 'variza/webhook',
+];
+
+function mirza_payment_callback_path(string $gw): ?string
+{
+    return MIRZA_PAYMENT_CALLBACK_PATHS[$gw] ?? null;
+}
+
+/** Return the internal gateway route for an exact public Mirza payment file. */
+function mirza_payment_route_alias(string $path): ?string
+{
+    $path = '/' . ltrim(rtrim($path, '/'), '/');
+    return MIRZA_PAYMENT_ROUTE_ALIASES[$path] ?? null;
+}
+
 function pay_callback_url(string $gw): string
 {
-    $url = rtrim(web_base(), '/') . '/pay/' . rawurlencode($gw);
+    /* New Rial checkouts advertise the path emitted by updated Mirza itself.
+       Existing /pay/* callbacks remain handled by web_handle(), so already
+       created invoices never lose their return path after an update. */
+    $path = mirza_payment_callback_path($gw) ?? '/pay/' . rawurlencode($gw);
+    $url = rtrim(web_base(), '/') . $path;
     return gw_https_url($url) ? $url : '';
 }
 

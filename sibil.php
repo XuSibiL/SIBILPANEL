@@ -21,7 +21,7 @@
 
 declare(strict_types=1);
 
-const PANEL_VERSION = '3.18.5';
+const PANEL_VERSION = '3.18.6';
 const IRAN_OFFSET   = 3.5 * 3600;
 const DAY           = 86400;
 
@@ -20059,9 +20059,54 @@ function web_base(): string
     return rtrim($url, '/');
 }
 
+/**
+ * Updated Mirza installs expose gateway callbacks as files under /payment/.
+ * SIBIL is a single-router service, but publishing these exact public paths
+ * lets connector bots use the same callback contract without a copied or
+ * writable PHP file.  Keep this list strictly to the documented Rial/Mirza
+ * adapters: TetraPay deliberately remains on its own Telegram callback flow.
+ */
+const MIRZA_PAYMENT_CALLBACK_PATHS = [
+    'iranpay1'      => '/payment/iranpay1.php',
+    'iranpay2'      => '/payment/iranpay2.php',
+    'iranpay4'      => '/payment/iranpay4.php',
+    'zarinpal'      => '/payment/zarinpal.php',
+    'aqayepardakht' => '/payment/aqayepardakht.php',
+    'variza'        => '/payment/variza.php',
+];
+
+/** These file-shaped ingress aliases are accepted in addition to /pay/<gw>.
+ * Variza's signed webhook is a distinct Mirza file and therefore gets its own
+ * route instead of treating a browser return as payment proof. */
+const MIRZA_PAYMENT_ROUTE_ALIASES = [
+    '/payment/iranpay1.php'       => 'iranpay1',
+    '/payment/iranpay2.php'       => 'iranpay2',
+    '/payment/iranpay4.php'       => 'iranpay4',
+    '/payment/zarinpal.php'       => 'zarinpal',
+    '/payment/aqayepardakht.php'  => 'aqayepardakht',
+    '/payment/variza.php'         => 'variza',
+    '/payment/variza_webhook.php' => 'variza/webhook',
+];
+
+function mirza_payment_callback_path(string $gw): ?string
+{
+    return MIRZA_PAYMENT_CALLBACK_PATHS[$gw] ?? null;
+}
+
+/** Return the internal gateway route for an exact public Mirza payment file. */
+function mirza_payment_route_alias(string $path): ?string
+{
+    $path = '/' . ltrim(rtrim($path, '/'), '/');
+    return MIRZA_PAYMENT_ROUTE_ALIASES[$path] ?? null;
+}
+
 function pay_callback_url(string $gw): string
 {
-    $url = rtrim(web_base(), '/') . '/pay/' . rawurlencode($gw);
+    /* New Rial checkouts advertise the path emitted by updated Mirza itself.
+       Existing /pay/* callbacks remain handled by web_handle(), so already
+       created invoices never lose their return path after an update. */
+    $path = mirza_payment_callback_path($gw) ?? '/pay/' . rawurlencode($gw);
+    $url = rtrim(web_base(), '/') . $path;
     return gw_https_url($url) ? $url : '';
 }
 
@@ -22601,6 +22646,35 @@ function web_status(int $code): void
 }
 
 /**
+ * The current Mirza files for AbanGateway and Variza return a normal result
+ * page for a bare or unknown order rather than a server error; CubePay returns
+ * {"status":false} to non-browser callers.  Connector bots use this harmless
+ * behaviour to find /payment/*.php before any invoice exists.  It never loads
+ * a payment, calls a provider, or settles an order.
+ */
+function web_mirza_compat_missing_payment(string $gw, array $fields): bool
+{
+    if (!in_array($gw, ['iranpay2', 'iranpay4', 'variza'], true)) {
+        return false;
+    }
+    if ($gw === 'iranpay2' && !str_contains(strtolower(web_header('Accept')), 'text/html')) {
+        web_json(200, ['status' => false]);
+        return true;
+    }
+    $hint = web_callback_value($fields, [
+        'order_id', 'order', 'merchant_order_id', 'invoice_id', 'authority', 'token', 'payment_id',
+    ]);
+    $detail = $hint === '' ? 'شناسه سفارش ارسال نشد.' : 'این سفارش پیدا نشد.';
+    web_html('<!doctype html><html lang="fa" dir="rtl"><meta charset="utf-8">'
+        . '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        . '<body style="font-family:Tahoma,sans-serif;text-align:center;padding:48px 20px">'
+        . '<div style="font-size:44px">&#10005;</div>'
+        . '<h2 style="color:#e74c3c">پرداخت ناموفق</h2>'
+        . '<p style="color:#666">' . e($detail) . '</p></body></html>');
+    return true;
+}
+
+/**
  * This is the legacy website-style Tetra callback landing page. Current
  * SIBIL Tetra bot checkouts return through Telegram; this harmless response is
  * retained for older website-style links and can never reach settlement code.
@@ -22621,6 +22695,15 @@ function web_handle(): void
 {
     $path = parse_url((string) ($_SERVER['REQUEST_URI'] ?? '/'), PHP_URL_PATH) ?: '/';
     $path = rtrim($path, '/');
+
+    /* Updated Mirza and connector bots call physical-looking files such as
+       /payment/iranpay4.php.  SIBIL intentionally has one PHP router, so map
+       only the documented Rial aliases to the existing authoritative handlers.
+       No TetraPay route is included here. */
+    $mirzaCompatGateway = mirza_payment_route_alias($path);
+    if ($mirzaCompatGateway !== null) {
+        $path = '/pay/' . $mirzaCompatGateway;
+    }
 
     /*
      * Keep older website-style callbacks harmless and dependency-free. New
@@ -22763,6 +22846,13 @@ function web_handle(): void
         return;
     }
     if ($payment === null) {
+        /* Preserve the exact non-settling probe response from the updated
+           Mirza Aban/Cube/Variza files.  Other aliases retain SIBIL's normal
+           404 response for a genuinely unknown payment. */
+        if ($mirzaCompatGateway !== null
+            && web_mirza_compat_missing_payment($mirzaCompatGateway, $fields)) {
+            return;
+        }
         web_status(404);
         web_html(pay_result_page('notfound'));
         return;
@@ -22995,7 +23085,28 @@ function screen_pay_gateway(int|string $chat, ?int $messageId, string $gw): void
         }
         if ($gw === 'iranpay4') {
             $endpoint = pay_abanpay_endpoint();
-            $text .= '🌐 آدرس ابان‌پی: <code>' . e($endpoint !== '' ? $endpoint : 'ثبت نشده') . "</code>\n";
+            $callback = pay_callback_url('iranpay4');
+            $text .= '🌐 آدرس ابان‌پی: <code>' . e($endpoint !== '' ? $endpoint : 'ثبت نشده') . "</code>\n"
+                . '🧩 سازگاری میرزا: <code>' . e($callback !== '' ? $callback : 'آدرس وب ثبت نشده') . "</code>\n"
+                . 'آدرس و کلید باید همان دو مقداری باشند که اتصال «میرزا آپدیت‌شده» آبان می‌دهد.\n';
+        }
+        if (in_array($gw, ['iranpay1', 'iranpay2', 'zarinpal', 'aqayepardakht'], true)) {
+            $callback = pay_callback_url($gw);
+            if ($callback !== '') {
+                $text .= '🧩 کال‌بک سازگار با میرزا: <code>' . e($callback) . "</code>\n";
+            }
+        }
+        if ($gw === 'variza') {
+            $return = pay_callback_url('variza');
+            $base = rtrim(web_base(), '/');
+            $hook = gw_https_url($base . '/payment/variza_webhook.php')
+                ? $base . '/payment/variza_webhook.php' : '';
+            if ($return !== '') {
+                $text .= '🧩 بازگشت سازگار با میرزا: <code>' . e($return) . "</code>\n";
+            }
+            if ($hook !== '') {
+                $text .= '🔐 وب‌هوک سازگار با میرزا: <code>' . e($hook) . "</code>\n";
+            }
         }
         if ($gw === 'tetrapay') {
             $text .= 'API رسمی تولید تتراپی به‌صورت خودکار استفاده می‌شود.\n';

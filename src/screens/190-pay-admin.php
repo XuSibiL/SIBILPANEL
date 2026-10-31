@@ -176,7 +176,28 @@ function screen_pay_gateway(int|string $chat, ?int $messageId, string $gw): void
         }
         if ($gw === 'iranpay4') {
             $endpoint = pay_abanpay_endpoint();
-            $text .= '🌐 آدرس ابان‌پی: <code>' . e($endpoint !== '' ? $endpoint : 'ثبت نشده') . "</code>\n";
+            $callback = pay_callback_url('iranpay4');
+            $text .= '🌐 آدرس ابان‌پی: <code>' . e($endpoint !== '' ? $endpoint : 'ثبت نشده') . "</code>\n"
+                . '🧩 سازگاری میرزا: <code>' . e($callback !== '' ? $callback : 'آدرس وب ثبت نشده') . "</code>\n"
+                . 'آدرس و کلید باید همان دو مقداری باشند که اتصال «میرزا آپدیت‌شده» آبان می‌دهد.\n';
+        }
+        if (in_array($gw, ['iranpay1', 'iranpay2', 'zarinpal', 'aqayepardakht'], true)) {
+            $callback = pay_callback_url($gw);
+            if ($callback !== '') {
+                $text .= '🧩 کال‌بک سازگار با میرزا: <code>' . e($callback) . "</code>\n";
+            }
+        }
+        if ($gw === 'variza') {
+            $return = pay_callback_url('variza');
+            $base = rtrim(web_base(), '/');
+            $hook = gw_https_url($base . '/payment/variza_webhook.php')
+                ? $base . '/payment/variza_webhook.php' : '';
+            if ($return !== '') {
+                $text .= '🧩 بازگشت سازگار با میرزا: <code>' . e($return) . "</code>\n";
+            }
+            if ($hook !== '') {
+                $text .= '🔐 وب‌هوک سازگار با میرزا: <code>' . e($hook) . "</code>\n";
+            }
         }
         if ($gw === 'tetrapay') {
             $text .= 'API رسمی تولید تتراپی به‌صورت خودکار استفاده می‌شود.\n';

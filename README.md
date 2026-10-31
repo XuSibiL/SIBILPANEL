@@ -4,16 +4,16 @@
 
 **ربات فروش پنل پاسارگارد (PasarGuard) — نسخهٔ PHP**
 
-**نسخهٔ پایدار: `3.18.5`**
+**نسخهٔ پایدار: `3.18.6`**
 
 فروش پنل حجمی/ساعتی، کیف پول، درگاه‌های پرداخت ایرانی و کریپتو، احراز هویت دو سطحی،
 کد تخفیف، سیستم دعوت دوستان و پنل مدیریت کامل — بدون فریم‌ورک، بدون Composer.
 
-![version](https://img.shields.io/badge/version-3.18.5-2ea043)
+![version](https://img.shields.io/badge/version-3.18.6-2ea043)
 ![php](https://img.shields.io/badge/PHP-8.1%2B-777bb4)
 ![db](https://img.shields.io/badge/SQLite-PDO-003b57)
 ![license](https://img.shields.io/badge/license-MIT-blue)
-![tests](https://img.shields.io/badge/tests-215%20passing-2ea043)
+![tests](https://img.shields.io/badge/tests-251%20passing-2ea043)
 
 [![کانال رسمی تلگرام](https://img.shields.io/badge/Telegram-%DA%A9%D8%A7%D9%86%D8%A7%D9%84%20%D8%B1%D8%B3%D9%85%DB%8C-229ED9?logo=telegram&logoColor=white)](https://t.me/sibilpanel)
 [![GitHub](https://img.shields.io/badge/GitHub-XuSibiL%2FSIBILPANEL-181717?logo=github&logoColor=white)](https://github.com/XuSibiL/SIBILPANEL)
@@ -75,6 +75,38 @@
 | 💬 **پاسخ پشتیبانی** | زیر هر پیام مستقیمِ ادمین/پشتیبانی دکمهٔ «✍️ پاسخ به پیام / پشتیبانی» می‌آید؛ پاسخ با مشخصات کاربر، ticket امن و دکمهٔ پاسخ مجدد برای مسئول معتبر و گروه گزارشات ثبت می‌شود |
 | 📨 **پیام همگانی** | ارسال پس‌زمینه، تحمل 429، رد کاربران مسدودشده و گزارش کامل |
 | 🛡 **امنیت** | سکرت‌ها فقط در `.env`، دیتابیس SQLite با تراکنش قفل‌شده، هاردنینگ وب‌سرور |
+
+---
+
+## اتصال درگاه‌های ریالی با قرارداد میرزا
+
+نسخهٔ `3.18.6` مسیرهای واقعیِ پرداخت **Mirza updated** را داخل router خود SIBIL منتشر می‌کند؛
+پس لازم نیست هیچ فایل PHP را دستی در هاست آپلود کنید. نصب‌کنندهٔ رسمی همهٔ درخواست‌ها را به همان
+router می‌رساند و این آدرس‌ها پاسخ می‌دهند:
+
+| سرویس | مسیر سازگار با میرزا | قاعدهٔ قطعی‌سازی |
+|---|---|---|
+| Aban Gateway | `/payment/iranpay4.php` | callback فقط lookup است؛ `POST /verify` با Bearer key، تطبیق order/amount و تحویل idempotent |
+| CubePay | `/payment/iranpay2.php` | امضای HMAC + bind شدن به `order_id` پیش از تحویل |
+| Variza | `/payment/variza.php` و `/payment/variza_webhook.php` | بازگشت مرورگر فقط وضعیت انتظار؛ فقط webhook امضاشده تسویه می‌کند |
+| IranPay1 / زرین‌پال / آقای پرداخت | `/payment/iranpay1.php`، `/payment/zarinpal.php`، `/payment/aqayepardakht.php` | همان verify سمت سرور SIBIL |
+
+برای **Aban Gateway** در ربات Aban گزینهٔ «میرزا آپدیت‌شده» را انتخاب کنید و **ریشهٔ دامنهٔ نصب
+SIBIL** را بدهید (مثلاً `https://example.com`، نه صفحهٔ پنل یا زیرشاخه). سپس دو مقدار برگردانده‌شده
+را در SIBIL، «مدیریت → مالی → Aban Gateway» بگذارید: `آدرس ابان‌پی` همان آدرس اتصال و `کلید اصلی`
+همان کلید اتصال. هنگام ساخت فاکتور، SIBIL دقیقاً callback زیر را می‌فرستد:
+
+```
+https://your-domain/payment/iranpay4.php
+```
+
+یک درخواست ساده به این فایل، پیش از هر سفارش، فقط پاسخ بی‌خطرِ «شناسه سفارش ارسال نشد» می‌دهد؛
+هیچ پرداخت، کیف پول یا محصولی با probe/بازگشت مرورگر موفق نمی‌شود. پس از callback، فقط تأیید
+authoritative ارائه‌دهنده می‌تواند سفارش را تحویل دهد. مسیرهای قدیمی `/pay/...` هم برای فاکتورهای
+ساخته‌شده در نسخه‌های قبل زنده مانده‌اند.
+
+> **TetraPay عمداً به این لایه وارد نشده است.** callback تلگرامی، API و webhook آن بدون تغییر
+> می‌مانند.
 
 ---
 

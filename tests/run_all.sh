@@ -12,6 +12,7 @@ bash -n bin/sibil
 tests=(
   "php tests/test_db_tx_pdo_compat.php"
   "php tests/test_payment_iran_controls.php"
+  "php tests/test_mirza_payment_aliases.php"
   "php tests/test_payment_tetrapay.php"
   "php tests/test_tetrapay_preflight_fast.php"
   "php tests/test_mirza_payment_selector.php"

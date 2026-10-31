@@ -89,6 +89,35 @@ function web_status(int $code): void
 }
 
 /**
+ * The current Mirza files for AbanGateway and Variza return a normal result
+ * page for a bare or unknown order rather than a server error; CubePay returns
+ * {"status":false} to non-browser callers.  Connector bots use this harmless
+ * behaviour to find /payment/*.php before any invoice exists.  It never loads
+ * a payment, calls a provider, or settles an order.
+ */
+function web_mirza_compat_missing_payment(string $gw, array $fields): bool
+{
+    if (!in_array($gw, ['iranpay2', 'iranpay4', 'variza'], true)) {
+        return false;
+    }
+    if ($gw === 'iranpay2' && !str_contains(strtolower(web_header('Accept')), 'text/html')) {
+        web_json(200, ['status' => false]);
+        return true;
+    }
+    $hint = web_callback_value($fields, [
+        'order_id', 'order', 'merchant_order_id', 'invoice_id', 'authority', 'token', 'payment_id',
+    ]);
+    $detail = $hint === '' ? 'شناسه سفارش ارسال نشد.' : 'این سفارش پیدا نشد.';
+    web_html('<!doctype html><html lang="fa" dir="rtl"><meta charset="utf-8">'
+        . '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        . '<body style="font-family:Tahoma,sans-serif;text-align:center;padding:48px 20px">'
+        . '<div style="font-size:44px">&#10005;</div>'
+        . '<h2 style="color:#e74c3c">پرداخت ناموفق</h2>'
+        . '<p style="color:#666">' . e($detail) . '</p></body></html>');
+    return true;
+}
+
+/**
  * This is the legacy website-style Tetra callback landing page. Current
  * SIBIL Tetra bot checkouts return through Telegram; this harmless response is
  * retained for older website-style links and can never reach settlement code.
@@ -109,6 +138,15 @@ function web_handle(): void
 {
     $path = parse_url((string) ($_SERVER['REQUEST_URI'] ?? '/'), PHP_URL_PATH) ?: '/';
     $path = rtrim($path, '/');
+
+    /* Updated Mirza and connector bots call physical-looking files such as
+       /payment/iranpay4.php.  SIBIL intentionally has one PHP router, so map
+       only the documented Rial aliases to the existing authoritative handlers.
+       No TetraPay route is included here. */
+    $mirzaCompatGateway = mirza_payment_route_alias($path);
+    if ($mirzaCompatGateway !== null) {
+        $path = '/pay/' . $mirzaCompatGateway;
+    }
 
     /*
      * Keep older website-style callbacks harmless and dependency-free. New
@@ -251,6 +289,13 @@ function web_handle(): void
         return;
     }
     if ($payment === null) {
+        /* Preserve the exact non-settling probe response from the updated
+           Mirza Aban/Cube/Variza files.  Other aliases retain SIBIL's normal
+           404 response for a genuinely unknown payment. */
+        if ($mirzaCompatGateway !== null
+            && web_mirza_compat_missing_payment($mirzaCompatGateway, $fields)) {
+            return;
+        }
         web_status(404);
         web_html(pay_result_page('notfound'));
         return;

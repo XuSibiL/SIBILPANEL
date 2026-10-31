@@ -1,5 +1,25 @@
 # تغییرها
 
+## 3.18.6 — 2026-10-31
+
+- **سازگاری واقعی با میرزا برای درگاه‌های ریالی:** مسیرهای فایل‌مانندِ قرارداد میرزا، شامل
+  `/payment/iranpay4.php` (Aban Gateway)، `/payment/iranpay2.php` (CubePay)،
+  `/payment/variza.php` و `/payment/variza_webhook.php` (Variza)، و aliasهای سازگار
+  برای IranPay1، زرین‌پال و آقای پرداخت، اکنون توسط router خود SIBIL پاسخ داده می‌شوند.
+  نیازی به آپلود فایل PHP جداگانه نیست و مسیرهای قدیمی `/pay/...` برای فاکتورهای پیشین حفظ شده‌اند.
+- **آبان Gateway / میرزا آپدیت‌شده:** ساخت فاکتور همان payload مرجع میرزا را می‌فرستد:
+  `amount`، `order_id`، `user_id` و callback دقیق `/payment/iranpay4.php` با Bearer key.
+  بازگشت/اعلان فقط شناسهٔ lookup است؛ SIBIL همیشه `/verify` را سمت سرور صدا می‌زند،
+  کد سفارش و مبلغ را تطبیق می‌دهد و سپس تحویل idempotent سفارش را انجام می‌دهد.
+- **CubePay و Variza:** CubePay فقط با امضای HMAC و سفارشِ bind‌شده تسویه می‌شود؛
+  بازگشت Variza هرگز تسویه نمی‌کند و فقط وب‌هوک امضاشدهٔ آن سفارش را تحویل می‌دهد.
+  پاسخ‌های probe بی‌خطرِ همان فایل‌های میرزا برای Aban/Cube/Variza اضافه شده‌اند تا connector bot
+  بتواند نصب را قبل از ساخت اولین فاکتور تشخیص دهد.
+- **TetraPay تغییری نکرده است.** مسیر Telegram، API، webhook، تنظیمات و رفتار آن عمداً خارج از
+  لایهٔ سازگاری میرزا باقی مانده‌اند.
+- تست تازهٔ `test_mirza_payment_aliases.php` مسیرهای واقعی، قرارداد create، verify/امضا و تحویل
+  exactly-once برای Aban، CubePay و Variza را پوشش می‌دهد.
+
 ## 3.18.5 — 2026-10-31
 
 - Aban Gateway now uses Mirza-compatible buyer binding, accepts JSON/form/query provider callbacks only as lookup hints, verifies server-side, and has bounded authoritative reconciliation for missed callbacks.
