@@ -16,6 +16,7 @@ tests=(
   "php tests/test_payment_tetrapay.php"
   "php tests/test_tetrapay_preflight_fast.php"
   "php tests/test_mirza_payment_selector.php"
+  "php tests/test_crypto_gateway_lifecycle.php"
   "php tests/test_metered_product_callbacks.php"
   "php tests/test_hourly_unlimited.php"
   "php tests/test_v318_unlimited.php"

@@ -1206,6 +1206,11 @@ function handle_callback_inner(array $cb): void
                 screen_pay_gateway($chatId, $messageId, $gw);
                 return;
             }
+            if ($op === 'key2' && $gw === 'nowpayment') {
+                Tg::answer($cbId, 'NowPayments فقط با کلید API اصلی تنظیم می‌شود.', true);
+                screen_pay_gateway($chatId, $messageId, $gw);
+                return;
+            }
             if ($op === 'key2' && $gw === 'tetrapay') {
                 Tg::answer($cbId, 'تتراپی فقط با کلید API اصلی تنظیم می‌شود.', true);
                 screen_pay_gateway($chatId, $messageId, $gw);
@@ -1214,7 +1219,6 @@ function handle_callback_inner(array $cb): void
             if (in_array($op, ['key', 'key2', 'min', 'max', 'daily', 'cashback', 'help', 'minfiat', 'endpoint'], true)) {
                 $key2Label = match ($gw) {
                     'variza' => 'کلید امضای وب‌هوک Variza',
-                    'nowpayment' => 'IPN secret نواپی‌منت',
                     'iranpay2' => 'کلید دوم / امضای کال‌بک CubePay',
                     'trx' => 'آدرس کیف پول TRX',
                     default => 'کلید دوم',

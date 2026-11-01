@@ -166,7 +166,6 @@ function screen_pay_gateway(int|string $chat, ?int $messageId, string $gw): void
         $text .= 'کلید اصلی: ' . e($mask(gw_key($gw))) . "\n";
         $key2Label = match ($gw) {
             'variza' => 'کلید امضای وب‌هوک',
-            'nowpayment' => 'IPN secret',
             'iranpay2' => 'کلید دوم / امضای کال‌بک',
             'trx' => 'آدرس کیف پول TRX',
             default => '',
@@ -251,7 +250,6 @@ function screen_pay_gateway(int|string $chat, ?int $messageId, string $gw): void
         $rows[] = [btn('🔑 کلید اصلی', 'ad:pay:' . $gw . ':key')];
         $key2Button = match ($gw) {
             'variza' => '🔐 کلید وب‌هوک',
-            'nowpayment' => '🔐 IPN secret',
             'iranpay2' => '🔐 کلید دوم',
             'trx' => '👛 کیف پول TRX',
             default => '',

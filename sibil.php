@@ -16157,6 +16157,11 @@ function handle_callback_inner(array $cb): void
                 screen_pay_gateway($chatId, $messageId, $gw);
                 return;
             }
+            if ($op === 'key2' && $gw === 'nowpayment') {
+                Tg::answer($cbId, 'NowPayments فقط با کلید API اصلی تنظیم می‌شود.', true);
+                screen_pay_gateway($chatId, $messageId, $gw);
+                return;
+            }
             if ($op === 'key2' && $gw === 'tetrapay') {
                 Tg::answer($cbId, 'تتراپی فقط با کلید API اصلی تنظیم می‌شود.', true);
                 screen_pay_gateway($chatId, $messageId, $gw);
@@ -16165,7 +16170,6 @@ function handle_callback_inner(array $cb): void
             if (in_array($op, ['key', 'key2', 'min', 'max', 'daily', 'cashback', 'help', 'minfiat', 'endpoint'], true)) {
                 $key2Label = match ($gw) {
                     'variza' => 'کلید امضای وب‌هوک Variza',
-                    'nowpayment' => 'IPN secret نواپی‌منت',
                     'iranpay2' => 'کلید دوم / امضای کال‌بک CubePay',
                     'trx' => 'آدرس کیف پول TRX',
                     default => 'کلید دوم',
@@ -19762,7 +19766,7 @@ const PAY_GATEWAYS = [
     'tetrapay'      => ['label' => 'تتراپی', 'emoji' => '🔷', 'type' => 'online',
                         'hint' => 'فقط کلید API تتراپی؛ مبلغ‌ها خودکار از تومان به ریال تبدیل می‌شوند.'],
     'nowpayment'    => ['label' => 'NowPayments', 'emoji' => '₿', 'type' => 'crypto',
-                        'hint' => 'x-api-key از nowpayments.io + IPN secret.'],
+                        'hint' => 'فقط x-api-key از nowpayments.io.'],
     'plisio'        => ['label' => 'Plisio', 'emoji' => '🪙', 'type' => 'crypto',
                         'hint' => 'Secret key از Plisio (همان کلید، امضای کال‌بک را می‌سازد).'],
     'variza'        => ['label' => 'Variza', 'emoji' => '🏦', 'type' => 'online',
@@ -19783,9 +19787,10 @@ function pay_setting_defaults(): array
         }
         $defaults["pay_{$id}_on"] = ($id === 'card') ? '1' : '0';
         $defaults["pay_{$id}_key"] = '';
-        /* TetraPay new installs require only its API key. An old key2 setting,
-           if already present, is read solely to validate a legacy webhook. */
-        if ($id !== 'tetrapay') {
+        /* TetraPay and NowPayments new installs require only their API key.
+           Any old secondary setting remains harmless legacy data and is not
+           required for checkout creation or settlement. */
+        if (!in_array($id, ['tetrapay', 'nowpayment'], true)) {
             $defaults["pay_{$id}_key2"] = '';
         }
         /* اعداد پیش‌فرض درگاه‌ها */
@@ -20005,9 +20010,6 @@ function gw_readiness(string $gw): array
     }
     if ($gw === 'variza' && gw_key2($gw) === '') {
         $missing[] = 'کلید امضای وب‌هوک واریزا ثبت نشده';
-    }
-    if ($gw === 'nowpayment' && gw_key2($gw) === '') {
-        $missing[] = 'IPN secret نواپی‌منت ثبت نشده';
     }
     if ($gw === 'trx' && gw_key2($gw) === '') {
         $missing[] = 'آدرس کیف پول TRX ثبت نشده';
@@ -20426,6 +20428,50 @@ function pay_result_page(string $state, string $orderRef = '', int $amount = 0):
 /* ── درخواست پرداخت از هر درگاه ─────────────────────────────────────────── */
 
 /**
+ * علت فنیِ ساخت‌نشدن لینک فقط برای گزارش مدیر آماده می‌شود. کلیدهای API و
+ * هر متن احتمالیِ شامل آن‌ها پیش از ارسال به تلگرام حذف می‌شوند.
+ */
+function crypto_checkout_failure_reason(string $gw, array $created): string
+{
+    $reason = trim((string) ($created['report_reason'] ?? $created['text'] ?? ''));
+    if (($created['ok'] ?? false) === true && !gw_https_url((string) ($created['url'] ?? ''))) {
+        $reason = 'درگاه پاسخ موفق داد اما لینک HTTPS معتبر برنگرداند.';
+    }
+    if ($reason === '') {
+        $reason = 'درگاه پاسخ قابل‌استفاده‌ای برای ساخت لینک برنگرداند.';
+    }
+    foreach (array_filter([gw_key($gw), gw_key2($gw)], static fn(string $value): bool => $value !== '') as $secret) {
+        $reason = str_replace($secret, '[REDACTED]', $reason);
+    }
+    $reason = strip_tags($reason);
+    $reason = preg_replace('/[\x00-\x1F\x7F]+/u', ' ', $reason) ?? $reason;
+    $reason = preg_replace('/\b(authorization|x-api-key|api[ _-]?key|token|secret)\b\s*[:=]\s*[^\s<]+/iu',
+        '$1: [REDACTED]', $reason) ?? $reason;
+    $reason = trim($reason);
+    $status = (int) ($created['report_status'] ?? 0);
+    return ($status > 0 ? 'HTTP ' . $status . ' · ' : '') . mb_substr($reason, 0, 500);
+}
+
+/** گزارش فنیِ خطای ساخت لینک کریپتو؛ مشتری هیچ متن درگاه یا کلیدی نمی‌بیند. */
+function report_crypto_checkout_failure(string $gw, array $order, array $payment, array $created): void
+{
+    $label = (string) (PAY_GATEWAYS[$gw]['label'] ?? $gw);
+    $reason = crypto_checkout_failure_reason($gw, $created);
+    $context = ['gateway' => $gw, 'order' => (string) ($order['ref'] ?? ''),
+        'payment' => (int) ($payment['id'] ?? 0), 'reason' => $reason];
+    log_line('warning', 'crypto checkout creation failed', $context);
+    post_report('⚠️ <b>گزارش خطا در ساخت لینک ' . e($label) . '</b>' . "\n\n"
+        . 'کد سفارش: <code>' . e((string) ($order['ref'] ?? '—')) . "</code>\n"
+        . 'شناسهٔ پرداخت: <code>' . (int) ($payment['id'] ?? 0) . "</code>\n"
+        . 'علت فنی: <code>' . e($reason) . '</code>', 'error');
+}
+
+function crypto_checkout_failure_customer_text(): string
+{
+    return 'مشکلی در ایجاد لینک پرداخت پیش آمد.';
+}
+
+/**
  * شروع پرداخت. خروجی:
  * ['ok'=>bool, 'url'=>لینک پرداخت, 'text'=>پیام برای کاربر, 'payment'=>id]
  */
@@ -20521,19 +20567,24 @@ function pay_start(array $order, string $gw): array
     if (($created['ok'] ?? false) === true && gw_https_url((string) ($created['url'] ?? ''))) {
         /* URL را محلی نگه می‌داریم تا لمس دوبارهٔ دکمه همان فاکتور باز را باز کند. */
         $fresh = pay_get((int) $payment['id']) ?? $payment;
-        $meta = pay_meta($fresh);
-        $meta['checkout_url'] = (string) $created['url'];
+        $paymentMeta = pay_meta($fresh);
+        $paymentMeta['checkout_url'] = (string) $created['url'];
         if (!empty($created['alt_url']) && preg_match('~^https://~i', (string) $created['alt_url']) === 1) {
-            $meta['telegram_checkout_url'] = (string) $created['alt_url'];
+            $paymentMeta['telegram_checkout_url'] = (string) $created['alt_url'];
         }
-        pay_save_meta((int) $payment['id'], $meta);
+        pay_save_meta((int) $payment['id'], $paymentMeta);
         $created['payment'] = (int) $payment['id'];
-    } else {
-        /* A rejected or malformed provider response must not leave an unpaid
-           local row behind. Otherwise each retry accumulates another invoice
-           and later produces another expiry sweep. */
-        DB::update("UPDATE payments SET status='expire' WHERE id=? AND status='unpaid'",
-            [(int) $payment['id']]);
+        return $created;
+    }
+    /* A rejected or malformed provider response must not leave an unpaid
+       local row behind. Otherwise each retry accumulates another invoice
+       and later produces another expiry sweep. */
+    DB::update("UPDATE payments SET status='expire' WHERE id=? AND status='unpaid'",
+        [(int) $payment['id']]);
+    if (($meta['type'] ?? '') === 'crypto') {
+        report_crypto_checkout_failure($gw, $order, $payment, $created);
+        return ['ok' => false, 'url' => '', 'state' => 'create_failed',
+            'text' => crypto_checkout_failure_customer_text()];
     }
     return $created;
 }
@@ -21849,8 +21900,9 @@ function pay_nowpay_create(array $payment, array $order): array
     $url = (string) ($res['invoice_url'] ?? '');
     $invoiceId = (string) ($res['id'] ?? '');
     if ($url === '' || $invoiceId === '') {
-        return ['ok' => false, 'url' => '', 'text' => 'NowPayments: '
-            . pay_error_text($res, 'لینک پرداخت ساخته نشد')];
+        $reason = pay_error_text($res, 'لینک پرداخت ساخته نشد');
+        return ['ok' => false, 'url' => '', 'text' => 'NowPayments: ' . $reason,
+            'report_reason' => $reason, 'report_status' => (int) ($res['_status'] ?? 0)];
     }
     pay_set_authority((int) $payment['id'], $invoiceId, $res);
     return ['ok' => true, 'url' => $url, 'text' => 'NowPayments'];
@@ -21881,20 +21933,13 @@ function pay_nowpay_status(array $payment): array
             'text' => 'NowPayments: وضعیت ' . ($status !== '' ? $status : 'نامشخص')];
 }
 
-/** IPN نواپی‌منت — امضا با ipn_secret بررسی می‌شود، بعد وضعیت از خود API خوانده می‌شود */
-function pay_nowpay_webhook(array $body, string $rawBody, string $signature): array
+/**
+ * IPN نواپی‌منت فقط یک اعلان برای بررسی فوری است. تنظیمات این درگاه فقط
+ * x-api-key دارد؛ محتوای IPN و امضای آن هرگز دلیل پرداخت محسوب نمی‌شوند و
+ * وضعیت نهایی همیشه دوباره از API رسمی نواپی‌منت خوانده می‌شود.
+ */
+function pay_nowpay_webhook(array $body, string $_rawBody, string $_signature): array
 {
-    $secret = gw_key2('nowpayment');
-    if ($secret !== '' && $signature !== '') {
-        $sorted = $body;
-        ksort($sorted);
-        $expected = hash_hmac('sha512', json_encode($sorted, JSON_UNESCAPED_SLASHES), $secret);
-        if (!hash_equals($expected, $signature)) {
-            return ['ok' => false, 'code' => 403, 'text' => 'invalid signature'];
-        }
-    } elseif ($secret !== '') {
-        return ['ok' => false, 'code' => 403, 'text' => 'missing signature'];
-    }
     $invoiceId = (string) ($body['invoice_id'] ?? '');
     $orderRef = (string) ($body['order_id'] ?? '');
     $payment = $invoiceId !== '' ? pay_find_by_authority($invoiceId) : null;
@@ -21946,7 +21991,9 @@ function pay_plisio_create(array $payment, array $order): array
     $url = (string) ($res['data']['invoice_url'] ?? '');
     $txnId = (string) ($res['data']['txn_id'] ?? '');
     if (strtolower((string) ($res['status'] ?? '')) !== 'success' || $url === '' || $txnId === '') {
-        return ['ok' => false, 'url' => '', 'text' => 'Plisio: ' . plisio_error($res)];
+        $reason = plisio_error($res);
+        return ['ok' => false, 'url' => '', 'text' => 'Plisio: ' . $reason,
+            'report_reason' => $reason, 'report_status' => (int) ($res['_status'] ?? 0)];
     }
     pay_set_authority((int) $payment['id'], $txnId, $res);
     return ['ok' => true, 'url' => $url, 'text' => 'Plisio'];
@@ -22168,8 +22215,9 @@ function pay_trx_create(array $payment, array $order): array
     $url = (string) ($res['payment_url'] ?? ($res['url'] ?? ($res['link'] ?? '')));
     $ref = (string) ($res['id'] ?? ($res['factor_id'] ?? ''));
     if ($url === '' || $ref === '') {
-        return ['ok' => false, 'url' => '', 'text' => 'درگاه TRX: '
-            . pay_error_text($res, 'فاکتور ساخته نشد')];
+        $reason = pay_error_text($res, 'فاکتور ساخته نشد');
+        return ['ok' => false, 'url' => '', 'text' => 'درگاه TRX: ' . $reason,
+            'report_reason' => $reason, 'report_status' => (int) ($res['_status'] ?? 0)];
     }
     pay_set_authority((int) $payment['id'], $ref, $res);
     return ['ok' => true, 'url' => $url, 'text' => 'TRX'];
@@ -23074,7 +23122,6 @@ function screen_pay_gateway(int|string $chat, ?int $messageId, string $gw): void
         $text .= 'کلید اصلی: ' . e($mask(gw_key($gw))) . "\n";
         $key2Label = match ($gw) {
             'variza' => 'کلید امضای وب‌هوک',
-            'nowpayment' => 'IPN secret',
             'iranpay2' => 'کلید دوم / امضای کال‌بک',
             'trx' => 'آدرس کیف پول TRX',
             default => '',
@@ -23159,7 +23206,6 @@ function screen_pay_gateway(int|string $chat, ?int $messageId, string $gw): void
         $rows[] = [btn('🔑 کلید اصلی', 'ad:pay:' . $gw . ':key')];
         $key2Button = match ($gw) {
             'variza' => '🔐 کلید وب‌هوک',
-            'nowpayment' => '🔐 IPN secret',
             'iranpay2' => '🔐 کلید دوم',
             'trx' => '👛 کیف پول TRX',
             default => '',

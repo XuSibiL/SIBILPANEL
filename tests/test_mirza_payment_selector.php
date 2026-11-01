@@ -58,7 +58,6 @@ foreach (['plisio', 'nowpayment', 'trx', 'iranpay1', 'iranpay2', 'iranpay4',
     'tetrapay', 'aqayepardakht', 'zarinpal', 'variza'] as $gateway) {
     set_put('pay_' . $gateway . '_key', 'fixture-' . $gateway . '-key');
 }
-set_put('pay_nowpayment_key2', 'fixture-now-ipn');
 set_put('pay_trx_key2', 'TFixtureWalletAddress');
 set_put('pay_variza_key2', 'fixture-variza-webhook');
 set_put('pay_iranpay4_endpoint', 'https://aban.example.test/api');
@@ -95,6 +94,15 @@ okselector(!in_array('nav:back', $callbacks, true) && !in_array('nav:back:user',
 $withAban = gw_available($uid);
 okselector(!isset($withAban['card']) && isset($withAban['iranpay4']),
     'customer-ready Aban card path hides the duplicate manual card method');
+[$nowReady, $nowMissing] = gw_readiness('nowpayment');
+okselector($nowReady && $nowMissing === [] && isset($withAban['nowpayment']),
+    'NowPayments is customer-ready with only its primary API key');
+set_put('pay_nowpayment_on', '0');
+okselector(!isset(gw_available($uid)['nowpayment']),
+    'turning NowPayments off removes it from the buyer selector');
+set_put('pay_nowpayment_on', '1');
+okselector(isset(gw_available($uid)['nowpayment']),
+    'turning NowPayments on restores it to the buyer selector');
 set_put('pay_iranpay4_on', '0');
 $manualFallback = gw_available($uid);
 okselector(isset($manualFallback['card']),
@@ -130,6 +138,13 @@ $tetraUi = json_encode(Tg::$outbox, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLAS
 okselector(str_contains($tetraUi, ':key') && !str_contains($tetraUi, ':key2')
     && !str_contains($tetraUi, ':endpoint') && !str_contains($tetraUi, 'سندباکس'),
     'TetraPay setup has one API key and no sandbox, endpoint, or second-key control');
+
+Tg::$outbox = [];
+screen_pay_gateway($uid, null, 'nowpayment');
+$nowUi = json_encode(Tg::$outbox, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) ?: '';
+okselector(str_contains($nowUi, ':key') && !str_contains($nowUi, ':key2')
+    && !str_contains($nowUi, 'IPN secret') && !str_contains($nowUi, 'کلید دوم'),
+    'NowPayments administration exposes only its primary API key and no IPN-secret control');
 
 Tg::$outbox = [];
 screen_pay_gateway($uid, null, 'iranpay4');
