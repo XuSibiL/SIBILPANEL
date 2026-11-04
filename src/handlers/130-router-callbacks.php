@@ -763,7 +763,7 @@ function handle_callback_inner(array $cb): void
             return;
         }
         $isManager = admin_trial_unlimited($uid);
-        if (!$isManager && trial_used($uid) >= max(1, set_int('trial_per_user', 1))) {
+        if (!$isManager && trial_used($uid) >= trial_quota_limit()) {
             Tg::answer($cbId, 'سهمیهٔ تستت تمام شده.', true);
             screen_trial($chatId, $messageId, $uid);
             return;
@@ -1494,9 +1494,12 @@ function handle_callback_inner(array $cb): void
                 return;
             }
             if ($sub === 'trialreset') {
-                DB::exec("UPDATE orders SET status='canceled' WHERE tg_id=? AND kind='trial' "
-                    . 'AND status=\'delivered\'', [$tgId]);
-                Tg::answer($cbId, 'سهمیهٔ تست صفر شد', false);
+                $reset = trial_quota_reset($tgId, $uid);
+                $active = max(0, (int) ($reset['active_claims'] ?? 0));
+                $note = $active > 0
+                    ? ' · ' . fa_digits($active) . ' سفارش/رسید باز همچنان سهمیه را نگه می‌دارد'
+                    : '';
+                Tg::answer($cbId, 'سهمیهٔ تست ریست شد' . $note, false);
                 screen_user_card($chatId, $messageId, $tgId);
                 return;
             }
@@ -1680,6 +1683,8 @@ function handle_callback_inner(array $cb): void
                             'int', 0, '📱 دستگاه هر کاربر'),
                         step_def('min_users', 'حداقل تعداد کاربر در هر خرید یا شارژ را بفرستید.',
                             'int', 1, '👥 حداقل تعداد کاربر'),
+                        step_def('min_balance', 'حداقل موجودی کیف پول برای خرید این پنل نامحدود را بفرستید (تومان) — ۰ یعنی بدون حداقل.',
+                            'int', 0, '💰 حداقل موجودی برای خرید'),
                     ], ['cat_id' => $catId, 'role_page' => 1]);
                     return;
                 }
@@ -1832,11 +1837,18 @@ function handle_callback_inner(array $cb): void
                 Tg::send($chatId, 'محصول پیدا نشد.', [[btn('« دسته‌ها', 'ad:cats', null, 'danger')]]);
                 return;
             }
-            if (product_is_unlimited($product)
-                && !in_array($field, ['name', 'emoji', 'peruser', 'hourly', 'minusers', 'devices'], true)) {
-                Tg::answer($cbId, 'این تنظیم برای پنل نامحدود با نقش پاسارگارد مدیریت می‌شود.', true);
-                screen_product_admin($chatId, $messageId, $productId);
-                return;
+            if (product_is_unlimited($product)) {
+                $unlimitedFields = ['name', 'emoji', 'peruser', 'hourly', 'minusers', 'devices'];
+                /* حداقل موجودی کنترل فروش جدیدِ مدل ساعتیِ واقعی است؛ محصولات
+                   نامحدود قدیمی عمداً با تنظیمات گذشته‌شان دست‌نخورده می‌مانند. */
+                if (product_is_hourly_unlimited($product)) {
+                    $unlimitedFields[] = 'minbal';
+                }
+                if (!in_array($field, $unlimitedFields, true)) {
+                    Tg::answer($cbId, 'این تنظیم برای پنل نامحدود با نقش پاسارگارد مدیریت می‌شود.', true);
+                    screen_product_admin($chatId, $messageId, $productId);
+                    return;
+                }
             }
             wiz_start($uid, 'prod_field', [
                 step_def('value', $meta[0] . "\nمقدار فعلی: " . ($product[$meta[2]] ?? '—'),

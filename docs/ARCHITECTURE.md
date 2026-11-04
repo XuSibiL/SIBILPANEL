@@ -65,8 +65,9 @@ Telegram ──callback──────▶ src/handlers/130-router-callbacks.p
 
 `users` · `panels` · `products` · `categories` · `orders` · `payments` · `receipts` ·
 `wallet_tx` · `usage_charges` · `unlimited_online_minutes` · `unlimited_online_billing_state` ·
-`unlimited_online_settlements` · `slots` · `discounts` · `discount_uses` · `kyc_cards` ·
-`kyc_requests` · `pg_panels` · `settings` · `tg_state` · `nav_stack` · `temp_restricted_users`
+`unlimited_online_settlements` · `trial_quota_resets` · `trial_quota_carryovers` · `slots` ·
+`discounts` · `discount_uses` · `kyc_cards` · `kyc_requests` · `pg_panels` · `settings` ·
+`tg_state` · `nav_stack` · `temp_restricted_users`
 
 ## جریان مالی
 
@@ -78,6 +79,7 @@ Telegram ──callback──────▶ src/handlers/130-router-callbacks.p
 3. **مصرف حجمی:** حلقهٔ `panels_meter` طبق برنامهٔ پنج‌دقیقه‌ای مصرف را می‌خواند، گیگ کامل را کسر می‌کند،
    `usage_charges` را ثبت می‌کند و در صورت لزوم پنل را تعلیق می‌کند.
 4. **نامحدود اتصال‌محور:** `panels_unlimited_online_tick` مستقل از مسیر حجمی هر دقیقه مشاهدهٔ زنده را ذخیره و ساعت‌های کامل را تسویه می‌کند؛ گزارش Telegram فقط پس از یک settlement موفق و فقط یک‌بار برای همان پنل/ساعت ارسال می‌شود.
+5. **تست:** `trial_quota_reserve_order()` شمار delivered، review و pending منقضی‌نشده را زیر `BEGIN IMMEDIATE` claim می‌کند. `trial_quota_reset()` فقط marker و carry-over باز را ثبت می‌کند؛ سابقهٔ delivered تغییر نمی‌کند.
 
 ## سیاست خطا
 

@@ -92,7 +92,10 @@ function screen_user_card(int|string $chat, ?int $messageId, int $tgId): void
             . '👛 موجودی کیف پول: <b>' . money($balance) . "</b>\n"
             . '💵 مجموع واریزها: ' . money($deposits) . "\n"
             . '📊 مجموع ترافیک مصرف‌شده: ' . gb_step_text($traffic) . " گیگابایت\n"
-            . '🎁 تخفیف اختصاصی: ' . user_discount_text($user);
+            . '🎁 تخفیف اختصاصی: ' . user_discount_text($user) . "\n"
+            . '🧪 سهمیهٔ مؤثر تست: <b>' . (admin_trial_unlimited($tgId)
+                ? 'نامحدود (مدیر)'
+                : fa_digits(trial_used($tgId)) . ' از ' . fa_digits(trial_quota_limit())) . '</b>';
     } else {
         $text .= SEP . "\n"
             . '<i>اطلاعات مالی، شمارهٔ کارت و احراز هویت در سطح شما نمایش داده نمی‌شود.</i>';
@@ -110,8 +113,9 @@ function screen_user_card(int|string $chat, ?int $messageId, int $tgId): void
              btn('🎁 اعطای تخفیف اختصاصی', 'ad:u:' . $id . ':gift', null, 'success')],
             [btn('🪪 تغییر دستی سطح احراز', 'ad:u:' . $id . ':kyc'),
              btn('📩 ارسال پیام به کاربر', 'ad:u:' . $id . ':msg', null, 'success')],
-            [btn('🔄 همگام‌سازی و بروزرسانی', 'ad:u:' . $id . ':sync', null, 'primary'),
-             btn('🔙 بازگشت', 'ad:users', null, 'danger')],
+            [btn('🔄 ریست تست', 'ad:u:' . $id . ':trialreset', null, 'primary'),
+             btn('🔄 همگام‌سازی و بروزرسانی', 'ad:u:' . $id . ':sync', null, 'primary')],
+            [btn('🔙 بازگشت', 'ad:users', null, 'danger')],
         ];
     } elseif ($canOps) {
         $rows = [

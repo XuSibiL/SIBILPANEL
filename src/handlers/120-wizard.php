@@ -316,8 +316,9 @@ function wiz_finish(int $uid, array $data): void
             $fixedHourly = 0;
             $deviceLimit = max(0, (int) ($values['device_limit'] ?? 0));
             $minUsers = (int) ($values['min_users'] ?? 0);
-            if ($perUser <= 0 || $minUsers < 1 || $minUsers > UNLIMITED_USERS_MAX) {
-                Tg::send($uid, '❌ نرخ ساعتی هر کاربرِ آنلاین باید بیشتر از صفر و حداقل تعداد کاربر معتبر باشد.',
+            $minBalance = (int) ($values['min_balance'] ?? 0);
+            if ($perUser <= 0 || $minUsers < 1 || $minUsers > UNLIMITED_USERS_MAX || $minBalance < 0) {
+                Tg::send($uid, '❌ نرخ ساعتی هر کاربرِ آنلاین باید بیشتر از صفر باشد؛ حداقل کاربر و حداقل موجودی هم باید معتبر باشند.',
                     [[btn('➕ محصول نامحدود', 'ad:cat:' . $catId . ':new:unlimited', null, 'success')]]);
                 return;
             }
@@ -341,7 +342,7 @@ function wiz_finish(int $uid, array $data): void
                 . 'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                 [trim((string) $values['name']), $values['emoji'] ?: '♾️', mb_substr($tagline, 0, 180),
                  'v2ray', $catId, $roleId, '[]', 0, $deviceLimit, 0, 0, 0, $fixedHourly,
-                 0, 0, 1, '', 0, 1, now_ts(), (int) $panelRow['id'],
+                 $minBalance, 0, 1, '', 0, 1, now_ts(), (int) $panelRow['id'],
                  PRODUCT_SALE_UNLIMITED_USERS, $perUser, $minUsers, UNLIMITED_BILLING_HOURLY]);
             $text = '✅ محصول نامحدود ساعتی #' . $productId . " ساخته شد.\n\n"
                 . ($values['emoji'] ?: '♾️') . ' <b>' . e((string) $values['name']) . "</b>\n"
@@ -350,7 +351,8 @@ function wiz_finish(int $uid, array $data): void
                 . '💵 نرخ هر کاربرِ آنلاین / ساعت: <b>' . money($perUser) . "</b>\n"
                 . ($tagline !== '' ? '🧩 توضیح: ' . e($tagline) . "\n" : '')
                 . '📱 دستگاه هر کاربر: <b>' . fa_digits($deviceLimit) . "</b>\n"
-                . '👥 حداقل تعداد کاربر: <b>' . fa_digits($minUsers) . "</b>\n\n"
+                . '👥 حداقل تعداد کاربر: <b>' . fa_digits($minUsers) . "</b>\n"
+                . '💰 حداقل موجودی برای خرید: <b>' . money($minBalance) . "</b>\n\n"
                 . 'پرداخت مصرفی است؛ فقط دقیقه‌های اتصال زنده ثبت می‌شود و صورتحساب هر ساعت یک‌جا از کیف پول کم می‌شود.\n'
                 . UNLIMITED_ROLE_GUIDE;
             Tg::send($uid, $text, [
@@ -384,6 +386,11 @@ function wiz_finish(int $uid, array $data): void
             }
             if ($field === 'minusers' && ((int) $value < 1 || (int) $value > UNLIMITED_USERS_MAX)) {
                 Tg::send($uid, '❌ حداقل تعداد کاربر باید بین ۱ تا ' . fa_digits(UNLIMITED_USERS_MAX) . ' باشد.',
+                    [[btn('« محصول', 'ad:prod:' . $productId, null, 'danger')]]);
+                return;
+            }
+            if ($field === 'minbal' && (int) $value < 0) {
+                Tg::send($uid, '❌ حداقل موجودی نمی‌تواند منفی باشد.',
                     [[btn('« محصول', 'ad:prod:' . $productId, null, 'danger')]]);
                 return;
             }

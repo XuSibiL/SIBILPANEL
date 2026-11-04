@@ -517,6 +517,10 @@ function screen_product_admin(int|string $chat, ?int $messageId, int $productId)
                     . '<i>این محصول/فروش‌های قبلی با مدل پیش‌پرداخت حفظ شده‌اند.</i>' . "\n"))
             . '👥 حداقل تعداد کاربر در هر خرید/شارژ: <b>'
                 . fa_digits(unlimited_min_users($product)) . "</b>\n"
+            . ($hourlyUnlimited
+                ? ('💰 حداقل موجودی کیف پول برای خرید: <b>'
+                    . money(max(0, (int) ($product['min_balance'] ?? 0))) . "</b>\n")
+                : '')
             . '📱 دستگاهِ نمایش محصول: ' . fa_digits((int) ($product['device_limit'] ?? 0)) . "\n"
             . '🎭 نقش پنل: '
             . role_title((int) $product['panel_id'], (int) $product['role_id']) . "\n\n"
@@ -524,7 +528,8 @@ function screen_product_admin(int|string $chat, ?int $messageId, int $productId)
         $rows = [
             [btn($hourlyUnlimited ? '💵 نرخ هر کاربرِ آنلاین / ساعت' : '💵 قیمت هر کاربر', "ad:pf:$productId:peruser"),
              btn('👥 حداقل تعداد کاربر', "ad:pf:$productId:minusers")],
-            [btn('📱 دستگاه', "ad:pf:$productId:devices")],
+            ...($hourlyUnlimited ? [[btn('💰 حداقل موجودی', "ad:pf:$productId:minbal"),
+                btn('📱 دستگاه', "ad:pf:$productId:devices")]] : [[btn('📱 دستگاه', "ad:pf:$productId:devices")]]),
             [btn('✏️ نام', "ad:pf:$productId:name"), btn('🎨 ایموجی', "ad:pf:$productId:emoji")],
             [btn('🧩 توضیح/تانل', "ad:pf:$productId:tagline")],
             [btn('🔌 پنل مقصد', "ad:prod:$productId:sp"),

@@ -20,6 +20,7 @@ tests=(
   "php tests/test_metered_product_callbacks.php"
   "php tests/test_hourly_unlimited.php"
   "php tests/test_v318_unlimited.php"
+  "php tests/test_trial_quota_and_unlimited_min_balance.php"
   "php tests/test_rbac_force_join.php"
   "bash tests/test_cli_safety.sh"
 )

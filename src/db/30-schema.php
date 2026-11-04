@@ -259,6 +259,9 @@ CREATE TABLE IF NOT EXISTS orders (
     paid_at     INTEGER
 );
 
+CREATE INDEX IF NOT EXISTS orders_trial_quota_idx
+    ON orders(tg_id, kind, status, created_at, id);
+
 CREATE TABLE IF NOT EXISTS receipts (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     order_id    INTEGER NOT NULL,
@@ -417,6 +420,28 @@ CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT
 );
+
+/* Reset markers are deliberately separate from the historical orders ledger:
+   an administrator can grant a user a fresh trial quota without rewriting an
+   already delivered (and possibly paid) trial order. */
+CREATE TABLE IF NOT EXISTS trial_quota_resets (
+    tg_id       INTEGER PRIMARY KEY,
+    order_floor INTEGER NOT NULL DEFAULT 0,
+    reset_at    INTEGER NOT NULL,
+    reset_by    INTEGER NOT NULL DEFAULT 0
+);
+
+/* سفارشِ باز هنگام ریست نباید با تغییر وضعیت بعدی سهمیه را دور بزند. این
+   carry-over فقط شناسهٔ claimهای باز را نگه می‌دارد؛ خودِ سفارش/سابقه هرگز
+   بازنویسی نمی‌شود. */
+CREATE TABLE IF NOT EXISTS trial_quota_carryovers (
+    tg_id       INTEGER NOT NULL,
+    order_id    INTEGER NOT NULL,
+    reset_at    INTEGER NOT NULL,
+    PRIMARY KEY (tg_id, order_id)
+);
+CREATE INDEX IF NOT EXISTS trial_quota_carryovers_order_idx
+    ON trial_quota_carryovers(order_id);
 
 /* نقش‌های چندسطحی ادمین؛ مالک اصلی عمداً این‌جا ذخیره نمی‌شود و از .env قفل است. */
 CREATE TABLE IF NOT EXISTS admin_roles (

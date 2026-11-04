@@ -171,6 +171,8 @@ function hourly_unlimited_product_detail_text(array $product): string
         . '📱 دستگاه هر کاربر: <b>' . fa_digits($devices) . "</b> دستگاه\n"
         . '⏳ اعتبار پنل: <b>بدون انقضا ♾️</b>' . "\n"
         . '💵 نرخ هر کاربرِ آنلاین: <b>' . toman_short($perUser) . "</b> در ساعت\n"
+        . '💰 حداقل موجودی کیف پول برای خرید: <b>'
+            . money(max(0, (int) ($product['min_balance'] ?? 0))) . "</b>\n"
         . '📅 معادل ماهانهٔ یک کاربرِ همیشه‌آنلاین: <b>' . toman_short($monthly) . "</b>\n\n"
         . '🔋 <b>پرداخت به‌صورت مصرفی (pay-and-go):</b> هیچ پیش‌پرداخت یا اجارهٔ ظرفیت ندارد؛ '
         . 'ربات فقط وقتی اتصال زندهٔ یک کاربر را از node پاسارگارد تأیید کند، همان دقیقه را ثبت می‌کند. '
@@ -510,6 +512,8 @@ function screen_unlimited_initial_users(int|string $chat, ?int $messageId, int $
         . 'حداقل مجاز: <b>' . fa_digits(unlimited_min_users($product)) . '</b> کاربر' . "\n"
         . ($hourly
             ? ('💵 نرخ هر کاربرِ آنلاین / ساعت: <b>' . money(unlimited_user_price($product)) . "</b>\n"
+                . '💰 حداقل موجودی کیف پول برای خرید: <b>'
+                    . money(max(0, (int) ($product['min_balance'] ?? 0))) . "</b>\n"
                 . '<i>فعال‌سازی ظرفیت رایگان است؛ فقط دقیقه‌های اتصال زنده ثبت و هر ساعت یک‌جا تسویه می‌شود.</i>')
             : ('قیمت هر کاربر: <b>' . money(unlimited_user_price($product)) . '</b>'))
         . "\n\n" . '<i>مثال: ' . fa_digits(unlimited_min_users($product)) . '</i>' . "\n"
@@ -609,11 +613,28 @@ function start_trial_order(int $uid, int|string $chat, ?int $messageId, int $pro
         return;
     }
     $price = admin_trial_unlimited($uid) ? 0 : set_int('trial_price', 0);
-    $order = create_order($uid, 'trial', $price, $productId, [
+    $reservation = trial_quota_reserve_order($uid, $price, $productId, [
         'trial_gb' => set_int('trial_gb', 1),
         'trial_hours' => set_int('trial_hours', 24),
         'panel_username' => $username,
     ]);
+    if (empty($reservation['ok'])) {
+        $limit = max(1, (int) ($reservation['limit'] ?? trial_quota_limit()));
+        $used = max(0, (int) ($reservation['used'] ?? trial_used($uid)));
+        Tg::show($chat, $messageId,
+            '🎟 <b>سهمیهٔ تستت تمام شده است</b>' . "\n\n"
+            . 'سهمیهٔ ثبت‌شده: <b>' . fa_digits($used) . ' از ' . fa_digits($limit) . "</b>\n"
+            . 'برای پنل کامل «🛒 خرید پنل» را بزنید.',
+            [[btn('🛒 خرید پنل', 'menu:buy', null, 'success')],
+             [btn('« بازگشت', 'menu:trial', null, 'danger')]]);
+        return;
+    }
+    $order = $reservation['order'] ?? [];
+    if ($order === []) {
+        Tg::show($chat, $messageId, '❌ رزرو سهمیهٔ تست انجام نشد؛ دوباره تلاش کنید.',
+            [[btn('« تست پنل', 'menu:trial', null, 'danger')]]);
+        return;
+    }
     if ($price > 0) {
         Tg::show($chat, $messageId,
             invoice_text($order, 'پنل تست', $product['emoji'] . ' ' . e((string) $product['name'])
@@ -988,11 +1009,124 @@ function panel_username_check(string $name): array
     return [true, ''];
 }
 
+/** سقف معتبر سهمیهٔ تست؛ رفتار تاریخیِ تنظیم صفر همان حداقل یک‌بار است. */
+function trial_quota_limit(): int
+{
+    return max(1, set_int('trial_per_user', 1));
+}
+
+/** سفارش pending پس از این زمان دیگر یک claim زندهٔ تست نیست. */
+function trial_quota_pending_cutoff(?int $at = null): int
+{
+    $at ??= now_ts();
+    return $at - max(1, set_int('pay_expire_minutes', 30)) * 60;
+}
+
+/** آخرین ریست پایدارِ سهمیه؛ سفارش‌های قدیمی‌تر از floor سابقه‌اند، نه سهمیهٔ تازه. */
+function trial_quota_reset_row(int $uid): array
+{
+    $row = DB::one('SELECT tg_id, order_floor, reset_at, reset_by FROM trial_quota_resets WHERE tg_id=?',
+        [$uid]);
+    return $row ?? ['tg_id' => $uid, 'order_floor' => 0, 'reset_at' => 0, 'reset_by' => 0];
+}
+
+/**
+ * تعداد claimهای مؤثر تست برای یک کاربر.
+ *
+ * delivered همیشه سهمیه را می‌گیرد، مگر اینکه پیش از آخرین ریست تحویل شده باشد.
+ * review و pendingِ منقضی‌نشده نیز claim هستند تا کاربر نتواند با چند فاکتور/رسید
+ * هم‌زمان از سقف عبور کند. carry-over فقط سفارشِ بازی را نگه می‌دارد که در لحظهٔ
+ * ریست وجود داشته؛ اگر همان سفارش بعداً delivered شود، باز هم سهمیه را دور نمی‌زند.
+ */
+function trial_quota_claims(int $uid, ?int $at = null): int
+{
+    if ($uid <= 0) {
+        return 0;
+    }
+    $marker = trial_quota_reset_row($uid);
+    $floor = max(0, (int) ($marker['order_floor'] ?? 0));
+    $cutoff = trial_quota_pending_cutoff($at);
+    return (int) DB::val("SELECT COUNT(*) FROM orders AS o
+        LEFT JOIN trial_quota_carryovers AS c ON c.tg_id=o.tg_id AND c.order_id=o.id
+        WHERE o.tg_id=? AND o.kind='trial' AND (
+            (o.status='delivered' AND (o.id>? OR c.order_id IS NOT NULL))
+            OR o.status='review'
+            OR (o.status='pending' AND o.created_at>?)
+        )", [$uid, $floor, $cutoff], 0);
+}
+
+/** نام سازگار با صفحه‌های قدیمی؛ اکنون claimهای هم‌زمان را هم حساب می‌کند. */
 function trial_used(int $uid): int
 {
-    // فقط تست‌هایی که واقعاً تحویل شده‌اند سهمیه را مصرف می‌کنند
-    return (int) DB::val("SELECT COUNT(*) FROM orders WHERE tg_id=? AND kind='trial' "
-        . "AND status='delivered'", [$uid], 0);
+    return trial_quota_claims($uid);
+}
+
+/**
+ * آخرین سد سهمیه: ساخت سفارش تست و گرفتن claim در یک BEGIN IMMEDIATE انجام می‌شود.
+ * بنابراین callback تکراری، نام‌کاربری دلخواه و دو آپدیت هم‌زمان نمی‌توانند هر دو
+ * وضعیت قبلی را بخوانند و بیش از سهمیه سفارش بسازند.
+ *
+ * @return array{ok:bool,order?:array,used:int,limit:int}
+ */
+function trial_quota_reserve_order(int $uid, int $price, int $productId, array $payload): array
+{
+    if (admin_trial_unlimited($uid)) {
+        return ['ok' => true, 'order' => create_order($uid, 'trial', $price, $productId, $payload),
+            'used' => 0, 'limit' => 0];
+    }
+    return DB::tx(static function () use ($uid, $price, $productId, $payload): array {
+        $limit = trial_quota_limit();
+        $used = trial_quota_claims($uid);
+        if ($used >= $limit) {
+            return ['ok' => false, 'used' => $used, 'limit' => $limit];
+        }
+        return ['ok' => true,
+            'order' => create_order($uid, 'trial', $price, $productId, $payload),
+            'used' => $used + 1, 'limit' => $limit];
+    });
+}
+
+/**
+ * ریست مدیریتی بدون دستکاری تاریخچهٔ delivered:
+ * - pendingهای منقضی‌شده safely canceled می‌شوند؛
+ * - review/pending زنده به‌عنوان carry-over حفظ می‌شوند؛
+ * - همهٔ deliveredهای پیشین فقط در marker تاریخی می‌مانند.
+ *
+ * @return array{order_floor:int,stale_canceled:int,active_claims:int}
+ */
+function trial_quota_reset(int $uid, int $resetBy): array
+{
+    if ($uid <= 0) {
+        return ['order_floor' => 0, 'stale_canceled' => 0, 'active_claims' => 0];
+    }
+    return DB::tx(static function () use ($uid, $resetBy): array {
+        $now = now_ts();
+        $cutoff = trial_quota_pending_cutoff($now);
+        /* فقط pending منقضی‌شده رهاشدنی است؛ سفارش review یا delivered هرگز تغییر نمی‌کند. */
+        $staleCanceled = DB::update("UPDATE orders SET status='canceled', paid_at=NULL
+            WHERE tg_id=? AND kind='trial' AND status='pending' AND created_at<=?", [$uid, $cutoff]);
+        $open = DB::all("SELECT id FROM orders WHERE tg_id=? AND kind='trial' AND (
+                status='review' OR (status='pending' AND created_at>?)
+            ) ORDER BY id", [$uid, $cutoff]);
+        $floor = (int) DB::val("SELECT COALESCE(MAX(id),0) FROM orders WHERE tg_id=? AND kind='trial'",
+            [$uid], 0);
+        DB::exec('INSERT INTO trial_quota_resets(tg_id, order_floor, reset_at, reset_by) VALUES(?,?,?,?) '
+            . 'ON CONFLICT(tg_id) DO UPDATE SET order_floor=excluded.order_floor, '
+            . 'reset_at=excluded.reset_at, reset_by=excluded.reset_by', [$uid, $floor, $now, $resetBy]);
+        /* ریست تازه، carry-over ریست قبلی را جایگزین می‌کند؛ فقط سفارش‌های هنوز باز باقی می‌مانند. */
+        DB::exec('DELETE FROM trial_quota_carryovers WHERE tg_id=?', [$uid]);
+        foreach ($open as $row) {
+            $orderId = (int) ($row['id'] ?? 0);
+            if ($orderId > 0) {
+                DB::exec('INSERT INTO trial_quota_carryovers(tg_id, order_id, reset_at) VALUES(?,?,?)',
+                    [$uid, $orderId, $now]);
+            }
+        }
+        $active = trial_quota_claims($uid, $now);
+        log_line('info', 'trial quota reset', ['tg' => $uid, 'by' => $resetBy,
+            'floor' => $floor, 'active_claims' => $active]);
+        return ['order_floor' => $floor, 'stale_canceled' => $staleCanceled, 'active_claims' => $active];
+    });
 }
 
 /** فهرست سرویس تست: فقط محصولات متری؛ پنل نامحدود هرگز گزینهٔ تست نیست. */
@@ -1014,7 +1148,7 @@ function screen_trial(int|string $chat, ?int $messageId, int $uid): void
         return;
     }
     $isManager = admin_trial_unlimited($uid);
-    $limit = max(1, set_int('trial_per_user', 1));
+    $limit = trial_quota_limit();
     $used = trial_used($uid);
     $gb = (float) set_int('trial_gb', 1);
     $hours = set_int('trial_hours', 24);
