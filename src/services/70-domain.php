@@ -206,15 +206,26 @@ function panel_unlimited_min_users(array $panel): int
     return max(1, (int) ($panel['unlimited_min_users'] ?? 1));
 }
 
-/** Fixed hourly rent is stored in the normal hourly_price snapshot for new plans. */
+/**
+ * v3.18.7 retires the former flat panel-rent line for hourly unlimited sales.
+ * The authoritative rate is only the immutable per-client hourly snapshot;
+ * capacity, a configured maximum, and an offline client must cost zero.
+ * The old column is deliberately retained in the database for migration/audit.
+ */
 function panel_unlimited_fixed_hourly_price(array $panel): int
 {
-    return panel_is_hourly_unlimited($panel) ? max(0, (int) ($panel['hourly_price'] ?? 0)) : 0;
+    return 0;
 }
 
 function unlimited_fixed_hourly_price(array $product): int
 {
-    return product_is_hourly_unlimited($product) ? max(0, (int) ($product['hourly_price'] ?? 0)) : 0;
+    return 0;
+}
+
+/** نرخ قطعیِ هر کانفیگِ واقعاً آنلاین در یک ساعت. */
+function unlimited_online_hourly_rate(array $panel): int
+{
+    return panel_is_hourly_unlimited($panel) ? panel_unlimited_user_price($panel) : 0;
 }
 
 function panel_unlimited_user_count_check(array $panel, int $count): array
@@ -270,12 +281,14 @@ function unlimited_user_order_total(array $product, int $count): int
     return $count * unlimited_user_price($product);
 }
 
-/** First hour is paid with the purchase; later hours are wallet-metered. */
+/**
+ * Online-time products have no capacity/first-hour invoice. Their price begins
+ * only after a client is observed connected and is settled from the wallet at
+ * the end of the affected hour.
+ */
 function unlimited_initial_hourly_total(array $product, int $count): int
 {
-    $users = unlimited_user_order_total($product, $count);
-    $fixed = unlimited_fixed_hourly_price($product);
-    return $users > PHP_INT_MAX - $fixed ? PHP_INT_MAX : $users + $fixed;
+    return product_is_hourly_unlimited($product) ? 0 : unlimited_user_order_total($product, $count);
 }
 
 function panel_unlimited_users_hourly_total(array $panel, int $count): int
@@ -288,8 +301,8 @@ function panel_unlimited_users_hourly_total(array $panel, int $count): int
 }
 
 /**
- * Immutable hourly components: a new user block starts at its own paid-through
- * time, avoiding a charge for hours before that block existed.
+ * Legacy v3.18.6 capacity-clock helper retained only so historical audit rows
+ * remain readable. v3.18.7 never creates or charges these components.
  */
 function unlimited_billing_unit_add(int $panelId, ?int $sourceOrderId, string $component,
                                     int $units, int $hourlyPrice, int $paidUntil): void

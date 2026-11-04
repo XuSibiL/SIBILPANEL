@@ -238,123 +238,372 @@ function panel_charge_once(array $panel, int $usedBytes, bool $hourlyEnabled,
 }
 
 /**
- * Meter the immutable components of an hourly unlimited panel.
+ * v3.18.7 — live per-client billing for unlimited panels.
  *
- * A component is either the fixed panel rent or one purchased user-cap block.
- * Its paid_until clock means capacity added later cannot be billed backwards.
- * The full decision and wallet debit live under one SQLite write lock, so two
- * cron invocations cannot charge the same hour twice.
+ * A minute is written only when PasarGuard's node online-IP endpoint reports at
+ * least one current connection for that exact user. We intentionally do not
+ * fall back to used traffic, last-seen, or users?online=true: those are not a
+ * live socket signal and would make offline time billable.
  */
-function unlimited_hourly_charge_once(array $panel, ?int $at = null): array
+const UNLIMITED_ONLINE_MINUTE_SECONDS = 60;
+const UNLIMITED_ONLINE_HOUR_SECONDS = 3600;
+
+function unlimited_online_minute_start(?int $at = null): int
 {
-    $out = ['charged' => 0, 'hours' => 0, 'insufficient' => false,
-            'suspended' => false, 'resumed' => false, 'skipped' => false];
+    $at = max(0, $at ?? now_ts());
+    return intdiv($at, UNLIMITED_ONLINE_MINUTE_SECONDS) * UNLIMITED_ONLINE_MINUTE_SECONDS;
+}
+
+function unlimited_online_hour_start(?int $at = null): int
+{
+    $at = max(0, $at ?? now_ts());
+    return intdiv($at, UNLIMITED_ONLINE_HOUR_SECONDS) * UNLIMITED_ONLINE_HOUR_SECONDS;
+}
+
+/** Exact ownership guard when the API returns an admin object with the user. */
+function unlimited_online_user_owner(array $user): string
+{
+    $admin = $user['admin'] ?? null;
+    if (is_array($admin)) {
+        return trim((string) ($admin['username'] ?? ''));
+    }
+    return '';
+}
+
+/**
+ * Persists supplied observations. This small pure-storage seam also lets the
+ * regression suite exercise accounting without pretending an HTTP response is
+ * live telemetry. An observation with connections<=0 intentionally writes no
+ * row: offline time is zero cost, while the unique index makes a repeated tick
+ * in the same minute harmless.
+ *
+ * @param list<array{id:int,username?:string,connections:int,sampled_at?:int}> $observations
+ * @return array{recorded:int,active_clients:int,active_minutes:int}
+ */
+function unlimited_online_record_observations(array $panel, array $observations, ?int $at = null): array
+{
+    $out = ['recorded' => 0, 'active_clients' => 0, 'active_minutes' => 0];
     if (!panel_is_hourly_unlimited($panel)) {
         return $out;
     }
+    $panelId = (int) ($panel['id'] ?? 0);
+    if ($panelId <= 0) {
+        throw new InvalidArgumentException('invalid unlimited panel id');
+    }
+    $unique = [];
+    foreach ($observations as $row) {
+        $clientId = (int) ($row['id'] ?? 0);
+        $connections = max(0, (int) ($row['connections'] ?? 0));
+        if ($clientId <= 0 || $connections <= 0) {
+            continue;
+        }
+        $sampledAt = max(0, (int) ($row['sampled_at'] ?? $at ?? now_ts()));
+        $minuteAt = unlimited_online_minute_start($sampledAt);
+        $username = mb_substr(trim((string) ($row['username'] ?? '')), 0, 191);
+        $inserted = DB::q('INSERT OR IGNORE INTO unlimited_online_minutes(panel_id, client_id, client_username, '
+            . 'minute_at, connections, sampled_at) VALUES(?,?,?,?,?,?)',
+            [$panelId, $clientId, $username, $minuteAt, $connections, $sampledAt])->rowCount() === 1;
+        if ($inserted) {
+            $out['recorded']++;
+            $out['active_minutes']++;
+            $unique[$clientId] = true;
+        }
+    }
+    $out['active_clients'] = count($unique);
+    return $out;
+}
+
+/**
+ * Reads every client belonging to a sold panel, then verifies each one through
+ * /api/node/online_stats/{id}/ip. A single unavailable/ambiguous node response
+ * aborts this panel's sample rather than converting uncertainty into an online
+ * or offline minute.
+ */
+function unlimited_online_sample_panel(array $panel, ?int $at = null): array
+{
+    $panelId = (int) ($panel['id'] ?? 0);
+    $adminUsername = trim((string) ($panel['panel_username'] ?? ''));
+    $pgRow = panel_pg_row($panel);
+    if ($panelId <= 0 || $adminUsername === '' || $pgRow === null) {
+        throw new PanelError('live billing panel mapping is incomplete');
+    }
+    $client = new PgPanel($pgRow);
+    $users = $client->users_of_all($adminUsername);
+    $observations = [];
+    foreach ($users as $user) {
+        $clientId = (int) ($user['id'] ?? 0);
+        $username = trim((string) ($user['username'] ?? ''));
+        if ($clientId <= 0) {
+            throw new PanelError('users response has no stable user id');
+        }
+        $owner = unlimited_online_user_owner($user);
+        if ($owner !== '' && mb_strtolower($owner) !== mb_strtolower($adminUsername)) {
+            throw new PanelError('users response crossed sold-panel ownership');
+        }
+        $live = $client->user_online_connections($clientId);
+        if (!$live['available']) {
+            throw new PanelError('live node stats are unavailable; minute was not recorded');
+        }
+        $observations[] = [
+            'id' => $clientId,
+            'username' => $username,
+            'connections' => (int) $live['connections'],
+            /* The bucket belongs to the moment the direct node response was read. */
+            'sampled_at' => now_ts(),
+        ];
+    }
+    $out = unlimited_online_record_observations($panel, $observations, $at);
+    $out['users'] = count($users);
+    return $out;
+}
+
+/**
+ * Settles one completed hour under a SQLite write lock. The denominator stays
+ * 60 for the carry, so 750 toman/hour applied to a single active minute becomes
+ * 12 toman + 30/60 carried forward, never 13 repeatedly.
+ */
+function unlimited_online_settle_hour(int $panelId, int $hourAt, ?int $at = null): array
+{
     $at = $at ?? now_ts();
-    $panelId = (int) $panel['id'];
-    $decision = db_tx(static function () use ($panelId, $at): array {
-        $fresh = DB::one('SELECT * FROM panels WHERE id=?', [$panelId]);
-        if ($fresh === null || !panel_is_hourly_unlimited($fresh)) {
-            return ['skip' => true, 'charged' => 0, 'hours' => 0, 'insufficient' => false,
-                    'tg' => 0, 'username' => '', 'balance' => 0, 'status' => '', 'reason' => ''];
+    return db_tx(static function () use ($panelId, $hourAt, $at): array {
+        $empty = ['state' => 'skip', 'new' => false, 'settled' => false, 'pending' => false,
+            'panel_id' => $panelId, 'hour_at' => $hourAt, 'amount' => 0, 'active_minutes' => 0,
+            'active_clients' => 0, 'remainder_before' => 0, 'remainder_after' => 0];
+        $panel = DB::one('SELECT * FROM panels WHERE id=?', [$panelId]);
+        if ($panel === null || !panel_is_hourly_unlimited($panel)) {
+            return $empty;
         }
-        $units = DB::all('SELECT * FROM unlimited_billing_units WHERE panel_id=? AND active=1 '
-            . 'AND paid_until<=? AND (units * hourly_price)>0 ORDER BY paid_until, id',
-            [$panelId, $at]);
-        if ($units === []) {
-            return ['skip' => false, 'charged' => 0, 'hours' => 0, 'insufficient' => false,
-                    'tg' => (int) $fresh['tg_id'], 'username' => (string) $fresh['panel_username'],
-                    'balance' => balance_of((int) $fresh['tg_id']), 'status' => (string) $fresh['status'],
-                    'reason' => (string) ($fresh['suspended_reason'] ?? '')];
+        $existing = DB::one('SELECT * FROM unlimited_online_settlements WHERE panel_id=? AND hour_at=?',
+            [$panelId, $hourAt]);
+        if ($existing !== null && (string) $existing['status'] === 'settled') {
+            return array_merge($empty, [
+                'state' => 'already', 'settled' => true, 'settlement_id' => (int) $existing['id'],
+                'amount' => (int) $existing['amount'],
+                'active_minutes' => (int) $existing['active_minutes'],
+                'active_clients' => (int) $existing['active_clients'],
+                'remainder_before' => (int) $existing['remainder_before'],
+                'remainder_after' => (int) $existing['remainder_after'],
+            ]);
         }
-        $tgId = (int) $fresh['tg_id'];
-        $balance = balance_of($tgId);
-        $startingBalance = $balance;
-        $charged = 0;
-        $hours = 0;
-        $insufficient = false;
-        foreach ($units as $unit) {
-            $paidUntil = (int) $unit['paid_until'];
-            $unitCount = max(0, (int) $unit['units']);
-            $price = max(0, (int) $unit['hourly_price']);
-            if ($paidUntil > $at || $unitCount === 0 || $price === 0
-                || $unitCount > intdiv(PHP_INT_MAX, $price)) {
+        DB::exec('INSERT OR IGNORE INTO unlimited_online_billing_state(panel_id, remainder_numerator, updated_at) '
+            . 'VALUES(?,?,?)', [$panelId, 0, $at]);
+        $state = DB::one('SELECT * FROM unlimited_online_billing_state WHERE panel_id=?', [$panelId])
+            ?? ['remainder_numerator' => 0];
+        $currentCarry = max(0, (int) $state['remainder_numerator']) % 60;
+
+        if ($existing === null) {
+            $usage = DB::one('SELECT COUNT(*) AS active_minutes, COUNT(DISTINCT client_id) AS active_clients '
+                . 'FROM unlimited_online_minutes WHERE panel_id=? AND minute_at>=? AND minute_at<?',
+                [$panelId, $hourAt, $hourAt + UNLIMITED_ONLINE_HOUR_SECONDS])
+                ?? ['active_minutes' => 0, 'active_clients' => 0];
+            $activeMinutes = max(0, (int) $usage['active_minutes']);
+            $activeClients = max(0, (int) $usage['active_clients']);
+            if ($activeMinutes === 0) {
+                return $empty;
+            }
+            $rate = max(0, unlimited_online_hourly_rate($panel));
+            if ($rate > 0 && $activeMinutes > intdiv(PHP_INT_MAX - $currentCarry, $rate)) {
+                throw new RuntimeException('unlimited live-minute amount overflow');
+            }
+            $numerator = $currentCarry + ($activeMinutes * $rate);
+            $amount = intdiv($numerator, 60);
+            $carryAfter = $numerator % 60;
+            $settlementId = DB::exec('INSERT INTO unlimited_online_settlements(panel_id, hour_at, hourly_price, '
+                . 'active_minutes, active_clients, amount, remainder_before, remainder_after, status, '
+                . 'created_at, settled_at, reported_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+                [$panelId, $hourAt, $rate, $activeMinutes, $activeClients, $amount, $currentCarry,
+                 $carryAfter, 'pending', $at, 0, 0]);
+            $existing = DB::one('SELECT * FROM unlimited_online_settlements WHERE id=?', [$settlementId]);
+        }
+        if ($existing === null) {
+            throw new RuntimeException('unlimited live-minute settlement was not stored');
+        }
+        $amount = max(0, (int) $existing['amount']);
+        $balance = balance_of((int) $panel['tg_id']);
+        $event = [
+            'state' => 'pending', 'new' => false, 'settled' => false, 'pending' => true,
+            'settlement_id' => (int) $existing['id'], 'panel_id' => $panelId, 'hour_at' => $hourAt,
+            'tg_id' => (int) $panel['tg_id'], 'username' => (string) $panel['panel_username'],
+            'hourly_price' => (int) $existing['hourly_price'],
+            'active_minutes' => (int) $existing['active_minutes'],
+            'active_clients' => (int) $existing['active_clients'], 'amount' => $amount,
+            'remainder_before' => (int) $existing['remainder_before'],
+            'remainder_after' => (int) $existing['remainder_after'], 'balance' => $balance,
+        ];
+        if ($balance < $amount) {
+            return $event;
+        }
+        if ($amount > 0) {
+            $changed = DB::update('UPDATE users SET balance=balance-? WHERE tg_id=? AND balance>=?',
+                [$amount, (int) $panel['tg_id'], $amount]);
+            if ($changed !== 1) {
+                throw new RuntimeException('live-minute wallet changed during settlement');
+            }
+        }
+        $changed = DB::update("UPDATE unlimited_online_settlements SET status='settled', settled_at=? "
+            . "WHERE id=? AND status='pending'", [$at, (int) $existing['id']]);
+        if ($changed !== 1) {
+            throw new RuntimeException('live-minute settlement changed during settlement');
+        }
+        DB::exec('UPDATE unlimited_online_billing_state SET remainder_numerator=?, updated_at=? WHERE panel_id=?',
+            [(int) $existing['remainder_after'], $at, $panelId]);
+        if ($amount > 0) {
+            $newBalance = $balance - $amount;
+            DB::exec('INSERT INTO wallet_tx(tg_id, amount, kind, ref, note, balance, created_at) '
+                . 'VALUES(?,?,?,?,?,?,?)', [(int) $panel['tg_id'], -$amount, 'unlimited-online',
+                (string) $existing['id'], 'صورتحساب زمان آنلاین پنل نامحدود', $newBalance, $at]);
+            DB::exec('INSERT INTO usage_charges(panel_id, tg_id, bytes, hours, amount, kind, created_at) '
+                . 'VALUES(?,?,?,?,?,?,?)', [$panelId, (int) $panel['tg_id'], 0,
+                ((int) $existing['active_minutes']) / 60, $amount, 'unlimited-online', $at]);
+            DB::exec('UPDATE panels SET spent_total=spent_total+?, last_meter_at=? WHERE id=?',
+                [$amount, $at, $panelId]);
+            $event['balance'] = $newBalance;
+        }
+        $event['state'] = 'settled';
+        $event['new'] = true;
+        $event['settled'] = true;
+        $event['pending'] = false;
+        return $event;
+    });
+}
+
+/** Settles the oldest due live-time hours first; an unpaid hour blocks later ones. */
+function unlimited_online_settle_due(array $panel, ?int $at = null): array
+{
+    $at = $at ?? now_ts();
+    $panelId = (int) ($panel['id'] ?? 0);
+    $out = ['events' => [], 'pending' => false];
+    if ($panelId <= 0 || !panel_is_hourly_unlimited($panel)) {
+        return $out;
+    }
+    $cutoff = unlimited_online_hour_start($at);
+    $hours = [];
+    foreach (DB::all("SELECT hour_at FROM unlimited_online_settlements WHERE panel_id=? AND status='pending' "
+            . 'AND hour_at<? ORDER BY hour_at', [$panelId, $cutoff]) as $row) {
+        $hours[(int) $row['hour_at']] = true;
+    }
+    foreach (DB::all('SELECT DISTINCT minute_at - (minute_at % 3600) AS hour_at '
+            . 'FROM unlimited_online_minutes WHERE panel_id=? AND minute_at<? ORDER BY hour_at',
+            [$panelId, $cutoff]) as $row) {
+        $hours[(int) $row['hour_at']] = true;
+    }
+    ksort($hours, SORT_NUMERIC);
+    foreach (array_keys($hours) as $hourAt) {
+        $event = unlimited_online_settle_hour($panelId, (int) $hourAt, $at);
+        if (($event['state'] ?? '') === 'pending') {
+            $out['pending'] = true;
+            $out['events'][] = $event;
+            break;
+        }
+        if (!empty($event['new'])) {
+            $out['events'][] = $event;
+        }
+    }
+    return $out;
+}
+
+/** One Persian aggregate report, never one report per minute/client. */
+function unlimited_online_report_text(array $event): string
+{
+    $hourAt = (int) ($event['hour_at'] ?? 0);
+    $activeMinutes = max(0, (int) ($event['active_minutes'] ?? 0));
+    $activeClients = max(0, (int) ($event['active_clients'] ?? 0));
+    $carry = max(0, (int) ($event['remainder_after'] ?? 0)) % 60;
+    $text = '♾️ <b>صورتحساب زمان آنلاین پنل نامحدود</b>' . "\n"
+        . '👤 مشتری <code>' . (int) ($event['tg_id'] ?? 0) . "</code>\n"
+        . '📦 پنل <code>' . e((string) ($event['username'] ?? '')) . "</code>\n"
+        . '🕒 بازه: ' . fa_ts($hourAt) . ' تا ' . fa_ts($hourAt + UNLIMITED_ONLINE_HOUR_SECONDS) . "\n"
+        . '👥 کاربرِ فعال: ' . fa_digits($activeClients) . "\n"
+        . '⏱ مجموع زمان فعال: ' . fa_digits($activeMinutes) . ' دقیقهٔ کاربر' . "\n"
+        . '💵 نرخ: ' . money((int) ($event['hourly_price'] ?? 0)) . ' / کاربر / ساعت' . "\n"
+        . '➖ کسر شد: <b>' . money((int) ($event['amount'] ?? 0)) . "</b>\n"
+        . '👛 موجودی: ' . money((int) ($event['balance'] ?? 0));
+    if ($carry > 0) {
+        $text .= "\n" . '🔢 باقیماندهٔ کسری برای ساعت بعد: ' . fa_digits($carry) . '/۶۰ تومان';
+    }
+    return $text;
+}
+
+/** Claim before Telegram I/O: concurrent ticks can produce at most one hourly report. */
+function unlimited_online_post_report(array $event): bool
+{
+    $id = (int) ($event['settlement_id'] ?? 0);
+    if ($id <= 0) {
+        return false;
+    }
+    $claimed = DB::update('UPDATE unlimited_online_settlements SET reported_at=? '
+        . 'WHERE id=? AND reported_at=0', [now_ts(), $id]);
+    if ($claimed !== 1) {
+        return false;
+    }
+    post_report(unlimited_online_report_text($event), 'usage');
+    return true;
+}
+
+/**
+ * Called once per minute by the poller (and by --meter). It measures only active
+ * sold panels; a balance-suspended panel retries its oldest hourly invoice and
+ * resumes only after that exact debt has been settled.
+ */
+function panels_unlimited_online_tick(bool $verbose = false, ?int $at = null): array
+{
+    $at = $at ?? now_ts();
+    $out = ['panels' => 0, 'users' => 0, 'active_minutes' => 0, 'settlements' => 0,
+        'charged' => 0, 'suspended' => 0, 'resumed' => 0, 'errors' => 0];
+    $rows = DB::all("SELECT * FROM panels WHERE is_unlimited=1 AND unlimited_billing_mode='hourly' "
+        . "AND (status='active' OR (status='suspended' AND suspended_reason IN ('online_balance','hourly_balance'))) ");
+    foreach ($rows as $panel) {
+        $out['panels']++;
+        $panelId = (int) $panel['id'];
+        if ((string) $panel['status'] === 'active') {
+            try {
+                $sample = unlimited_online_sample_panel($panel, $at);
+                $out['users'] += (int) ($sample['users'] ?? 0);
+                $out['active_minutes'] += (int) ($sample['active_minutes'] ?? 0);
+                if ($verbose) {
+                    echo '· unlimited live ' . $panel['panel_username'] . ' — users='
+                        . (int) ($sample['users'] ?? 0) . ' active-minutes='
+                        . (int) ($sample['active_minutes'] ?? 0) . "\n";
+                }
+            } catch (Throwable $ex) {
+                $out['errors']++;
+                log_line('warning', 'unlimited live-minute sample failed: ' . $ex->getMessage(),
+                    ['panel' => $panelId]);
+            }
+        }
+        try {
+            $settlement = unlimited_online_settle_due($panel, $at);
+            $hasPending = (bool) ($settlement['pending'] ?? false);
+            foreach ($settlement['events'] as $event) {
+                if (($event['state'] ?? '') === 'pending') {
+                    continue;
+                }
+                if (!empty($event['new'])) {
+                    $out['settlements']++;
+                    $out['charged'] += (int) $event['amount'];
+                    unlimited_online_post_report($event);
+                }
+            }
+            $fresh = DB::one('SELECT * FROM panels WHERE id=?', [$panelId]);
+            if ($fresh !== null && $hasPending) {
+                if ((string) $fresh['status'] === 'active'
+                    && suspend_panel($fresh, 'کمبود موجودی برای زمان آنلاین پنل نامحدود')) {
+                    DB::exec('UPDATE panels SET suspended_reason=? WHERE id=?', ['online_balance', $panelId]);
+                    $out['suspended']++;
+                }
                 continue;
             }
-            $rate = $unitCount * $price;
-            $periods = intdiv($at - $paidUntil, 3600) + 1;
-            /* Each period needs a whole rate; partial hours are never silently
-               booked, so an unpaid clock remains due for the next run. */
-            $canPay = min($periods, intdiv(max(0, $balance), $rate));
-            if ($canPay > 0) {
-                $amount = $canPay * $rate;
-                DB::exec('UPDATE unlimited_billing_units SET paid_until=? WHERE id=? AND paid_until=?',
-                    [$paidUntil + $canPay * 3600, (int) $unit['id'], $paidUntil]);
-                $charged += $amount;
-                $balance -= $amount;
-                $hours += $canPay;
+            if ($fresh !== null && (string) $fresh['status'] === 'suspended'
+                && in_array((string) ($fresh['suspended_reason'] ?? ''), ['online_balance', 'hourly_balance'], true)) {
+                if (resume_panel($fresh)) {
+                    DB::exec('UPDATE panels SET suspended_reason=NULL WHERE id=?', [$panelId]);
+                    $out['resumed']++;
+                }
             }
-            if ($canPay < $periods) {
-                $insufficient = true;
-            }
-        }
-        if ($charged > 0) {
-            $changed = DB::update('UPDATE users SET balance=balance-? WHERE tg_id=? AND balance>=?',
-                [$charged, $tgId, $charged]);
-            if ($changed !== 1) {
-                throw new RuntimeException('hourly unlimited balance changed during locked debit');
-            }
-            $newBalance = $startingBalance - $charged;
-            DB::exec('INSERT INTO wallet_tx(tg_id, amount, kind, ref, note, balance, created_at) '
-                . 'VALUES(?,?,?,?,?,?,?)', [$tgId, -$charged, 'unlimited-hourly', (string) $panelId,
-                'صورتحساب ساعتی پنل نامحدود', $newBalance, now_ts()]);
-            DB::exec('INSERT INTO usage_charges(panel_id, tg_id, bytes, hours, amount, kind, created_at) '
-                . 'VALUES(?,?,?,?,?,?,?)', [$panelId, $tgId, 0, $hours, $charged,
-                'unlimited-hourly', now_ts()]);
-            DB::exec('UPDATE panels SET spent_total=spent_total+?, last_meter_at=? WHERE id=?',
-                [$charged, $at, $panelId]);
-        }
-        return ['skip' => false, 'charged' => $charged, 'hours' => $hours,
-                'insufficient' => $insufficient, 'tg' => $tgId,
-                'username' => (string) $fresh['panel_username'], 'balance' => $balance,
-                'status' => (string) $fresh['status'],
-                'reason' => (string) ($fresh['suspended_reason'] ?? '')];
-    });
-    if (($decision['skip'] ?? false) === true) {
-        $out['skipped'] = true;
-        return $out;
-    }
-    $out['charged'] = (int) $decision['charged'];
-    $out['hours'] = (int) $decision['hours'];
-    $out['insufficient'] = (bool) $decision['insufficient'];
-    if ($out['charged'] > 0) {
-        post_report('♾️ <b>صورتحساب ساعتی پنل نامحدود</b>' . "\n"
-            . '👤 کاربر <code>' . (int) $decision['tg'] . "</code>\n"
-            . '📦 پنل <code>' . e((string) $decision['username']) . "</code>\n"
-            . '⏱ دورهٔ ثبت‌شده: ' . fa_digits($out['hours']) . " ساعت\n"
-            . '💵 کسر شد: ' . money($out['charged']) . "\n"
-            . '👛 موجودی: ' . money((int) $decision['balance']), 'usage');
-    }
-    $fresh = DB::one('SELECT * FROM panels WHERE id=?', [$panelId]);
-    if ($fresh === null) {
-        return $out;
-    }
-    if ($out['insufficient']) {
-        if ((string) $fresh['status'] === 'active'
-            && suspend_panel($fresh, 'کمبود موجودی برای صورتحساب ساعتی پنل نامحدود')) {
-            DB::exec('UPDATE panels SET suspended_reason=? WHERE id=?', ['hourly_balance', $panelId]);
-            $out['suspended'] = true;
-        }
-        return $out;
-    }
-    /* Only a suspension caused by this billing model is auto-resumed. */
-    if ((string) $fresh['status'] === 'suspended'
-        && (string) ($fresh['suspended_reason'] ?? '') === 'hourly_balance') {
-        DB::exec('UPDATE panels SET suspended_reason=NULL WHERE id=?', [$panelId]);
-        if (resume_panel($fresh)) {
-            $out['resumed'] = true;
+        } catch (Throwable $ex) {
+            $out['errors']++;
+            log_line('warning', 'unlimited live-minute settlement failed: ' . $ex->getMessage(),
+                ['panel' => $panelId]);
         }
     }
     return $out;
@@ -373,16 +622,8 @@ function panels_meter(bool $verbose = false): array
     foreach (DB::all("SELECT * FROM panels WHERE status='suspended'") as $held) {
         if (panel_is_unlimited($held)) {
             if (panel_is_hourly_unlimited($held)) {
-                if ($hourlyEnabled && (string) ($held['suspended_reason'] ?? '') === 'hourly_balance') {
-                    $hourly = unlimited_hourly_charge_once($held);
-                    if ($hourly['charged'] > 0) {
-                        $stats['charges']++;
-                        $stats['charged'] += $hourly['charged'];
-                    }
-                    if ($hourly['resumed']) {
-                        $stats['resumed']++;
-                    }
-                }
+                /* Live-minute debt/recovery belongs to panels_unlimited_online_tick(),
+                   which runs every minute and never invokes the old capacity meter. */
                 continue;
             }
             /* اگر نسخهٔ قبلی ربات به‌علت موجودی این پنل را بسته باشد، واگذار کردن
@@ -411,22 +652,8 @@ function panels_meter(bool $verbose = false): array
     $rows = DB::all("SELECT * FROM panels WHERE status='active'");
     foreach ($rows as $panel) {
         if (panel_is_unlimited($panel)) {
-            if (panel_is_hourly_unlimited($panel) && $hourlyEnabled) {
-                $hourly = unlimited_hourly_charge_once($panel);
-                if ($hourly['charged'] > 0) {
-                    $stats['charges']++;
-                    $stats['charged'] += $hourly['charged'];
-                }
-                if ($hourly['suspended']) {
-                    $stats['suspended']++;
-                }
-                if ($verbose && ($hourly['charged'] > 0 || $hourly['insufficient'])) {
-                    echo '· unlimited ' . $panel['panel_username'] . ' — hours=' . $hourly['hours']
-                        . ' charge=' . money($hourly['charged'])
-                        . ($hourly['insufficient'] ? ' (insufficient)' : '') . "\n";
-                }
-            }
-            /* No usage/traffic/expiry meter for either unlimited model. */
+            /* No volume/expiry meter applies to unlimited panels. Their separate
+               live-minute worker samples direct node connection state each minute. */
             continue;
         }
         $panelRow = $panel['pg_panel_id']
@@ -566,7 +793,7 @@ function panels_balance_enforce(bool $verbose = false): array
         }
         if (panel_is_unlimited($panel)) {
             if (panel_is_hourly_unlimited($panel)) {
-                /* Its own component meter decides when this service may resume. */
+                /* Its own live-minute meter decides when this service may resume. */
                 continue;
             }
             if ($panel['status'] === 'suspended' && ($panel['suspended_reason'] ?? '') === 'balance') {

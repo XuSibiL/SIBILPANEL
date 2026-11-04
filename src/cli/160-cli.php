@@ -239,6 +239,7 @@ function cli_poll(int $seconds = 0): void
     $deadline = $seconds > 0 ? time() + $seconds : PHP_INT_MAX;
     $lastMeter = 0;
     $lastUnban = 0;
+    $lastUnlimitedOnline = 0;
     $lastReport = (int) set_get('last_report_at', '0');
     while (time() < $deadline) {
         /* آپدیت از دکمهٔ ربات یا CLI: خروج تمیز، سرویس خودش بالا می‌آید */
@@ -276,7 +277,21 @@ function cli_poll(int $seconds = 0): void
                 log_line('warning', 'device unban tick failed: ' . $ex->getMessage());
             }
         }
-        /* متر مصرف هر ۵ دقیقه */
+        /* اتصال زندهٔ هر کانفیگ نامحدود هر ۶۰ ثانیه نمونه‌برداری می‌شود.
+           این مسیر از متر حجمی جداست تا رفتار محصولات حجمی تغییر نکند. */
+        if (time() - $lastUnlimitedOnline >= 60) {
+            $lastUnlimitedOnline = time();
+            try {
+                $onlineStats = panels_unlimited_online_tick();
+                if (($onlineStats['settlements'] ?? 0) || ($onlineStats['suspended'] ?? 0)
+                    || ($onlineStats['resumed'] ?? 0) || ($onlineStats['errors'] ?? 0)) {
+                    log_line('info', 'unlimited online meter', $onlineStats);
+                }
+            } catch (Throwable $ex) {
+                log_line('error', 'unlimited online meter failed: ' . $ex->getMessage());
+            }
+        }
+        /* متر مصرف حجمی/اجارهٔ معمول هر ۵ دقیقه */
         if (time() - $lastMeter >= 300) {
             $lastMeter = time();
             try {
@@ -386,7 +401,11 @@ function cli_main(array $argv): int
             echo json_encode(['settled' => $settled, 'expired' => $expired]) . "\n";
             return 0;
         case '--meter':
+            /* Manual meter preserves the volume path and also runs one live
+               unlimited sample/settlement so an operator can verify it. */
+            $online = panels_unlimited_online_tick(true);
             $stats = panels_meter(true);
+            $stats['unlimited_online'] = $online;
             echo json_encode($stats, JSON_UNESCAPED_UNICODE) . "\n";
             return 0;
         case '--broadcast':

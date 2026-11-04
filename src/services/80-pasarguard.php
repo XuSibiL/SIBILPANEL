@@ -378,6 +378,166 @@ final class PgPanel
     }
 
     /**
+     * همهٔ کانفیگ‌های زیرمجموعهٔ یک ادمین فروخته‌شده را صفحه‌به‌صفحه می‌خواند.
+     *
+     * صورت‌حساب زمان آنلاین نباید با اولین ۲۰۰/۱۰۰۰ ردیف، کاربرهای انتهایی را
+     * نادیده بگیرد. PasarGuard v5 پاسخ را به شکل {users:[...], total:n}
+     * می‌دهد؛ برای wrapperهای قدیمی‌تر، کوتاه شدن صفحه پایان فهرست محسوب می‌شود.
+     * پاسخ ناقص/تکراری خطا است، نه «فهرست خالی»، چون در آن حالت هیچ دقیقه‌ای
+     * نباید حدسی ثبت شود.
+     */
+    public function users_of_all(string $adminUsername): array
+    {
+        $this->login();
+        $adminUsername = trim($adminUsername);
+        if ($adminUsername === '') {
+            throw new PanelError('sold panel username is empty');
+        }
+        $limit = 1000;
+        $offset = 0;
+        $total = null;
+        $all = [];
+        $seen = [];
+        $finished = false;
+        for ($page = 0; $page < 10000; $page++) {
+            $data = $this->request('GET', '/api/users', null, [
+                'admin'  => $adminUsername,
+                'limit'  => $limit,
+                'offset' => $offset,
+            ]);
+            $users = is_array($data['users'] ?? null) ? $data['users'] : null;
+            if ($users === null) {
+                throw new PanelError('unexpected users response');
+            }
+            if ($total === null && isset($data['total']) && is_numeric($data['total'])) {
+                $total = max(0, (int) $data['total']);
+            }
+            if ($users === []) {
+                $finished = true;
+                break;
+            }
+            $fresh = 0;
+            foreach ($users as $user) {
+                if (!is_array($user)) {
+                    throw new PanelError('users response contains a malformed user');
+                }
+                $id = (int) ($user['id'] ?? 0);
+                if ($id <= 0) {
+                    throw new PanelError('users response has no stable user id');
+                }
+                if (isset($seen[$id])) {
+                    continue;
+                }
+                $seen[$id] = true;
+                $all[] = $user;
+                $fresh++;
+            }
+            if ($fresh === 0) {
+                throw new PanelError('users pagination did not advance');
+            }
+            $offset += count($users);
+            if (($total !== null && $offset >= $total) || count($users) < $limit) {
+                $finished = true;
+                break;
+            }
+        }
+        if (!$finished) {
+            throw new PanelError('users pagination exceeded its safety limit');
+        }
+        if ($total !== null && count($all) < $total) {
+            throw new PanelError('users list ended before its advertised total');
+        }
+        return $all;
+    }
+
+    /**
+     * اتصال زندهٔ یک کانفیگ از مسیر رسمی node online stats PasarGuard v5.
+     *
+     * GET /api/node/online_stats/{user_id}/ip
+     * → {nodes:{node_id:{ips:{ip:connection_count}}}}
+     *
+     * برخلاف users?online=true که online_at/پنجرهٔ ۲ دقیقه‌ای است، این endpoint
+     * شمارش IP/connection جاری را از nodeهای سالم می‌گیرد. nodes خالی به معنی
+     * «آفلاین» تلقی نمی‌شود: وقتی node سالمی برای پاسخ وجود ندارد، وضعیت ناشناخته
+     * است و متر نباید دقیقه‌ای را ثبت کند.
+     *
+     * @return array{available:bool,connections:int,nodes:int}
+     */
+    public function user_online_connections(int $userId): array
+    {
+        $this->login();
+        if ($userId <= 0) {
+            throw new PanelError('invalid PasarGuard user id');
+        }
+        $data = $this->request('GET', '/api/node/online_stats/' . $userId . '/ip');
+        $nodes = $data['nodes'] ?? null;
+        if (!is_array($nodes)) {
+            throw new PanelError('unexpected node online-stats response');
+        }
+        $available = 0;
+        $connections = 0;
+        foreach ($nodes as $node) {
+            if (!is_array($node)) {
+                continue;
+            }
+            $ips = $node['ips'] ?? null;
+            if (!is_array($ips)) {
+                continue;
+            }
+            $available++;
+            foreach ($ips as $count) {
+                if (is_numeric($count) && (int) $count > 0) {
+                    $connections += (int) $count;
+                }
+            }
+        }
+        return ['available' => $available > 0, 'connections' => $connections, 'nodes' => $available];
+    }
+
+    /**
+     * حین تست اتصال، دسترسی واقعی لازم برای مدل «زمان آنلاین» را بررسی می‌کند.
+     * یک شناسهٔ واقعی از /api/users انتخاب می‌شود؛ پس پاسخ ۲۰۰ از مسیر node stats
+     * هم وجود endpoint و هم مجوز users.read / nodes.stats را اثبات می‌کند.
+     */
+    public function online_billing_capability(): array
+    {
+        $this->login();
+        try {
+            $data = $this->request('GET', '/api/users', null, ['limit' => 1, 'offset' => 0]);
+            $users = is_array($data['users'] ?? null) ? $data['users'] : null;
+            if ($users === null) {
+                return ['ok' => false, 'state' => 'error', 'message' => 'پاسخ فهرست کاربران معتبر نیست.'];
+            }
+            if ($users === []) {
+                return ['ok' => false, 'state' => 'unverified',
+                    'message' => 'هنوز کاربری برای تست زنده وجود ندارد؛ در نخستین پنل فروخته‌شده دوباره بررسی می‌شود.'];
+            }
+            $id = (int) (($users[0]['id'] ?? 0));
+            if ($id <= 0) {
+                return ['ok' => false, 'state' => 'error', 'message' => 'شناسهٔ پایدار کاربر از API دریافت نشد.'];
+            }
+            $live = $this->user_online_connections($id);
+            if (!$live['available']) {
+                return ['ok' => false, 'state' => 'unverified',
+                    'message' => 'node سالمی برای سنجش اتصال زنده پاسخ نداد؛ فعلاً هیچ دقیقه‌ای کسر نمی‌شود.'];
+            }
+            return ['ok' => true, 'state' => 'ok',
+                'message' => 'دسترسی کاربران و آمار اتصال زندهٔ node تأیید شد.'];
+        } catch (PanelError $ex) {
+            if ($ex->status === 403) {
+                return ['ok' => false, 'state' => 'permission',
+                    'message' => 'کلید API باید مجوز users.read و nodes.stats داشته باشد.'];
+            }
+            if ($ex->status === 404) {
+                return ['ok' => false, 'state' => 'unsupported',
+                    'message' => 'endpoint آمار اتصال زندهٔ PasarGuard v5 در دسترس نیست.'];
+            }
+            return ['ok' => false, 'state' => 'error',
+                'message' => 'بررسی اتصال زنده ناموفق بود: ' . mb_substr($ex->getMessage(), 0, 160)];
+        }
+    }
+
+    /**
      * آمار سیستم پنل: نسخه، RAM سرور، CPU و تعداد کاربران.
      * PasarGuard/Marzban: GET /api/system — اگر نبود، خروجی خالی برمی‌گردد.
      */
@@ -437,6 +597,15 @@ function panel_test(array $row): array
             $lines[] = 'گروه‌ها: ' . count($groups) . ' عدد';
         } catch (Throwable $ex) {
             $lines[] = 'گروه‌ها خوانده نشد';
+        }
+        /* این probe فقط خواندنی است و روشن می‌کند آیا همین API key واقعاً می‌تواند
+           کاربران هر پنل را ببیند و اتصال زندهٔ node را بخواند یا نه. */
+        try {
+            $online = $client->online_billing_capability();
+            $lines[] = 'صورت‌حساب زمان آنلاین: ' . ($online['ok'] ? '✅ ' : '⚠️ ')
+                . (string) ($online['message'] ?? 'وضعیت نامشخص');
+        } catch (Throwable $ex) {
+            $lines[] = 'صورت‌حساب زمان آنلاین: ⚠️ بررسی نشد';
         }
         $ms = (int) round((microtime(true) - $started) * 1000);
         $lines[] = 'زمان پاسخ: ' . fa_digits($ms) . ' میلی‌ثانیه';

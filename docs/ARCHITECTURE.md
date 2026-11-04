@@ -39,7 +39,7 @@ Telegram ──callback──────▶ src/handlers/130-router-callbacks.p
 | `src/handlers/120-wizard.php` | موتور ورودی‌های چندمرحله‌ای |
 | `src/handlers/130-router-callbacks.php` | مسیریابی callbackها |
 | `src/handlers/140-router-messages.php` | مسیریابی پیام‌ها و `/start` |
-| `src/services/150-meter.php` | مصرف هر گیگ، اجارهٔ ساعتی و توقف خودکار |
+| `src/services/150-meter.php` | مصرف هر گیگ و اجارهٔ معمولی، و نمونه‌برداری/تسویهٔ مستقلِ دقیقه‌ای برای پنل نامحدود اتصال‌محور |
 | `src/cli/160-cli.php` | `--check`، `--poll`، `--meter` و `--migrate` |
 | `src/services/170-gateways.php` | زرین‌پال، آقای پرداخت، واریزا، NowPayments، Plisio و SwapWallet |
 | `src/web/180-web.php` | وب‌هوک درگاه‌ها |
@@ -57,15 +57,16 @@ Telegram ──callback──────▶ src/handlers/130-router-callbacks.p
 - نمایش مبلغ با `money()`، بر پایهٔ تومان و با جداکنندهٔ هزارگان انجام می‌شود.
 - مصرف: هر یک گیگ کامل در قیمت گیگ همان پنل ضرب می‌شود و هیچ گیگی دوباره کسر نمی‌شود؛
   مبنا ستون `billed_bytes` با CAS است.
-- اجارهٔ ساعتی بر پایهٔ ساعت کامل محاسبه می‌شود و ۲۴ ساعت نخست در زمان ساخت پنل ثبت می‌شود.
-- اگر موجودی از هزینهٔ یک ساعت کمتر باشد و `suspend_on_zero` فعال باشد، پنل غیرفعال، نه حذف، می‌شود.
+- اجارهٔ ساعتی محصولات حجمی بر پایهٔ ساعت کامل محاسبه می‌شود و ۲۴ ساعت نخست در زمان ساخت پنل ثبت می‌شود.
+- پنل نامحدود اتصال‌محور (`unlimited_billing_mode=hourly`) مسیر جداگانه دارد: poller هر دقیقه همهٔ کاربران ادمین فروخته‌شده را از PasarGuard می‌خواند و فقط شمارش اتصال لحظه‌ای `node/online_stats/{user_id}/ip` را معتبر می‌داند. جدول `unlimited_online_minutes` با کلید یکتای پنل/کاربر/دقیقه، مشاهده را نگه می‌دارد؛ `unlimited_online_settlements` یک تسویهٔ یکتا برای هر پنل/ساعت و `unlimited_online_billing_state` باقیماندهٔ دقیق تقسیم بر ۶۰ را نگه می‌دارد.
+- اگر موجودی از مبلغ یک تسویه کمتر باشد، پنل غیرفعال، نه حذف، می‌شود و همان settlement pending پس از شارژ دوباره بررسی می‌شود.
 
 ## مدل داده
 
 `users` · `panels` · `products` · `categories` · `orders` · `payments` · `receipts` ·
-`wallet_tx` · `usage_charges` · `slots` · `discounts` · `discount_uses` · `kyc_cards` ·
-`kyc_requests` · `pg_panels` · `settings` · `tg_state` · `nav_stack` ·
-`temp_restricted_users`
+`wallet_tx` · `usage_charges` · `unlimited_online_minutes` · `unlimited_online_billing_state` ·
+`unlimited_online_settlements` · `slots` · `discounts` · `discount_uses` · `kyc_cards` ·
+`kyc_requests` · `pg_panels` · `settings` · `tg_state` · `nav_stack` · `temp_restricted_users`
 
 ## جریان مالی
 
@@ -74,8 +75,9 @@ Telegram ──callback──────▶ src/handlers/130-router-callbacks.p
    `add_balance(kind=topup)` اجرا می‌شود.
 2. **خرید پنل:** `start_panel_order()` فاکتور را با تخفیف اختصاصی می‌سازد. پس از پرداخت از
    کیف پول یا درگاه، `settle_payment()` اجرا و پنل در PasarGuard ایجاد می‌شود.
-3. **مصرف:** حلقهٔ `panels_meter` هر دقیقه مصرف را می‌خواند، گیگ کامل را کسر می‌کند،
+3. **مصرف حجمی:** حلقهٔ `panels_meter` طبق برنامهٔ پنج‌دقیقه‌ای مصرف را می‌خواند، گیگ کامل را کسر می‌کند،
    `usage_charges` را ثبت می‌کند و در صورت لزوم پنل را تعلیق می‌کند.
+4. **نامحدود اتصال‌محور:** `panels_unlimited_online_tick` مستقل از مسیر حجمی هر دقیقه مشاهدهٔ زنده را ذخیره و ساعت‌های کامل را تسویه می‌کند؛ گزارش Telegram فقط پس از یک settlement موفق و فقط یک‌بار برای همان پنل/ساعت ارسال می‌شود.
 
 ## سیاست خطا
 

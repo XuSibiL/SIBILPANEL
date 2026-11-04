@@ -163,7 +163,6 @@ function hourly_unlimited_product_detail_text(array $product): string
     $minUsers = unlimited_min_users($product);
     $devices = max(0, (int) ($product['device_limit'] ?? 0));
     $perUser = unlimited_user_price($product);
-    $fixed = unlimited_fixed_hourly_price($product);
     $monthly = unlimited_monthly_user_equivalent($product);
 
     return $title . "\n\n"
@@ -171,12 +170,11 @@ function hourly_unlimited_product_detail_text(array $product): string
         . '👤 تعداد کاربر: از <b>' . fa_digits($minUsers) . '</b> کاربر (به انتخاب خودت)' . "\n"
         . '📱 دستگاه هر کاربر: <b>' . fa_digits($devices) . "</b> دستگاه\n"
         . '⏳ اعتبار پنل: <b>بدون انقضا ♾️</b>' . "\n"
-        . '💵 قیمت هر کاربر: <b>' . toman_short($perUser) . "</b> در ساعت\n"
-        . '⏱ هزینهٔ ثابت پنل: <b>' . toman_short($fixed) . "</b> در ساعت\n"
-        . '📅 معادل ماهانه هر کاربر: <b>' . toman_short($monthly) . "</b>\n\n"
-        . '🔋 <b>پرداخت به‌صورت مصرفی (pay-and-go):</b> پیش‌پرداخت دوره‌ای ندارد؛ '
-        . 'هزینهٔ ساعت اول هنگام فعال‌سازی و سپس هر ساعت، فقط بر اساس تعداد کاربری که '
-        . 'انتخاب می‌کنی از کیف پول کم می‌شود و ترافیک آزاد است.';
+        . '💵 نرخ هر کاربرِ آنلاین: <b>' . toman_short($perUser) . "</b> در ساعت\n"
+        . '📅 معادل ماهانهٔ یک کاربرِ همیشه‌آنلاین: <b>' . toman_short($monthly) . "</b>\n\n"
+        . '🔋 <b>پرداخت به‌صورت مصرفی (pay-and-go):</b> هیچ پیش‌پرداخت یا اجارهٔ ظرفیت ندارد؛ '
+        . 'ربات فقط وقتی اتصال زندهٔ یک کاربر را از node پاسارگارد تأیید کند، همان دقیقه را ثبت می‌کند. '
+        . 'زمان آفلاین هیچ هزینه‌ای ندارد و صورتحساب هر ساعت یک‌جا از کیف پول کم می‌شود.';
 }
 
 function product_detail_text(array $product): string
@@ -511,9 +509,8 @@ function screen_unlimited_initial_users(int|string $chat, ?int $messageId, int $
         . 'تعداد کاربر موردنیاز را فقط به‌صورت عدد بفرستید.' . "\n"
         . 'حداقل مجاز: <b>' . fa_digits(unlimited_min_users($product)) . '</b> کاربر' . "\n"
         . ($hourly
-            ? ('💵 نرخ هر کاربر / ساعت: <b>' . money(unlimited_user_price($product)) . "</b>\n"
-                . '🏷 اجارهٔ ثابت پنل / ساعت: <b>' . money(unlimited_fixed_hourly_price($product)) . "</b>\n"
-                . '<i>فاکتور، ساعت اول را پوشش می‌دهد؛ سپس کسر ساعتی از کیف پول انجام می‌شود.</i>')
+            ? ('💵 نرخ هر کاربرِ آنلاین / ساعت: <b>' . money(unlimited_user_price($product)) . "</b>\n"
+                . '<i>فعال‌سازی ظرفیت رایگان است؛ فقط دقیقه‌های اتصال زنده ثبت و هر ساعت یک‌جا تسویه می‌شود.</i>')
             : ('قیمت هر کاربر: <b>' . money(unlimited_user_price($product)) . '</b>'))
         . "\n\n" . '<i>مثال: ' . fa_digits(unlimited_min_users($product)) . '</i>' . "\n"
         . 'برای لغو: <code>لغو</code>',
@@ -558,27 +555,25 @@ function start_panel_order(int $uid, int|string $chat, ?int $messageId, int $pro
         }
         $hourly = product_is_hourly_unlimited($product);
         $usersRate = unlimited_user_order_total($product, $unlimitedUsers);
-        $fixedRate = unlimited_fixed_hourly_price($product);
-        $price = $hourly ? unlimited_initial_hourly_total($product, $unlimitedUsers) : $usersRate;
+        $price = $hourly ? 0 : $usersRate;
         $payload = [
             'product' => $productId,
             'panel_username' => $username,
             'sale_type' => PRODUCT_SALE_UNLIMITED_USERS,
             'unlimited_users' => true,
             'unlimited_billing_mode' => $hourly ? UNLIMITED_BILLING_HOURLY : UNLIMITED_BILLING_LEGACY,
+            'unlimited_online_billing' => $hourly ? 1 : 0,
             'user_count' => $unlimitedUsers,
             'per_user_price' => unlimited_user_price($product),
-            'panel_hourly_price' => $fixedRate,
             'min_users' => unlimited_min_users($product),
         ];
         $order = create_order($uid, 'panel', $price, $productId, $payload);
         $breakdown = '♾️ ' . e((string) $product['name']) . "\n"
             . '👥 تعداد کاربر: <b>' . fa_digits($unlimitedUsers) . "</b>\n";
         if ($hourly) {
-            $breakdown .= '💵 ساعت اول: ' . fa_digits($unlimitedUsers) . ' × '
-                . money(unlimited_user_price($product)) . ' + اجارهٔ ثابت ' . money($fixedRate)
-                . ' = <b>' . money($price) . "</b>\n"
-                . '<i>از ساعت بعد، همین نرخ از کیف پول کم می‌شود.</i>' . "\n";
+            $breakdown .= '💵 فعال‌سازی ظرفیت: <b>رایگان</b>' . "\n"
+                . '⏱ نرخ هر کاربرِ آنلاین: ' . money(unlimited_user_price($product)) . ' / ساعت' . "\n"
+                . '<i>فقط دقیقه‌های اتصال زنده ثبت و در پایان هر ساعت یک‌جا از کیف پول کم می‌شود.</i>' . "\n";
         } else {
             $breakdown .= '💵 ' . fa_digits($unlimitedUsers) . ' × '
                 . money(unlimited_user_price($product)) . ' = <b>' . money($price) . "</b>\n";
@@ -1479,18 +1474,17 @@ function screen_panel_detail(int|string $chat, ?int $messageId, int $panelId): v
             . '👥 کاربر: ' . fa_digits((int) $panel['last_users']) . ' از '
                 . fa_digits($cap) . "\n";
         if ($hourlyUnlimited) {
-            $nextDue = unlimited_billing_next_due((int) $panel['id']);
-            $fixedHourly = panel_unlimited_fixed_hourly_price($panel);
-            $usersHourly = panel_unlimited_users_hourly_total($panel, $cap);
-            $hourlyTotal = $usersHourly > PHP_INT_MAX - $fixedHourly
-                ? PHP_INT_MAX : $usersHourly + $fixedHourly;
-            $text .= '💵 نرخ هر کاربر / ساعت: ' . money(panel_unlimited_user_price($panel)) . "\n"
-                . '🏷 اجارهٔ ثابت / ساعت: ' . money(panel_unlimited_fixed_hourly_price($panel)) . "\n"
-                . '⏱ نرخ فعلی با سقف ' . fa_digits($cap) . ' کاربر: <b>' . money($hourlyTotal)
-                    . '</b> / ساعت' . "\n"
-                . ($nextDue > 0 ? '🕒 کسر بعدی: ' . fa_ts($nextDue) . "\n" : '')
-                . '🔻 حداقل شارژ: ' . fa_digits(panel_unlimited_min_users($panel)) . " کاربر\n"
-                . '<i>ساعت اول هر بخش هنگام خرید آن پرداخت می‌شود؛ پس از آن کسر ساعتی از کیف پول است.</i>' . "\n";
+            $lastSettlement = DB::one('SELECT * FROM unlimited_online_settlements WHERE panel_id=? '
+                . "AND status='settled' ORDER BY hour_at DESC LIMIT 1", [(int) $panel['id']]);
+            $text .= '💵 نرخ هر کاربرِ آنلاین / ساعت: ' . money(unlimited_online_hourly_rate($panel)) . "\n"
+                . '⏱ ثبت اتصال: دقیقه‌به‌دقیقه · تسویه: هر ساعت یک گزارش تجمیعی' . "\n"
+                . '🔻 حداقل شارژ ظرفیت: ' . fa_digits(panel_unlimited_min_users($panel)) . " کاربر\n";
+            if ($lastSettlement !== null) {
+                $text .= '🧾 آخرین تسویه: ' . fa_ts((int) $lastSettlement['hour_at'])
+                    . ' · ' . fa_digits((int) $lastSettlement['active_minutes'])
+                    . ' دقیقهٔ فعال · ' . money((int) $lastSettlement['amount']) . "\n";
+            }
+            $text .= '<i>کاربر آفلاین و ظرفیت خالی هیچ هزینه‌ای ندارد.</i>' . "\n";
         } else {
             $text .= '💵 قیمت هر کاربر برای شارژ: ' . money(panel_unlimited_user_price($panel)) . "\n"
                 . '🔻 حداقل شارژ: ' . fa_digits(panel_unlimited_min_users($panel)) . " کاربر\n";

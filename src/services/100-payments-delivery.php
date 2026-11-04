@@ -123,20 +123,24 @@ function deliver_panel_order(array $order): array
        no mode, so they remain the legacy up-front product by design. */
     $unlimitedHourly = $isUnlimited
         && (string) ($payloadOrder['unlimited_billing_mode'] ?? '') === UNLIMITED_BILLING_HOURLY;
-    $unlimitedFixedHourly = $unlimitedHourly
+    /* Orders created by v3.18.7 have no capacity/first-hour invoice. Keep an
+       already-issued old invoice deliverable, but never start its old flat clock. */
+    $unlimitedOnline = $unlimitedHourly && !empty($payloadOrder['unlimited_online_billing']);
+    $unlimitedFixedHourly = ($unlimitedHourly && !$unlimitedOnline)
         ? max(0, (int) ($payloadOrder['panel_hourly_price'] ?? 0)) : 0;
     $unlimitedUsersTotal = 0;
     if ($isUnlimited && $unlimitedUnit > 0 && $unlimitedUsers <= intdiv(PHP_INT_MAX, $unlimitedUnit)) {
         $unlimitedUsersTotal = $unlimitedUsers * $unlimitedUnit;
     }
-    $unlimitedExpected = $unlimitedUsersTotal;
-    if ($unlimitedHourly && $unlimitedExpected <= PHP_INT_MAX - $unlimitedFixedHourly) {
+    $unlimitedExpected = $unlimitedOnline ? 0 : $unlimitedUsersTotal;
+    if ($unlimitedHourly && !$unlimitedOnline && $unlimitedExpected <= PHP_INT_MAX - $unlimitedFixedHourly) {
         $unlimitedExpected += $unlimitedFixedHourly;
-    } elseif ($unlimitedHourly) {
+    } elseif ($unlimitedHourly && !$unlimitedOnline) {
         $unlimitedExpected = -1;
     }
     /* قیمت و تعداد در payload سفارش snapshot هستند تا تغییر محصول پس از پرداخت
-       به مبلغ/سقف فروخته‌شده اثر نگذارد. ساعت اول در فاکتور است، نه کسر کیف پول. */
+       به مبلغ/سقف فروخته‌شده اثر نگذارد. مدل v3.18.7 فقط دقیقه‌های اتصال تأییدشده
+       را بعداً از کیف پول می‌گیرد؛ هیچ ظرفیت/ساعت نخست پیش‌فاکتور نمی‌شود. */
     if ($isUnlimited && ($unlimitedUsers < $unlimitedMin || $unlimitedUsers > UNLIMITED_USERS_MAX
         || $unlimitedUnit <= 0 || $unlimitedUsers > intdiv(PHP_INT_MAX, $unlimitedUnit)
         || $unlimitedExpected !== (int) $order['price'])) {
@@ -227,11 +231,12 @@ function deliver_panel_order(array $order): array
         return [false, 'ساخت پنل روی سرور انجام نشد: ' . $note];
     }
 
-    /* Legacy unlimited panels stay completely outside local billing.  The new
-       model records first-hour paid-through clocks per component. */
+    /* Legacy unlimited panels remain outside local billing. Hourly unlimited
+       panels now enter the v3.18.7 per-client live-minute meter with no paid
+       capacity clock and no synthetic first hour. */
     $now = now_ts();
     $prepaidHours = ($isTrial || $isUnlimited) ? 0 : prepaid_hours();
-    $billingStartAt = $unlimitedHourly ? $now + 3600
+    $billingStartAt = $unlimitedHourly ? 0
         : ($prepaidHours > 0 ? $now + $prepaidHours * 3600 : 0);
     $prepaidAmount = ($isTrial || $isUnlimited) ? 0
         : max(0, (int) ($payloadOrder['prepaid'] ?? panel_prepaid_amount($product)));
@@ -254,18 +259,9 @@ function deliver_panel_order(array $order): array
          $isUnlimited ? $unlimitedMin : 1,
          $unlimitedHourly ? UNLIMITED_BILLING_HOURLY : UNLIMITED_BILLING_LEGACY,
          $billingStartAt, $prepaidAmount, $billingStartAt > 0 ? $billingStartAt : $now]);
-    if ($unlimitedHourly) {
-        /* The base and user-cap lines are separate so an added cap never incurs
-           a charge for hours before it was purchased.  INSERT OR IGNORE makes
-           an accidental re-delivery of the same order harmless. */
-        db_tx(static function () use ($panelId, $order, $unlimitedFixedHourly, $unlimitedUsers,
-                                      $unlimitedUnit, $billingStartAt): void {
-            unlimited_billing_unit_add($panelId, (int) $order['id'], 'base', 1,
-                $unlimitedFixedHourly, $billingStartAt);
-            unlimited_billing_unit_add($panelId, (int) $order['id'], 'users', $unlimitedUsers,
-                $unlimitedUnit, $billingStartAt);
-        });
-    }
+    /* Do not create unlimited_billing_units here. Those v3.18.6 capacity rows
+       charged purchased slots; v3.18.7 charges only a client-minute that the
+       live PasarGuard node endpoint has actually observed. */
     if (!$isTrial && !$isUnlimited) {
         try {
             grant_order_discount($order, $panelId);
@@ -289,8 +285,7 @@ function deliver_panel_order(array $order): array
         $spec = $isUnlimited
             ? ('👥 سقف کاربر: ' . fa_digits($userCap)
                 . ($unlimitedHourly
-                    ? (' · 💵 هر کاربر/ساعت: ' . money($unlimitedUnit)
-                        . ' · 🏷 ثابت/ساعت: ' . money($unlimitedFixedHourly))
+                    ? (' · 💵 هر کاربرِ آنلاین/ساعت: ' . money($unlimitedUnit))
                     : (' · 💵 هر کاربر: ' . money($unlimitedUnit))))
             : ('📊 حجم: ' . fa_digits($dataCapGb) . ' گیگ'
                 . ($isTrial ? ' · ⏳ ' . fa_digits((int) (($expireAt - time()) / 3600)) . ' ساعت'
@@ -320,9 +315,8 @@ function deliver_panel_order(array $order): array
     }
     if ($isUnlimited) {
         $hourlyNote = $unlimitedHourly
-            ? ('💵 ساعت اول پرداخت شده است. از ' . fa_ts($billingStartAt)
-                . '، هر ساعت <b>' . money($unlimitedUsersTotal + $unlimitedFixedHourly)
-                . '</b> از کیف پول کسر می‌شود.\n')
+            ? ('💵 نرخ هر کاربرِ آنلاین: <b>' . money($unlimitedUnit) . '</b> در ساعت. '
+                . 'فقط دقیقه‌های اتصال زنده از node پاسارگارد ثبت و هر ساعت یک‌جا از کیف پول کسر می‌شود.\n')
             : '';
         return [true, "✅ <b>پنل نامحدود شما آماده است</b>\n\n" . $nameNote
             . '🌐 آدرس پنل: ' . e($dashboard) . "\n"
@@ -512,13 +506,16 @@ function settle_payment(array $order, string $source = 'wallet', int $adminId = 
             $unit = (int) ($payload['per_user_price'] ?? 0);
             $min = max(1, (int) ($payload['min_users'] ?? 1));
             $payloadHourly = (string) ($payload['unlimited_billing_mode'] ?? '') === UNLIMITED_BILLING_HOURLY;
+            $payloadOnline = $payloadHourly && !empty($payload['unlimited_online_billing']);
             $hourlyUnlimitedRecharge = panel_is_hourly_unlimited($panel);
-            /* Added capacity pays only its own first hour.  It must never be
-               charged for historical hours of an existing panel. */
+            /* New v3.18.7 capacity activation is free: only later live client
+               minutes are billed. A pre-upgrade pending order keeps its issued
+               one-hour price only so it can be delivered/reconciled safely. */
+            $expectedRecharge = $payloadOnline ? 0 : $block * $unit;
             if (!panel_is_unlimited($panel) || $payloadHourly !== $hourlyUnlimitedRecharge
                 || $block < $min || $block > UNLIMITED_USERS_MAX
                 || $unit <= 0 || $block > intdiv(PHP_INT_MAX, $unit)
-                || $block * $unit !== (int) $order['price']
+                || $expectedRecharge !== (int) $order['price']
                 || $unit !== panel_unlimited_user_price($panel)
                 || $min !== panel_unlimited_min_users($panel)) {
                 order_mark((int) $order['id'], 'failed');
@@ -551,14 +548,7 @@ function settle_payment(array $order, string $source = 'wallet', int $adminId = 
         }
         /* فقط پس از پاسخ موفق PasarGuard مقدار محلی تغییر می‌کند. */
         DB::exec('UPDATE panels SET user_cap=?, max_users=? WHERE id=?', [$cap, $cap, $panelId]);
-        $newUsersPaidUntil = 0;
-        if ($hourlyUnlimitedRecharge) {
-            $newUsersPaidUntil = now_ts() + 3600;
-            db_tx(static function () use ($panelId, $order, $block, $unit, $newUsersPaidUntil): void {
-                unlimited_billing_unit_add($panelId, (int) $order['id'], 'users', $block, $unit,
-                    $newUsersPaidUntil);
-            });
-        }
+        /* No purchased-capacity clock is created for unlimited online billing. */
         order_mark((int) $order['id'], 'delivered');
         post_report(($isUnlimitedRecharge ? '♾️ <b>افزودن کاربر پنل نامحدود</b>'
                 : '➕ <b>افزایش سقف کاربر</b>') . "\n"
@@ -567,13 +557,13 @@ function settle_payment(array $order, string $source = 'wallet', int $adminId = 
             . '➕ کاربر افزوده‌شده: ' . fa_digits($block) . "\n"
             . '👥 سقف جدید: ' . fa_digits($cap) . "\n"
             . '💵 مبلغ: ' . money((int) $order['payable'])
-            . ($hourlyUnlimitedRecharge ? "\n⏱ ساعت اول کاربران تازه تا " . fa_ts($newUsersPaidUntil)
-                . ' پرداخت شد.' : ''), 'sales');
+            . ($hourlyUnlimitedRecharge ? "\n⏱ فقط زمان اتصال زندهٔ هر کاربر، دقیقه‌به‌دقیقه محاسبه می‌شود."
+                : ''), 'sales');
         return [true, '✅ سقف کاربر پنل <code>' . e((string) $panel['panel_username'])
             . '</code> شد <b>' . fa_digits($cap) . "</b> کاربر."
             . ($hourlyUnlimitedRecharge
-                ? "\n⏱ ساعت اولِ کاربران تازه پرداخت شده؛ کسر ساعتی از "
-                    . fa_ts($newUsersPaidUntil) . ' آغاز می‌شود.' : '')];
+                ? "\n⏱ هیچ هزینه‌ای برای ظرفیت افزوده‌شده ثبت نشد؛ کسر فقط برای دقیقه‌های آنلاین است."
+                : '')];
     }
     if ($kind === 'slot') {
         DB::exec('INSERT INTO slots(tg_id, count, expires_at, created_at) VALUES(?,?,?,?)',

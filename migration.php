@@ -62,7 +62,8 @@ try {
 /* --- گزارش وضعیت --- */
 $tables = ['users', 'wallet_tx', 'panels', 'pg_panels', 'orders', 'receipts',
            'products', 'categories', 'discounts', 'kyc_requests', 'kyc_cards',
-           'payments', 'usage_charges', 'temp_restricted_users', 'settings', 'slots'];
+           'payments', 'usage_charges', 'unlimited_online_minutes', 'unlimited_online_billing_state',
+           'unlimited_online_settlements', 'temp_restricted_users', 'settings', 'slots'];
 
 $say('panel-service — database migration');
 $say('  database : ' . db_path());

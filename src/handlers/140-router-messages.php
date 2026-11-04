@@ -393,10 +393,9 @@ function handle_message_inner(array $message): void
             }
             $count = (int) $count;
             $unit = panel_unlimited_user_price($panel);
-            /* A capacity extension buys exactly its own first hourly period; the
-               fixed panel component is never charged again here. */
+            /* v3.18.7 never sells an hour merely because capacity grew. */
             $hourly = panel_is_hourly_unlimited($panel);
-            $price = panel_unlimited_users_hourly_total($panel, $count);
+            $price = $hourly ? 0 : panel_unlimited_users_hourly_total($panel, $count);
             State::clear($uid);
             $order = create_order($uid, 'users', $price, (int) ($panel['product_id'] ?? 0), [
                 'panel_id' => $panelId,
@@ -404,16 +403,20 @@ function handle_message_inner(array $message): void
                 'sale_type' => PRODUCT_SALE_UNLIMITED_USERS,
                 'unlimited_users' => true,
                 'unlimited_billing_mode' => $hourly ? UNLIMITED_BILLING_HOURLY : UNLIMITED_BILLING_LEGACY,
+                'unlimited_online_billing' => $hourly ? 1 : 0,
                 'user_count' => $count,
                 'per_user_price' => $unit,
                 'min_users' => panel_unlimited_min_users($panel),
             ]);
             $detail = '📦 پنل <code>' . e((string) $panel['panel_username']) . "</code>\n"
-                . '👥 تعداد کاربر: <b>' . fa_digits($count) . "</b>\n"
-                . '💵 ' . fa_digits($count) . ' × ' . money($unit) . ' = <b>'
-                    . money($price) . '</b>';
+                . '👥 تعداد کاربر: <b>' . fa_digits($count) . "</b>\n";
             if ($hourly) {
-                $detail .= "\n<i>این مبلغ ساعت اولِ کاربران تازه است؛ از ساعت بعد نرخ آن‌ها ساعتی از کیف پول کم می‌شود.</i>";
+                $detail .= '💵 افزایش ظرفیت: <b>رایگان</b>' . "\n"
+                    . '⏱ نرخ هر کاربرِ آنلاین: ' . money($unit) . ' / ساعت'
+                    . "\n<i>تنها دقیقه‌های اتصال زندهٔ کاربران تازه، در گزارش ساعتی محاسبه می‌شود.</i>";
+            } else {
+                $detail .= '💵 ' . fa_digits($count) . ' × ' . money($unit) . ' = <b>'
+                    . money($price) . '</b>';
             }
             Tg::send($chatId, invoice_text($order, 'افزودن کاربر به پنل نامحدود', $detail),
                 invoice_kb($order, $uid));

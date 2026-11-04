@@ -325,8 +325,8 @@ CREATE TABLE IF NOT EXISTS usage_charges (
     created_at INTEGER NOT NULL
 );
 
-/* Each hourly-unlimited component gets its own paid-through clock.  A later
-   capacity increase begins billing from its own purchase time, never retroactively. */
+/* Historical v3.18.6 capacity-clock records are retained for audit only.
+   v3.18.7 deactivates them and uses the per-client live-minute ledger below. */
 CREATE TABLE IF NOT EXISTS unlimited_billing_units (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     panel_id        INTEGER NOT NULL,
@@ -342,6 +342,54 @@ CREATE UNIQUE INDEX IF NOT EXISTS unlimited_billing_source_component_uq
     ON unlimited_billing_units(panel_id, source_order_id, component);
 CREATE INDEX IF NOT EXISTS unlimited_billing_due_idx
     ON unlimited_billing_units(panel_id, active, paid_until);
+
+/* v3.18.7 — minute-granular, per-client live-connection ledger for unlimited
+   panels. A row is written only after the PasarGuard node online-IP endpoint
+   proves an active connection; absence/errors never synthesize an active minute. */
+CREATE TABLE IF NOT EXISTS unlimited_online_minutes (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    panel_id        INTEGER NOT NULL,
+    client_id       INTEGER NOT NULL,
+    client_username TEXT    NOT NULL DEFAULT '',
+    minute_at       INTEGER NOT NULL,
+    connections     INTEGER NOT NULL DEFAULT 0,
+    sampled_at      INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS unlimited_online_minute_uq
+    ON unlimited_online_minutes(panel_id, client_id, minute_at);
+CREATE INDEX IF NOT EXISTS unlimited_online_minute_hour_idx
+    ON unlimited_online_minutes(panel_id, minute_at);
+
+/* Remainder is numerator/60 of one toman. Keeping it per sold panel makes
+   odd rates (for example 750 toman/hour = 12.5 toman/minute) exact over time
+   without rounding every connected minute upward. */
+CREATE TABLE IF NOT EXISTS unlimited_online_billing_state (
+    panel_id          INTEGER PRIMARY KEY,
+    remainder_numerator INTEGER NOT NULL DEFAULT 0,
+    updated_at        INTEGER NOT NULL DEFAULT 0
+);
+
+/* Exactly one settlement row per panel/hour. Pending rows retain the exact
+   computed amount when a wallet is short, and are retried before later hours. */
+CREATE TABLE IF NOT EXISTS unlimited_online_settlements (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    panel_id          INTEGER NOT NULL,
+    hour_at           INTEGER NOT NULL,
+    hourly_price      INTEGER NOT NULL,
+    active_minutes    INTEGER NOT NULL DEFAULT 0,
+    active_clients    INTEGER NOT NULL DEFAULT 0,
+    amount            INTEGER NOT NULL DEFAULT 0,
+    remainder_before  INTEGER NOT NULL DEFAULT 0,
+    remainder_after   INTEGER NOT NULL DEFAULT 0,
+    status            TEXT    NOT NULL DEFAULT 'pending',
+    created_at        INTEGER NOT NULL,
+    settled_at        INTEGER NOT NULL DEFAULT 0,
+    reported_at       INTEGER NOT NULL DEFAULT 0
+);
+CREATE UNIQUE INDEX IF NOT EXISTS unlimited_online_settlement_hour_uq
+    ON unlimited_online_settlements(panel_id, hour_at);
+CREATE INDEX IF NOT EXISTS unlimited_online_settlement_status_idx
+    ON unlimited_online_settlements(panel_id, status, hour_at);
 
 CREATE TABLE IF NOT EXISTS discounts (
     code       TEXT PRIMARY KEY,
@@ -534,6 +582,27 @@ function db_bootstrap(): void
         }
     } catch (Throwable $ex) {
         log_line('warning', 'migration hourly-unlimited failed: ' . $ex->getMessage());
+    }
+
+    /* v3.18.7: old capacity-clock rows are kept for audit but are never allowed
+       to charge an upgraded unlimited panel. The new meter starts with a clean,
+       per-client live-time ledger; no offline/capacity backlog is synthesized. */
+    try {
+        $onlineMigration = (string) DB::val("SELECT value FROM settings WHERE key='migration_unlimited_online_v3187'", [], '');
+        if ($onlineMigration !== 'done') {
+            DB::exec("UPDATE unlimited_billing_units SET active=0 WHERE active=1 AND panel_id IN "
+                . "(SELECT id FROM panels WHERE is_unlimited=1 AND unlimited_billing_mode='hourly')");
+            /* A v3.18.6 capacity-debt hold has no live-minute debt after this
+               migration. Let the new worker re-check it and resume safely. */
+            DB::exec("UPDATE panels SET suspended_reason='online_balance' WHERE is_unlimited=1 "
+                . "AND unlimited_billing_mode='hourly' AND status='suspended' "
+                . "AND suspended_reason='hourly_balance'");
+            DB::exec("INSERT INTO settings(key,value) VALUES('migration_unlimited_online_v3187','done') "
+                . "ON CONFLICT(key) DO UPDATE SET value='done'");
+            log_line('info', 'migration: unlimited capacity clocks retired for live-minute billing');
+        }
+    } catch (Throwable $ex) {
+        log_line('warning', 'migration unlimited online billing failed: ' . $ex->getMessage());
     }
 
     /* مهاجرت: جدول قدیمی device_cuts (قطع کل کانفیگ) → temp_restricted_users

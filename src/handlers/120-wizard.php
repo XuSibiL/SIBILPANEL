@@ -312,11 +312,12 @@ function wiz_finish(int $uid, array $data): void
                 return;
             }
             $perUser = (int) ($values['per_user_price'] ?? 0);
-            $fixedHourly = max(0, (int) ($values['hourly_price'] ?? 0));
+            /* No fixed hourly/capacity rent exists in v3.18.7 online-time sales. */
+            $fixedHourly = 0;
             $deviceLimit = max(0, (int) ($values['device_limit'] ?? 0));
             $minUsers = (int) ($values['min_users'] ?? 0);
             if ($perUser <= 0 || $minUsers < 1 || $minUsers > UNLIMITED_USERS_MAX) {
-                Tg::send($uid, '❌ نرخ ساعتی هر کاربر باید بیشتر از صفر و حداقل تعداد کاربر معتبر باشد.',
+                Tg::send($uid, '❌ نرخ ساعتی هر کاربرِ آنلاین باید بیشتر از صفر و حداقل تعداد کاربر معتبر باشد.',
                     [[btn('➕ محصول نامحدود', 'ad:cat:' . $catId . ':new:unlimited', null, 'success')]]);
                 return;
             }
@@ -346,12 +347,11 @@ function wiz_finish(int $uid, array $data): void
                 . ($values['emoji'] ?: '♾️') . ' <b>' . e((string) $values['name']) . "</b>\n"
                 . '🔌 پنل: ' . e((string) $panelRow['name']) . "\n"
                 . '🎭 نقش: ' . e($roleName !== '' ? $roleName : (string) $roleId) . "\n"
-                . '💵 نرخ هر کاربر / ساعت: <b>' . money($perUser) . "</b>\n"
-                . '🏷 اجارهٔ ثابت پنل / ساعت: <b>' . money($fixedHourly) . "</b>\n"
+                . '💵 نرخ هر کاربرِ آنلاین / ساعت: <b>' . money($perUser) . "</b>\n"
                 . ($tagline !== '' ? '🧩 توضیح: ' . e($tagline) . "\n" : '')
                 . '📱 دستگاه هر کاربر: <b>' . fa_digits($deviceLimit) . "</b>\n"
                 . '👥 حداقل تعداد کاربر: <b>' . fa_digits($minUsers) . "</b>\n\n"
-                . 'پرداخت مصرفی است؛ ساعت نخست هنگام فعال‌سازی و ساعت‌های بعد از کیف پول محاسبه می‌شوند.\n'
+                . 'پرداخت مصرفی است؛ فقط دقیقه‌های اتصال زنده ثبت می‌شود و صورتحساب هر ساعت یک‌جا از کیف پول کم می‌شود.\n'
                 . UNLIMITED_ROLE_GUIDE;
             Tg::send($uid, $text, [
                 [btn('👁 پیش‌نمایش محصول', 'ad:prod:' . $productId)],
