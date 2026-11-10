@@ -249,6 +249,112 @@ okpay(str_contains($adminUi, 'کلید اصلی') && !str_contains($adminUi, ':e
 $callbackError = tetrapay_error(['error' => ['code' => 'INVALID_CALLBACK']]);
 okpay(str_contains($callbackError, 'https://t.me/') && str_contains($callbackError, '@SibilTestBot'),
     'provider callback rejection names the documented Telegram-bot return and actual bot');
+okpay(!str_contains($adminUi, '\\\\n'),
+    'TetraPay admin screen contains no literal backslash-n sequence');
+
+/* Regression v3.18.8: gateway fee in received_amount (e.g. 58,000 Toman = 580,000 Rial
+   for a 50,000 Toman = 500,000 Rial invoice), 32% TetraPay cashback, and KYC exemption. */
+echo "\n== fee-inclusive received_amount, cashback, and KYC exemption ==\n";
+$kycUid = 771099;
+user_ensure($kycUid, 'کاربر تتراپی', 'tetrapay_kyc');
+set_put('kyc_on', '1');
+set_put('kyc_l0_daily', '40000');
+set_put('kyc_l0_monthly', '100000');
+set_put('pay_tetrapay_cashback', '32');
+set_put('pay_zarinpal_on', '1');
+set_put('pay_zarinpal_key', '12345678-1234-1234-1234-123456789012');
+
+$GLOBALS['panel_http_mock'] = static function (string $method, string $url, array $headers, ?string $body): array {
+    if ($method === 'POST' && str_ends_with($url, '/payments')) {
+        $request = json_decode((string) $body, true) ?: [];
+        return [json_encode(['data' => [
+            'token' => 'tp_token_fee_580k',
+            'payment_url' => 'https://pay.example.test/tp_token_fee_580k',
+            'bot_payment_url' => 'https://t.me/TetraBot?start=tp_token_fee_580k',
+            'order_id' => $request['order_id'] ?? '',
+            'amount' => $request['amount'] ?? '',
+        ]], JSON_UNESCAPED_UNICODE), '', 201];
+    }
+    if ($method === 'POST' && str_contains($url, '/payments/tp_token_fee_580k/verify')) {
+        $payment = DB::one("SELECT * FROM payments WHERE authority='tp_token_fee_580k' ORDER BY id DESC LIMIT 1");
+        $meta = $payment ? pay_meta($payment) : [];
+        return [json_encode(['data' => [
+            'status' => 'paid',
+            'order_id' => $meta['tetrapay_order_id'] ?? '',
+            'amount' => 500000,
+            'received_amount' => 580000,
+            'transaction_id' => 'tp-ref-580k',
+        ]], JSON_UNESCAPED_UNICODE), '', 200];
+    }
+    return [json_encode(['error' => ['code' => 'NOT_FOUND', 'message' => 'not found']]), '', 404];
+};
+
+$feeOrder = create_order($kycUid, 'topup', 50000, null, ['topup' => 50000]);
+/* 50,000 Toman exceeds kyc_l0_daily (40,000): ZarinPal must be blocked by KYC,
+   whereas TetraPay must bypass KYC completely and not deduct from KYC quota. */
+Tg::$outbox = [];
+handle_callback([
+    'id' => 'cb-zarin-kyc',
+    'from' => ['id' => $kycUid],
+    'message' => ['message_id' => 91, 'chat' => ['id' => $kycUid, 'type' => 'private']],
+    'data' => 'inv:pay:' . (int) $feeOrder['id'] . ':zarinpal',
+]);
+$zarinBlockedText = json_encode(Tg::$outbox, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) ?: '';
+okpay(str_contains($zarinBlockedText, 'سقف مجاز واریز روزانه'),
+    'non-TetraPay Rial gateway (ZarinPal) is guarded by KYC daily deposit cap');
+
+Tg::$outbox = [];
+handle_callback([
+    'id' => 'cb-tetra-nokyc',
+    'from' => ['id' => $kycUid],
+    'message' => ['message_id' => 92, 'chat' => ['id' => $kycUid, 'type' => 'private']],
+    'data' => 'inv:pay:' . (int) $feeOrder['id'] . ':tetrapay',
+]);
+$feePayment = DB::one("SELECT * FROM payments WHERE order_id=? AND method='tetrapay'", [(int) $feeOrder['id']]);
+$feeMeta = $feePayment ? pay_meta($feePayment) : [];
+$feeStartPayload = (string) ($feeMeta['tetrapay_start'] ?? '');
+okpay($feePayment !== null && $feeStartPayload !== '',
+    'TetraPay bypasses KYC guard even when order amount exceeds KYC daily cap');
+
+handle_message([
+    'from' => ['id' => $kycUid, 'first_name' => 'کاربر', 'username' => 'tetrapay_kyc'],
+    'chat' => ['id' => $kycUid, 'type' => 'private'], 'message_id' => 93,
+    'text' => '/start ' . $feeStartPayload,
+]);
+$feePaid = pay_get((int) ($feePayment['id'] ?? 0));
+$kycAfterTetra = kyc_summary($kycUid);
+okpay(($feePaid['status'] ?? '') === 'paid' && balance_of($kycUid) === 66000,
+    'TetraPay verify with fee-inclusive received_amount (580,000 Rial for 500,000 Rial) credits 50,000 + 16,000 (32% cashback)');
+okpay(($kycAfterTetra['spent_day'] ?? -1) === 0 && ($kycAfterTetra['left_day'] ?? 0) === 40000,
+    'settled TetraPay payment does not deduct from user KYC daily or monthly deposit allowance');
+okpay(mirza_payment_button_label('tetrapay', PAY_GATEWAYS['tetrapay']) === '🔷 تتراپی (درگاه انلاین،بدون احراز)',
+    'TetraPay button label displays (درگاه انلاین،بدون احراز)');
+
+/* Settled payment on another Rial gateway (e.g. ZarinPal) MUST deduct from KYC quota. */
+$zarinSmallOrder = create_order($kycUid, 'topup', 15000, null, ['topup' => 15000]);
+$zarinSmallPay = pay_new($zarinSmallOrder, 'zarinpal', 15000);
+pay_prepare($zarinSmallPay, $zarinSmallOrder);
+pay_settle((int) $zarinSmallPay['id'], 'zarin-kyc-ref', ['code' => 100]);
+$kycAfterZarin = kyc_summary($kycUid);
+okpay(($kycAfterZarin['spent_day'] ?? 0) === 15000 && ($kycAfterZarin['left_day'] ?? 0) === 25000,
+    'settled non-TetraPay Rial gateway payment deducts from user KYC deposit allowance');
+
+/* SQLite PDO binds execute-array values as strings. COALESCE has no column
+   affinity, so its timestamp threshold must be explicitly cast to INTEGER. */
+okpay($kycAfterZarin['spent_month'] === 15000 && $kycAfterZarin['left_month'] === 85000,
+    'settled Rial payment consumes monthly KYC allowance too');
+okpay($kycAfterTetra['spent_month'] === 0,
+    'TetraPay consumes no monthly KYC allowance');
+foreach ([0, 7, 55, 100] as $percent) {
+    set_put('pay_tetrapay_cashback', (string) $percent);
+    $o = create_order($kycUid, 'topup', 10000, null, ['topup' => 10000]);
+    $p = pay_new($o, 'tetrapay', 10000);
+    $before = balance_of($kycUid);
+    $result = pay_settle((int) $p['id'], 'cashback-fixture-' . $percent);
+    pay_settle((int) $p['id']);
+    okpay(($result['ok'] ?? false) && balance_of($kycUid) === $before + 10000 + 100 * $percent,
+        'configured cashback ' . $percent . '% is respected and never paid twice');
+}
 
 unset($GLOBALS['panel_http_mock']);
 DB::close();

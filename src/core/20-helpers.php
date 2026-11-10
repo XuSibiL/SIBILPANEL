@@ -12,15 +12,11 @@ function now_ts(): int
 function g2j(int $gy, int $gm, int $gd): array
 {
     $gDaysInMonth = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    $jDaysInMonth = [31, 31, 31, 31, 31, 31, 30, 30, 30, 30, 30, 29];
     $gy2 = $gm > 2 ? $gy + 1 : $gy;
     $days = 355666 + (365 * $gy) + intdiv($gy2 + 3, 4) - intdiv($gy2 + 99, 100)
         + intdiv($gy2 + 399, 400) + $gd;
     for ($i = 0; $i < $gm - 1; $i++) {
         $days += $gDaysInMonth[$i];
-    }
-    if ($gm > 2 && (($gy % 4 === 0 && $gy % 100 !== 0) || $gy % 400 === 0)) {
-        $days++;
     }
     $jy = -1595 + (33 * intdiv($days, 12053));
     $days %= 12053;
@@ -30,12 +26,14 @@ function g2j(int $gy, int $gm, int $gd): array
         $jy += intdiv($days - 1, 365);
         $days = ($days - 1) % 365;
     }
-    $jm = 0;
-    for ($i = 0; $i < 12 && $days >= $jDaysInMonth[$i]; $i++) {
-        $days -= $jDaysInMonth[$i];
-        $jm = $i + 1;
+    if ($days < 186) {
+        $jm = 1 + intdiv($days, 31);
+        $jd = 1 + ($days % 31);
+    } else {
+        $jm = 7 + intdiv($days - 186, 30);
+        $jd = 1 + (($days - 186) % 30);
     }
-    return [$jy, $jm + 1, $days + 1];
+    return [$jy, $jm, $jd];
 }
 
 /** بخش‌های تاریخ/ساعت شمسی برای یک زمان یونیکس */

@@ -14,25 +14,25 @@ const PAY_GATEWAYS = [
     'card'          => ['label' => 'کارت به کارت', 'emoji' => '💳', 'type' => 'manual',
                         'hint' => 'کاربر رسید می‌فرستد و ادمین تأیید می‌کند.'],
     'zarinpal'      => ['label' => 'زرین‌پال', 'emoji' => '🟡', 'type' => 'online',
-                        'hint' => 'merchant_id از پنل زرین‌پال (۳۶ کاراکتری).'],
+                        'hint' => 'شناسهٔ پذیرنده (merchant_id سی‌وشش کاراکتری) از پنل زرین‌پال.'],
     'aqayepardakht' => ['label' => 'آقای پرداخت', 'emoji' => '🔵', 'type' => 'online',
-                        'hint' => 'pin درگاه از پنل aqayepardakht.ir.'],
+                        'hint' => 'کد پین (pin) درگاه از پنل aqayepardakht.ir.'],
     'iranpay1'      => ['label' => 'FloyPay', 'emoji' => '🟣', 'type' => 'online',
-                        'hint' => 'ApiKey از پنل FloyPay (tetra98.com).'],
+                        'hint' => 'کلید ارتباطی (ApiKey) از پنل FloyPay (tetra98.com).'],
     'iranpay2'      => ['label' => 'CubePay', 'emoji' => '🟢', 'type' => 'online',
                         'hint' => 'توکن Bearer از cubevps.ir (همان کلید، امضای کال‌بک را می‌سازد).'],
     'iranpay4'      => ['label' => 'AbanPay', 'emoji' => '🟠', 'type' => 'online',
-                        'hint' => 'API key + آدرس سرویس درگاه (https).'],
+                        'hint' => 'کلید ارتباطی (API key) به همراه آدرس سرویس درگاه (https).'],
     'tetrapay'      => ['label' => 'تتراپی', 'emoji' => '🔷', 'type' => 'online',
                         'hint' => 'فقط کلید API تتراپی؛ مبلغ‌ها خودکار از تومان به ریال تبدیل می‌شوند.'],
     'nowpayment'    => ['label' => 'NowPayments', 'emoji' => '₿', 'type' => 'crypto',
-                        'hint' => 'فقط x-api-key از nowpayments.io.'],
+                        'hint' => 'فقط کلید ارتباطی (x-api-key) از پنل nowpayments.io.'],
     'plisio'        => ['label' => 'Plisio', 'emoji' => '🪙', 'type' => 'crypto',
-                        'hint' => 'Secret key از Plisio (همان کلید، امضای کال‌بک را می‌سازد).'],
+                        'hint' => 'کلید مخفی (Secret key) از پنل Plisio (همان کلید، امضای کال‌بک را می‌سازد).'],
     'variza'        => ['label' => 'Variza', 'emoji' => '🏦', 'type' => 'online',
-                        'hint' => 'توکن API + secret وبهوک Variza.'],
+                        'hint' => 'توکن API به همراه کلید امضای وب‌هوک Variza.'],
     'trx'           => ['label' => 'TRX (Tron)', 'emoji' => '💎', 'type' => 'crypto',
-                        'hint' => 'توکن درگاه TRX + آدرس کیف پول.'],
+                        'hint' => 'توکن درگاه TRX به همراه آدرس کیف پول.'],
     'stars'         => ['label' => 'Telegram Stars', 'emoji' => '⭐️', 'type' => 'telegram',
                         'hint' => 'پرداخت با Stars؛ نیازی به کلید ندارد.'],
 ];
@@ -155,7 +155,7 @@ function gw_max(string $gw): int
 
 function gw_cashback(string $gw): int
 {
-    return max(0, min(50, set_int("pay_{$gw}_cashback", 0)));
+    return max(0, min(100, set_int("pay_{$gw}_cashback", 0)));
 }
 
 /** 0 means unlimited; a daily ceiling is calculated only from settled rows. */
@@ -497,13 +497,16 @@ function pay_apply_cashback_once(array $payment): int
         }
         $percent = gw_cashback((string) $fresh['method']);
         $reward = $percent > 0 ? intdiv((int) $fresh['amount'] * $percent, 100) : 0;
+        if ($reward <= 0) {
+            return 0;
+        }
         /* Marking and the wallet transaction share one BEGIN IMMEDIATE block,
            so a retry cannot grant the same cashback twice. */
         $meta['cashback_applied_at'] = now_ts();
         $meta['cashback_amount'] = $reward;
         $changed = DB::update('UPDATE payments SET payload=? WHERE id=? AND status=\'paid\'',
             [json_encode($meta, JSON_UNESCAPED_UNICODE), (int) $fresh['id']]);
-        if ($changed !== 1 || $reward <= 0) {
+        if ($changed !== 1) {
             return 0;
         }
         add_balance((int) $fresh['tg_id'], $reward, 'ref', (string) $fresh['id'],
@@ -559,6 +562,11 @@ function pay_settle(int $paymentId, string $ref = '', array $extra = [], bool $f
             $fresh = pay_get($paymentId);
             return ['state' => $fresh !== null && (string) $fresh['status'] === 'paid' ? 'already' : 'closed',
                 'payment' => $fresh ?? $payment, 'order' => $order];
+        }
+        if ($force && (string) $order['status'] === 'canceled') {
+            DB::update("UPDATE orders SET status='pending' WHERE id=? AND status='canceled'",
+                [(int) $order['id']]);
+            $order = order_get((int) $order['id']) ?? $order;
         }
         return ['state' => 'claimed', 'payment' => pay_get($paymentId) ?? $payment, 'order' => $order];
     });
@@ -1912,14 +1920,22 @@ function tetrapay_rial(int $toman): int
     return $toman > 0 && $toman <= intdiv(PHP_INT_MAX, 10) ? $toman * 10 : 0;
 }
 
+function tetrapay_amount_int(mixed $value): ?int
+{
+    if (is_int($value)) {
+        return $value;
+    }
+    $clean = str_replace([',', ' '], '', trim((string) $value));
+    if ($clean === '' || preg_match('/^\d+(?:\.0+)?$/', $clean) !== 1) {
+        return null;
+    }
+    return (int) explode('.', $clean, 2)[0];
+}
+
 function tetrapay_same_amount(mixed $actual, int $expectedRial): bool
 {
-    $actual = trim((string) $actual);
-    if ($expectedRial <= 0 || preg_match('/^\d+$/', $actual) !== 1) {
-        return false;
-    }
-    return ltrim($actual, '0') === (string) $expectedRial
-        || ($expectedRial === 0 && $actual === '0');
+    $parsed = tetrapay_amount_int($actual);
+    return $expectedRial > 0 && $parsed !== null && $parsed === $expectedRial;
 }
 
 function pay_tetrapay_create(array $payment, array $order): array
@@ -2010,13 +2026,13 @@ function pay_tetrapay_verify(array $payment, array $params = []): array
         log_payment('tetrapay verify mismatch', ['payment' => (int) $payment['id']]);
         return ['ok' => false, 'state' => 'failed', 'text' => 'مبلغ یا شمارهٔ سفارش تتراپی با فاکتور مطابقت ندارد.'];
     }
-    if (isset($data['received_amount']) && $data['received_amount'] !== null
-        && (string) $data['received_amount'] !== ''
-        && (!tetrapay_same_amount($data['received_amount'], $expectedRial))) {
+    $allowPartial = !empty($data['allow_partial']);
+    $receivedRial = tetrapay_amount_int($data['received_amount'] ?? null);
+    if ($allowPartial && $receivedRial !== null && $receivedRial > 0 && $receivedRial < $expectedRial) {
         return ['ok' => false, 'state' => 'failed', 'text' => 'پرداخت تتراپی ناقص است و شارژ نشد.'];
     }
-    return pay_accept($payment, (float) ((int) $expectedRial / 10),
-        (string) ($data['transaction_id'] ?? $data['reference'] ?? $token), $res);
+    return pay_settle((int) $payment['id'],
+        (string) ($data['transaction_id'] ?? $data['reference'] ?? $token), $res, true);
 }
 
 /**

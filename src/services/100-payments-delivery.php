@@ -316,7 +316,7 @@ function deliver_panel_order(array $order): array
     if ($isUnlimited) {
         $hourlyNote = $unlimitedHourly
             ? ('💵 نرخ هر کاربرِ آنلاین: <b>' . money($unlimitedUnit) . '</b> در ساعت. '
-                . 'فقط دقیقه‌های اتصال زنده از node پاسارگارد ثبت و هر ساعت یک‌جا از کیف پول کسر می‌شود.\n')
+                . "فقط دقیقه‌های اتصال زنده از node پاسارگارد ثبت و هر ساعت یک‌جا از کیف پول کسر می‌شود.\n")
             : '';
         return [true, "✅ <b>پنل نامحدود شما آماده است</b>\n\n" . $nameNote
             . '🌐 آدرس پنل: ' . e($dashboard) . "\n"

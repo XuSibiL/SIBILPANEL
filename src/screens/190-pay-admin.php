@@ -70,10 +70,10 @@ function screen_pay_group(int|string $chat, ?int $messageId, string $group): voi
         $flag = $id === 'wallet' ? '♾ همیشه روشن'
             : ($state['on'] && $state['ready'] ? '🟢 فعال'
             : ($state['on'] ? '🟡 روشن ولی ناقص' : '🔴 خاموش'));
-        $text .= $meta['emoji'] . ' <b>' . e($meta['label']) . '</b> — ' . $flag . "\n";
+        $text .= '• ' . $meta['emoji'] . ' <b>درگاه ' . e($meta['label']) . '</b> — ' . $flag . "\n";
         if ($id !== 'card' && $id !== 'wallet') {
-            $text .= '   ' . money(gw_min($id)) . ' تا ' . money(gw_max($id))
-                . ' · کش‌بک ' . fa_digits(gw_cashback($id)) . "٪\n";
+            $text .= '   حداقل: ' . fa_digits(money(gw_min($id))) . ' · حداکثر: ' . fa_digits(money(gw_max($id)))
+                . ' · کش‌بک: ' . fa_digits(gw_cashback($id)) . "٪\n";
         }
         $rows[] = [btn($meta['emoji'] . ' ' . $meta['label'],
             'ad:pay:' . $id, null, $state['on'] ? 'success' : 'danger')];
@@ -199,11 +199,12 @@ function screen_pay_gateway(int|string $chat, ?int $messageId, string $gw): void
             }
         }
         if ($gw === 'tetrapay') {
-            $text .= 'API رسمی تولید تتراپی به‌صورت خودکار استفاده می‌شود.\n';
+            $text .= "اتصال به وب‌سرویس رسمی تتراپی به‌صورت خودکار انجام می‌شود.\n";
         }
-        $text .= 'حداقل/حداکثر: ' . money(gw_min($gw)) . ' تا ' . money(gw_max($gw)) . "\n"
+        $text .= 'حداقل مبلغ: ' . fa_digits(money(gw_min($gw))) . "\n"
+            . 'حداکثر مبلغ: ' . fa_digits(money(gw_max($gw))) . "\n"
             . 'سقف روزانهٔ پرداخت‌شده: ' . (gw_daily_limit($gw) > 0
-                ? money(gw_daily_limit($gw)) : 'بدون سقف') . "\n"
+                ? fa_digits(money(gw_daily_limit($gw))) : 'بدون سقف') . "\n"
             . 'کش‌بک: ' . fa_digits(gw_cashback($gw)) . "٪\n";
         if (gw_help($gw) !== '') {
             $text .= 'راهنمای مشتری: ✅ ثبت شده' . "\n";
@@ -225,9 +226,10 @@ function screen_pay_gateway(int|string $chat, ?int $messageId, string $gw): void
     if ($gw === 'card') {
         $text .= 'شماره کارت: <code>' . e(set_get('card_number') !== '' ? set_get('card_number') : 'ثبت نشده') . "</code>\n"
             . 'صاحب کارت: ' . e(set_get('card_holder') !== '' ? set_get('card_holder') : 'ثبت نشده') . "\n"
-            . 'حداقل/حداکثر: ' . money(gw_min('card')) . ' تا ' . money(gw_max('card')) . "\n"
+            . 'حداقل مبلغ: ' . fa_digits(money(gw_min('card'))) . "\n"
+            . 'حداکثر مبلغ: ' . fa_digits(money(gw_max('card'))) . "\n"
             . 'سقف روزانهٔ پرداخت‌شده: ' . (gw_daily_limit('card') > 0
-                ? money(gw_daily_limit('card')) : 'بدون سقف') . "\n"
+                ? fa_digits(money(gw_daily_limit('card'))) : 'بدون سقف') . "\n"
             . 'کش‌بک: ' . fa_digits(gw_cashback('card')) . "٪\n"
             . 'تأیید خودکار رسید: ' . (set_bool('auto_confirm_receipt') ? '🟢 روشن' : '🔴 خاموش') . "\n\n"
             . 'کاربر رسید می‌فرستد و فقط پس از تأیید مسئول مالی، مبلغ شارژ می‌شود.' . "\n";

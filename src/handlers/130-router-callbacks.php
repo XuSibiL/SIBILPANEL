@@ -511,12 +511,10 @@ function handle_callback_inner(array $cb): void
                 }
                 return;
             }
+            if (gw_requires_kyc($gw) && kyc_guard_gateway($chatId, $messageId, $uid, $fresh)) {
+                return;
+            }
             if ($gw === 'card') {
-                /* سقف ریالی فقط همین‌جا و فقط برای کارت‌به‌کارت اعمال می‌شود؛
-                   کریپتو و استارز هیچ سقفی ندارند. */
-                if (kyc_guard_gateway($chatId, $messageId, $uid, $fresh)) {
-                    return;
-                }
                 screen_card_payment($chatId, $messageId, $uid, $order);
                 return;
             } else {

@@ -3834,18 +3834,15 @@ function j2g(int $jy, int $jm, int $jd): array
 /** منطقهٔ زمانی ایران (+03:30) */
 function kyc_iran_tz(): DateTimeZone
 {
-    return new DateTimeZone('Asia/Tehran');
+    return new DateTimeZone('+03:30');
 }
 
 /** آغاز روز (۰۰:۰۰) و آغاز ماه شمسی به وقت ایران */
 function kyc_day_start(?int $ts = null): int
 {
     $ts = $ts ?? now_ts();
-    [$jy, $jm, $jd] = jparts($ts);
-    [$gy, $gm, $gd] = j2g($jy, $jm, $jd);
-    $dt = new DateTimeImmutable(sprintf('%04d-%02d-%02d 00:00:00', $gy, $gm, $gd),
-        kyc_iran_tz());
-    return $dt->getTimestamp();
+    $shift = (int) IRAN_OFFSET;
+    return intdiv($ts + $shift, DAY) * DAY - $shift;
 }
 
 function kyc_month_start(?int $ts = null): int
@@ -3855,22 +3852,49 @@ function kyc_month_start(?int $ts = null): int
     [$gy, $gm, $gd] = j2g($jy, $jm, 1);
     $dt = new DateTimeImmutable(sprintf('%04d-%02d-%02d 00:00:00', $gy, $gm, $gd),
         kyc_iran_tz());
-    return $dt->getTimestamp();
+    return min(kyc_day_start($ts), $dt->getTimestamp());
+}
+
+/** درگاه‌های ریالی آنلاین که مشمول احراز هویت و سقف واریز ریالی هستند (تتراپی، کریپتو و استارز معاف‌اند). */
+const KYC_RIAL_PAYMENT_METHODS = [
+    'zarinpal',
+    'aqayepardakht',
+    'iranpay1',
+    'iranpay2',
+    'iranpay4',
+    'variza',
+];
+
+function gw_requires_kyc(string $gw): bool
+{
+    return $gw === 'card' || in_array($gw, KYC_RIAL_PAYMENT_METHODS, true);
 }
 
 /**
- * مصرف سقف: جمع رسیدهای کارت‌به‌کارتِ تأییدشده در بازه.
- * فقط خواندن از جدول موجود رسیدها — هیچ نوشتنی در هستهٔ پرداخت انجام نمی‌شود.
+ * مصرف سقف: جمع رسیدهای کارت‌به‌کارتِ تأییدشده + واریزی‌های موفق سایر درگاه‌های ریالی مشمول احراز
+ * (به‌جز تتراپی که بدون احراز و بدون محدودیت سقف واریز است).
  */
 function kyc_spent(int $uid, ?int $ts = null): array
 {
     $ts = $ts ?? now_ts();
-    $day = (int) DB::val("SELECT COALESCE(SUM(amount),0) FROM receipts "
-        . "WHERE tg_id=? AND status='approved' AND reviewed_at>=?", [$uid, kyc_day_start($ts)], 0);
-    $month = (int) DB::val("SELECT COALESCE(SUM(amount),0) FROM receipts "
+    $dayStart = kyc_day_start($ts);
+    $monthStart = kyc_month_start($ts);
+    $methodsSql = "'" . implode("','", KYC_RIAL_PAYMENT_METHODS) . "'";
+    $dayReceipts = (int) DB::val("SELECT COALESCE(SUM(amount),0) FROM receipts "
+        . "WHERE tg_id=? AND status='approved' AND reviewed_at>=?", [$uid, $dayStart], 0);
+    $monthReceipts = (int) DB::val("SELECT COALESCE(SUM(amount),0) FROM receipts "
         . "WHERE tg_id=? AND status='approved' AND reviewed_at>=?",
-        [$uid, kyc_month_start($ts)], 0);
-    return ['day' => $day, 'month' => $month];
+        [$uid, $monthStart], 0);
+    $dayGateways = (int) DB::val("SELECT COALESCE(SUM(amount),0) FROM payments "
+        . "WHERE tg_id=? AND status='paid' AND method IN ($methodsSql) "
+        . 'AND COALESCE(paid_at, created_at)>=CAST(? AS INTEGER)', [$uid, $dayStart], 0);
+    $monthGateways = (int) DB::val("SELECT COALESCE(SUM(amount),0) FROM payments "
+        . "WHERE tg_id=? AND status='paid' AND method IN ($methodsSql) "
+        . 'AND COALESCE(paid_at, created_at)>=CAST(? AS INTEGER)', [$uid, $monthStart], 0);
+    return [
+        'day'   => $dayReceipts + $dayGateways,
+        'month' => $monthReceipts + $monthGateways,
+    ];
 }
 
 function kyc_summary(int $uid, ?int $ts = null): array
@@ -3985,27 +4009,27 @@ function kyc_guard(int $uid, int $amount, int $orderId = 0): ?array
     $back = [btn('« بازگشت', 'home', null, 'danger')];
     $levelText = kyc_level_emoji($sum['level']) . ' ' . $sum['title'];
 
-    /* راهکارهای همیشگی: ارتقا، رمزارز، استارز. سقف فقط برای کارت‌به‌کارت است. */
+    /* راهکارهای همیشگی: ارتقا، تتراپی، رمزارز، استارز. سقف برای کارت‌به‌کارت و درگاه‌های ریالی مشمول احراز است. */
     $solutions = "💡 راهکارها برای ادامه واریز/خرید:\n\n"
         . '۱. ارتقای سطح احراز هویت از منوی حساب کاربری جهت افزایش سقف ریالی.' . "\n\n"
-        . '۲. استفاده از درگاه‌های رمزارزی (کریپتو) — بدون هیچ‌گونه محدودیت سقف و '
+        . '۲. استفاده از درگاه تتراپی (درگاه انلاین،بدون احراز) یا درگاه‌های رمزارزی (کریپتو) — بدون محدودیت سقف و '
         . 'بدون نیاز به احراز هویت.' . "\n\n"
         . '۳. پرداخت مستقیم با استارز تلگرام (Telegram Stars ⭐) — کاملاً بدون '
         . 'محدودیت سقف.';
-    /* دکمهٔ «بدون سقف» به همان لیست درگاه‌ها می‌رود تا کاربر کریپتو/استارز
-       را انتخاب کند؛ هیچ سقفی روی آن دو نیست. */
+    /* دکمهٔ «بدون سقف» به همان لیست درگاه‌ها می‌رود تا کاربر تتراپی/کریپتو/استارز
+       را انتخاب کند؛ هیچ سقفی روی آن‌ها نیست. */
     $noCapData = $orderId > 0 ? 'inv:gw:' . $orderId : 'home';
     $buttons = [
         [btn('⬆️ ارتقای سطح احراز هویت', 'kyc:up:'
             . min(KYC_MAX_LEVEL, $sum['level'] + 1), null, 'success')],
-        [btn('₿ / ⭐️ پرداخت بدون سقف (کریپتو و استارز)', $noCapData, null, 'primary')],
+        [btn('🔷 / ₿ / ⭐️ پرداخت بدون احراز (تتراپی، کریپتو و استارز)', $noCapData, null, 'primary')],
         [btn('🪪 وضعیت احراز هویت', 'kyc:home', null, 'primary')],
         $back,
     ];
 
     if ($amount > $sum['left_day']) {
         return ['text' => "⚠️ کاربر گرامی، مبلغ درخواستی بیشتر از سقف مجاز واریز "
-            . "روزانه شما با کارت‌به‌کارت است!\n\n"
+            . "روزانه ریالی شماست!\n\n"
             . "📊 وضعیت شما:\n\n"
             . '• سطح فعلی: ' . $levelText . "\n\n"
             . '• سقف مجاز روزانه: ' . money($sum['daily']) . "\n\n"
@@ -4016,7 +4040,7 @@ function kyc_guard(int $uid, int $amount, int $orderId = 0): ?array
 
     if ($amount > $sum['left_month']) {
         return ['text' => "⚠️ کاربر گرامی، مبلغ درخواستی بیشتر از سقف مجاز واریز "
-            . "ماهانه شما با کارت‌به‌کارت است!\n\n"
+            . "ماهانه ریالی شماست!\n\n"
             . "📊 وضعیت شما:\n\n"
             . '• سطح فعلی: ' . $levelText . "\n\n"
             . '• سقف مجاز ماهانه: ' . money($sum['monthly']) . "\n\n"
@@ -4027,7 +4051,7 @@ function kyc_guard(int $uid, int $amount, int $orderId = 0): ?array
     }
 
     if ($sum['level'] >= 1 && count(kyc_cards_verified($uid)) === 0) {
-        return ['text' => "⚠️ کاربر گرامی، برای واریز کارت‌به‌کارت باید حداقل یک "
+        return ['text' => "⚠️ کاربر گرامی، برای واریز ریالی مشمول احراز باید حداقل یک "
             . "کارت احرازشده داشته باشید.\n\n"
             . "📊 وضعیت شما:\n\n"
             . '• سطح فعلی: ' . $levelText . "\n\n"
@@ -4035,7 +4059,7 @@ function kyc_guard(int $uid, int $amount, int $orderId = 0): ?array
             . "حساب شما در این سطح فقط از کارت‌های احرازشده واریز می‌گیرد.\n\n"
             . $solutions, 'kb' => [
                 [btn('💳 کارت‌های من', 'kyc:cards', null, 'success')],
-                [btn('₿ / ⭐️ پرداخت بدون سقف (کریپتو و استارز)', $noCapData,
+                [btn('🔷 / ₿ / ⭐️ پرداخت بدون احراز (تتراپی، کریپتو و استارز)', $noCapData,
                     null, 'primary')],
                 $back,
             ]];
@@ -4112,12 +4136,12 @@ function screen_kyc(int|string $chat, ?int $messageId, int $uid): void
     $text = '🪪 <b>سطح احراز هویت</b>' . "\n"
         . SEP . "\n\n"
         . 'سطح فعلی: <b>' . kyc_level_emoji($level) . ' ' . $sum['title'] . "</b>\n\n"
-        . '<b>سقف واریز کارت‌به‌کارت</b>' . "\n"
+        . '<b>سقف واریز ریالی (کارت‌به‌کارت و درگاه‌های ریالی)</b>' . "\n"
         . '• روزانه: ' . money($sum['daily']) . ' — باقی‌مانده <b>'
         . money($sum['left_day']) . "</b>\n"
         . '• ماهانه: ' . money($sum['monthly']) . ' — باقی‌مانده <b>'
         . money($sum['left_month']) . "</b>\n\n"
-        . '<i>این سقف‌ها فقط برای کارت‌به‌کارت است؛ رمزارز و استارز سقف ندارند.</i>'
+        . '<i>این سقف‌ها برای کارت‌به‌کارت و درگاه‌های ریالی است؛ تتراپی (درگاه انلاین،بدون احراز)، رمزارز و استارز بدون احراز و بدون سقف واریز هستند.</i>'
         . "\n" . SEP . "\n"
         . '💳 کارت‌های ثبت‌شده: ' . count($cards) . ' · احرازشده: ' . $verified;
 

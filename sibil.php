@@ -21,7 +21,7 @@
 
 declare(strict_types=1);
 
-const PANEL_VERSION = '3.18.7';
+const PANEL_VERSION = '3.18.8';
 const IRAN_OFFSET   = 3.5 * 3600;
 const DAY           = 86400;
 
@@ -338,15 +338,11 @@ function now_ts(): int
 function g2j(int $gy, int $gm, int $gd): array
 {
     $gDaysInMonth = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    $jDaysInMonth = [31, 31, 31, 31, 31, 31, 30, 30, 30, 30, 30, 29];
     $gy2 = $gm > 2 ? $gy + 1 : $gy;
     $days = 355666 + (365 * $gy) + intdiv($gy2 + 3, 4) - intdiv($gy2 + 99, 100)
         + intdiv($gy2 + 399, 400) + $gd;
     for ($i = 0; $i < $gm - 1; $i++) {
         $days += $gDaysInMonth[$i];
-    }
-    if ($gm > 2 && (($gy % 4 === 0 && $gy % 100 !== 0) || $gy % 400 === 0)) {
-        $days++;
     }
     $jy = -1595 + (33 * intdiv($days, 12053));
     $days %= 12053;
@@ -356,12 +352,14 @@ function g2j(int $gy, int $gm, int $gd): array
         $jy += intdiv($days - 1, 365);
         $days = ($days - 1) % 365;
     }
-    $jm = 0;
-    for ($i = 0; $i < 12 && $days >= $jDaysInMonth[$i]; $i++) {
-        $days -= $jDaysInMonth[$i];
-        $jm = $i + 1;
+    if ($days < 186) {
+        $jm = 1 + intdiv($days, 31);
+        $jd = 1 + ($days % 31);
+    } else {
+        $jm = 7 + intdiv($days - 186, 30);
+        $jd = 1 + (($days - 186) % 30);
     }
-    return [$jy, $jm + 1, $days + 1];
+    return [$jy, $jm, $jd];
 }
 
 /** بخش‌های تاریخ/ساعت شمسی برای یک زمان یونیکس */
@@ -4753,10 +4751,10 @@ function mirza_payment_button_label(string $gateway, array $meta = []): string
         'plisio'        => '💰 پرداخت کریپتو با Plisio',
         'nowpayment'    => '💰 پرداخت کریپتو با NowPayments',
         'trx'           => '💵 پرداخت مستقیم ترون (TRX)',
-        'iranpay1'      => '💸 درگاه  پرداخت ریالی',
+        'iranpay1'      => '💸 درگاه پرداخت ریالی',
         'iranpay2'      => '💸 CubePay',
         'iranpay4'      => '💳 آبان گیت وی (کارت به کارت)',
-        'tetrapay'      => '🔷 تتراپی',
+        'tetrapay'      => '🔷 تتراپی (درگاه انلاین،بدون احراز)',
         'aqayepardakht' => '🔵 درگاه آقای پرداخت',
         'zarinpal'      => '🟡 زرین پال',
         'variza'        => '💳 واریزا (کارت‌به‌کارت خودکار)',
@@ -11378,18 +11376,15 @@ function j2g(int $jy, int $jm, int $jd): array
 /** منطقهٔ زمانی ایران (+03:30) */
 function kyc_iran_tz(): DateTimeZone
 {
-    return new DateTimeZone('Asia/Tehran');
+    return new DateTimeZone('+03:30');
 }
 
 /** آغاز روز (۰۰:۰۰) و آغاز ماه شمسی به وقت ایران */
 function kyc_day_start(?int $ts = null): int
 {
     $ts = $ts ?? now_ts();
-    [$jy, $jm, $jd] = jparts($ts);
-    [$gy, $gm, $gd] = j2g($jy, $jm, $jd);
-    $dt = new DateTimeImmutable(sprintf('%04d-%02d-%02d 00:00:00', $gy, $gm, $gd),
-        kyc_iran_tz());
-    return $dt->getTimestamp();
+    $shift = (int) IRAN_OFFSET;
+    return intdiv($ts + $shift, DAY) * DAY - $shift;
 }
 
 function kyc_month_start(?int $ts = null): int
@@ -11399,22 +11394,49 @@ function kyc_month_start(?int $ts = null): int
     [$gy, $gm, $gd] = j2g($jy, $jm, 1);
     $dt = new DateTimeImmutable(sprintf('%04d-%02d-%02d 00:00:00', $gy, $gm, $gd),
         kyc_iran_tz());
-    return $dt->getTimestamp();
+    return min(kyc_day_start($ts), $dt->getTimestamp());
+}
+
+/** درگاه‌های ریالی آنلاین که مشمول احراز هویت و سقف واریز ریالی هستند (تتراپی، کریپتو و استارز معاف‌اند). */
+const KYC_RIAL_PAYMENT_METHODS = [
+    'zarinpal',
+    'aqayepardakht',
+    'iranpay1',
+    'iranpay2',
+    'iranpay4',
+    'variza',
+];
+
+function gw_requires_kyc(string $gw): bool
+{
+    return $gw === 'card' || in_array($gw, KYC_RIAL_PAYMENT_METHODS, true);
 }
 
 /**
- * مصرف سقف: جمع رسیدهای کارت‌به‌کارتِ تأییدشده در بازه.
- * فقط خواندن از جدول موجود رسیدها — هیچ نوشتنی در هستهٔ پرداخت انجام نمی‌شود.
+ * مصرف سقف: جمع رسیدهای کارت‌به‌کارتِ تأییدشده + واریزی‌های موفق سایر درگاه‌های ریالی مشمول احراز
+ * (به‌جز تتراپی که بدون احراز و بدون محدودیت سقف واریز است).
  */
 function kyc_spent(int $uid, ?int $ts = null): array
 {
     $ts = $ts ?? now_ts();
-    $day = (int) DB::val("SELECT COALESCE(SUM(amount),0) FROM receipts "
-        . "WHERE tg_id=? AND status='approved' AND reviewed_at>=?", [$uid, kyc_day_start($ts)], 0);
-    $month = (int) DB::val("SELECT COALESCE(SUM(amount),0) FROM receipts "
+    $dayStart = kyc_day_start($ts);
+    $monthStart = kyc_month_start($ts);
+    $methodsSql = "'" . implode("','", KYC_RIAL_PAYMENT_METHODS) . "'";
+    $dayReceipts = (int) DB::val("SELECT COALESCE(SUM(amount),0) FROM receipts "
+        . "WHERE tg_id=? AND status='approved' AND reviewed_at>=?", [$uid, $dayStart], 0);
+    $monthReceipts = (int) DB::val("SELECT COALESCE(SUM(amount),0) FROM receipts "
         . "WHERE tg_id=? AND status='approved' AND reviewed_at>=?",
-        [$uid, kyc_month_start($ts)], 0);
-    return ['day' => $day, 'month' => $month];
+        [$uid, $monthStart], 0);
+    $dayGateways = (int) DB::val("SELECT COALESCE(SUM(amount),0) FROM payments "
+        . "WHERE tg_id=? AND status='paid' AND method IN ($methodsSql) "
+        . 'AND COALESCE(paid_at, created_at)>=CAST(? AS INTEGER)', [$uid, $dayStart], 0);
+    $monthGateways = (int) DB::val("SELECT COALESCE(SUM(amount),0) FROM payments "
+        . "WHERE tg_id=? AND status='paid' AND method IN ($methodsSql) "
+        . 'AND COALESCE(paid_at, created_at)>=CAST(? AS INTEGER)', [$uid, $monthStart], 0);
+    return [
+        'day'   => $dayReceipts + $dayGateways,
+        'month' => $monthReceipts + $monthGateways,
+    ];
 }
 
 function kyc_summary(int $uid, ?int $ts = null): array
@@ -11529,27 +11551,27 @@ function kyc_guard(int $uid, int $amount, int $orderId = 0): ?array
     $back = [btn('« بازگشت', 'home', null, 'danger')];
     $levelText = kyc_level_emoji($sum['level']) . ' ' . $sum['title'];
 
-    /* راهکارهای همیشگی: ارتقا، رمزارز، استارز. سقف فقط برای کارت‌به‌کارت است. */
+    /* راهکارهای همیشگی: ارتقا، تتراپی، رمزارز، استارز. سقف برای کارت‌به‌کارت و درگاه‌های ریالی مشمول احراز است. */
     $solutions = "💡 راهکارها برای ادامه واریز/خرید:\n\n"
         . '۱. ارتقای سطح احراز هویت از منوی حساب کاربری جهت افزایش سقف ریالی.' . "\n\n"
-        . '۲. استفاده از درگاه‌های رمزارزی (کریپتو) — بدون هیچ‌گونه محدودیت سقف و '
+        . '۲. استفاده از درگاه تتراپی (درگاه انلاین،بدون احراز) یا درگاه‌های رمزارزی (کریپتو) — بدون محدودیت سقف و '
         . 'بدون نیاز به احراز هویت.' . "\n\n"
         . '۳. پرداخت مستقیم با استارز تلگرام (Telegram Stars ⭐) — کاملاً بدون '
         . 'محدودیت سقف.';
-    /* دکمهٔ «بدون سقف» به همان لیست درگاه‌ها می‌رود تا کاربر کریپتو/استارز
-       را انتخاب کند؛ هیچ سقفی روی آن دو نیست. */
+    /* دکمهٔ «بدون سقف» به همان لیست درگاه‌ها می‌رود تا کاربر تتراپی/کریپتو/استارز
+       را انتخاب کند؛ هیچ سقفی روی آن‌ها نیست. */
     $noCapData = $orderId > 0 ? 'inv:gw:' . $orderId : 'home';
     $buttons = [
         [btn('⬆️ ارتقای سطح احراز هویت', 'kyc:up:'
             . min(KYC_MAX_LEVEL, $sum['level'] + 1), null, 'success')],
-        [btn('₿ / ⭐️ پرداخت بدون سقف (کریپتو و استارز)', $noCapData, null, 'primary')],
+        [btn('🔷 / ₿ / ⭐️ پرداخت بدون احراز (تتراپی، کریپتو و استارز)', $noCapData, null, 'primary')],
         [btn('🪪 وضعیت احراز هویت', 'kyc:home', null, 'primary')],
         $back,
     ];
 
     if ($amount > $sum['left_day']) {
         return ['text' => "⚠️ کاربر گرامی، مبلغ درخواستی بیشتر از سقف مجاز واریز "
-            . "روزانه شما با کارت‌به‌کارت است!\n\n"
+            . "روزانه ریالی شماست!\n\n"
             . "📊 وضعیت شما:\n\n"
             . '• سطح فعلی: ' . $levelText . "\n\n"
             . '• سقف مجاز روزانه: ' . money($sum['daily']) . "\n\n"
@@ -11560,7 +11582,7 @@ function kyc_guard(int $uid, int $amount, int $orderId = 0): ?array
 
     if ($amount > $sum['left_month']) {
         return ['text' => "⚠️ کاربر گرامی، مبلغ درخواستی بیشتر از سقف مجاز واریز "
-            . "ماهانه شما با کارت‌به‌کارت است!\n\n"
+            . "ماهانه ریالی شماست!\n\n"
             . "📊 وضعیت شما:\n\n"
             . '• سطح فعلی: ' . $levelText . "\n\n"
             . '• سقف مجاز ماهانه: ' . money($sum['monthly']) . "\n\n"
@@ -11571,7 +11593,7 @@ function kyc_guard(int $uid, int $amount, int $orderId = 0): ?array
     }
 
     if ($sum['level'] >= 1 && count(kyc_cards_verified($uid)) === 0) {
-        return ['text' => "⚠️ کاربر گرامی، برای واریز کارت‌به‌کارت باید حداقل یک "
+        return ['text' => "⚠️ کاربر گرامی، برای واریز ریالی مشمول احراز باید حداقل یک "
             . "کارت احرازشده داشته باشید.\n\n"
             . "📊 وضعیت شما:\n\n"
             . '• سطح فعلی: ' . $levelText . "\n\n"
@@ -11579,7 +11601,7 @@ function kyc_guard(int $uid, int $amount, int $orderId = 0): ?array
             . "حساب شما در این سطح فقط از کارت‌های احرازشده واریز می‌گیرد.\n\n"
             . $solutions, 'kb' => [
                 [btn('💳 کارت‌های من', 'kyc:cards', null, 'success')],
-                [btn('₿ / ⭐️ پرداخت بدون سقف (کریپتو و استارز)', $noCapData,
+                [btn('🔷 / ₿ / ⭐️ پرداخت بدون احراز (تتراپی، کریپتو و استارز)', $noCapData,
                     null, 'primary')],
                 $back,
             ]];
@@ -11656,12 +11678,12 @@ function screen_kyc(int|string $chat, ?int $messageId, int $uid): void
     $text = '🪪 <b>سطح احراز هویت</b>' . "\n"
         . SEP . "\n\n"
         . 'سطح فعلی: <b>' . kyc_level_emoji($level) . ' ' . $sum['title'] . "</b>\n\n"
-        . '<b>سقف واریز کارت‌به‌کارت</b>' . "\n"
+        . '<b>سقف واریز ریالی (کارت‌به‌کارت و درگاه‌های ریالی)</b>' . "\n"
         . '• روزانه: ' . money($sum['daily']) . ' — باقی‌مانده <b>'
         . money($sum['left_day']) . "</b>\n"
         . '• ماهانه: ' . money($sum['monthly']) . ' — باقی‌مانده <b>'
         . money($sum['left_month']) . "</b>\n\n"
-        . '<i>این سقف‌ها فقط برای کارت‌به‌کارت است؛ رمزارز و استارز سقف ندارند.</i>'
+        . '<i>این سقف‌ها برای کارت‌به‌کارت و درگاه‌های ریالی است؛ تتراپی (درگاه انلاین،بدون احراز)، رمزارز و استارز بدون احراز و بدون سقف واریز هستند.</i>'
         . "\n" . SEP . "\n"
         . '💳 کارت‌های ثبت‌شده: ' . count($cards) . ' · احرازشده: ' . $verified;
 
@@ -13761,7 +13783,7 @@ function deliver_panel_order(array $order): array
     if ($isUnlimited) {
         $hourlyNote = $unlimitedHourly
             ? ('💵 نرخ هر کاربرِ آنلاین: <b>' . money($unlimitedUnit) . '</b> در ساعت. '
-                . 'فقط دقیقه‌های اتصال زنده از node پاسارگارد ثبت و هر ساعت یک‌جا از کیف پول کسر می‌شود.\n')
+                . "فقط دقیقه‌های اتصال زنده از node پاسارگارد ثبت و هر ساعت یک‌جا از کیف پول کسر می‌شود.\n")
             : '';
         return [true, "✅ <b>پنل نامحدود شما آماده است</b>\n\n" . $nameNote
             . '🌐 آدرس پنل: ' . e($dashboard) . "\n"
@@ -14825,7 +14847,7 @@ function wiz_finish(int $uid, array $data): void
                 . '📱 دستگاه هر کاربر: <b>' . fa_digits($deviceLimit) . "</b>\n"
                 . '👥 حداقل تعداد کاربر: <b>' . fa_digits($minUsers) . "</b>\n"
                 . '💰 حداقل موجودی برای خرید: <b>' . money($minBalance) . "</b>\n\n"
-                . 'پرداخت مصرفی است؛ فقط دقیقه‌های اتصال زنده ثبت می‌شود و صورتحساب هر ساعت یک‌جا از کیف پول کم می‌شود.\n'
+                . "پرداخت مصرفی است؛ فقط دقیقه‌های اتصال زنده ثبت می‌شود و صورتحساب هر ساعت یک‌جا از کیف پول کم می‌شود.\n"
                 . UNLIMITED_ROLE_GUIDE;
             Tg::send($uid, $text, [
                 [btn('👁 پیش‌نمایش محصول', 'ad:prod:' . $productId)],
@@ -15865,12 +15887,10 @@ function handle_callback_inner(array $cb): void
                 }
                 return;
             }
+            if (gw_requires_kyc($gw) && kyc_guard_gateway($chatId, $messageId, $uid, $fresh)) {
+                return;
+            }
             if ($gw === 'card') {
-                /* سقف ریالی فقط همین‌جا و فقط برای کارت‌به‌کارت اعمال می‌شود؛
-                   کریپتو و استارز هیچ سقفی ندارند. */
-                if (kyc_guard_gateway($chatId, $messageId, $uid, $fresh)) {
-                    return;
-                }
                 screen_card_payment($chatId, $messageId, $uid, $order);
                 return;
             } else {
@@ -20416,25 +20436,25 @@ const PAY_GATEWAYS = [
     'card'          => ['label' => 'کارت به کارت', 'emoji' => '💳', 'type' => 'manual',
                         'hint' => 'کاربر رسید می‌فرستد و ادمین تأیید می‌کند.'],
     'zarinpal'      => ['label' => 'زرین‌پال', 'emoji' => '🟡', 'type' => 'online',
-                        'hint' => 'merchant_id از پنل زرین‌پال (۳۶ کاراکتری).'],
+                        'hint' => 'شناسهٔ پذیرنده (merchant_id سی‌وشش کاراکتری) از پنل زرین‌پال.'],
     'aqayepardakht' => ['label' => 'آقای پرداخت', 'emoji' => '🔵', 'type' => 'online',
-                        'hint' => 'pin درگاه از پنل aqayepardakht.ir.'],
+                        'hint' => 'کد پین (pin) درگاه از پنل aqayepardakht.ir.'],
     'iranpay1'      => ['label' => 'FloyPay', 'emoji' => '🟣', 'type' => 'online',
-                        'hint' => 'ApiKey از پنل FloyPay (tetra98.com).'],
+                        'hint' => 'کلید ارتباطی (ApiKey) از پنل FloyPay (tetra98.com).'],
     'iranpay2'      => ['label' => 'CubePay', 'emoji' => '🟢', 'type' => 'online',
                         'hint' => 'توکن Bearer از cubevps.ir (همان کلید، امضای کال‌بک را می‌سازد).'],
     'iranpay4'      => ['label' => 'AbanPay', 'emoji' => '🟠', 'type' => 'online',
-                        'hint' => 'API key + آدرس سرویس درگاه (https).'],
+                        'hint' => 'کلید ارتباطی (API key) به همراه آدرس سرویس درگاه (https).'],
     'tetrapay'      => ['label' => 'تتراپی', 'emoji' => '🔷', 'type' => 'online',
                         'hint' => 'فقط کلید API تتراپی؛ مبلغ‌ها خودکار از تومان به ریال تبدیل می‌شوند.'],
     'nowpayment'    => ['label' => 'NowPayments', 'emoji' => '₿', 'type' => 'crypto',
-                        'hint' => 'فقط x-api-key از nowpayments.io.'],
+                        'hint' => 'فقط کلید ارتباطی (x-api-key) از پنل nowpayments.io.'],
     'plisio'        => ['label' => 'Plisio', 'emoji' => '🪙', 'type' => 'crypto',
-                        'hint' => 'Secret key از Plisio (همان کلید، امضای کال‌بک را می‌سازد).'],
+                        'hint' => 'کلید مخفی (Secret key) از پنل Plisio (همان کلید، امضای کال‌بک را می‌سازد).'],
     'variza'        => ['label' => 'Variza', 'emoji' => '🏦', 'type' => 'online',
-                        'hint' => 'توکن API + secret وبهوک Variza.'],
+                        'hint' => 'توکن API به همراه کلید امضای وب‌هوک Variza.'],
     'trx'           => ['label' => 'TRX (Tron)', 'emoji' => '💎', 'type' => 'crypto',
-                        'hint' => 'توکن درگاه TRX + آدرس کیف پول.'],
+                        'hint' => 'توکن درگاه TRX به همراه آدرس کیف پول.'],
     'stars'         => ['label' => 'Telegram Stars', 'emoji' => '⭐️', 'type' => 'telegram',
                         'hint' => 'پرداخت با Stars؛ نیازی به کلید ندارد.'],
 ];
@@ -20557,7 +20577,7 @@ function gw_max(string $gw): int
 
 function gw_cashback(string $gw): int
 {
-    return max(0, min(50, set_int("pay_{$gw}_cashback", 0)));
+    return max(0, min(100, set_int("pay_{$gw}_cashback", 0)));
 }
 
 /** 0 means unlimited; a daily ceiling is calculated only from settled rows. */
@@ -20899,13 +20919,16 @@ function pay_apply_cashback_once(array $payment): int
         }
         $percent = gw_cashback((string) $fresh['method']);
         $reward = $percent > 0 ? intdiv((int) $fresh['amount'] * $percent, 100) : 0;
+        if ($reward <= 0) {
+            return 0;
+        }
         /* Marking and the wallet transaction share one BEGIN IMMEDIATE block,
            so a retry cannot grant the same cashback twice. */
         $meta['cashback_applied_at'] = now_ts();
         $meta['cashback_amount'] = $reward;
         $changed = DB::update('UPDATE payments SET payload=? WHERE id=? AND status=\'paid\'',
             [json_encode($meta, JSON_UNESCAPED_UNICODE), (int) $fresh['id']]);
-        if ($changed !== 1 || $reward <= 0) {
+        if ($changed !== 1) {
             return 0;
         }
         add_balance((int) $fresh['tg_id'], $reward, 'ref', (string) $fresh['id'],
@@ -20961,6 +20984,11 @@ function pay_settle(int $paymentId, string $ref = '', array $extra = [], bool $f
             $fresh = pay_get($paymentId);
             return ['state' => $fresh !== null && (string) $fresh['status'] === 'paid' ? 'already' : 'closed',
                 'payment' => $fresh ?? $payment, 'order' => $order];
+        }
+        if ($force && (string) $order['status'] === 'canceled') {
+            DB::update("UPDATE orders SET status='pending' WHERE id=? AND status='canceled'",
+                [(int) $order['id']]);
+            $order = order_get((int) $order['id']) ?? $order;
         }
         return ['state' => 'claimed', 'payment' => pay_get($paymentId) ?? $payment, 'order' => $order];
     });
@@ -22314,14 +22342,22 @@ function tetrapay_rial(int $toman): int
     return $toman > 0 && $toman <= intdiv(PHP_INT_MAX, 10) ? $toman * 10 : 0;
 }
 
+function tetrapay_amount_int(mixed $value): ?int
+{
+    if (is_int($value)) {
+        return $value;
+    }
+    $clean = str_replace([',', ' '], '', trim((string) $value));
+    if ($clean === '' || preg_match('/^\d+(?:\.0+)?$/', $clean) !== 1) {
+        return null;
+    }
+    return (int) explode('.', $clean, 2)[0];
+}
+
 function tetrapay_same_amount(mixed $actual, int $expectedRial): bool
 {
-    $actual = trim((string) $actual);
-    if ($expectedRial <= 0 || preg_match('/^\d+$/', $actual) !== 1) {
-        return false;
-    }
-    return ltrim($actual, '0') === (string) $expectedRial
-        || ($expectedRial === 0 && $actual === '0');
+    $parsed = tetrapay_amount_int($actual);
+    return $expectedRial > 0 && $parsed !== null && $parsed === $expectedRial;
 }
 
 function pay_tetrapay_create(array $payment, array $order): array
@@ -22412,13 +22448,13 @@ function pay_tetrapay_verify(array $payment, array $params = []): array
         log_payment('tetrapay verify mismatch', ['payment' => (int) $payment['id']]);
         return ['ok' => false, 'state' => 'failed', 'text' => 'مبلغ یا شمارهٔ سفارش تتراپی با فاکتور مطابقت ندارد.'];
     }
-    if (isset($data['received_amount']) && $data['received_amount'] !== null
-        && (string) $data['received_amount'] !== ''
-        && (!tetrapay_same_amount($data['received_amount'], $expectedRial))) {
+    $allowPartial = !empty($data['allow_partial']);
+    $receivedRial = tetrapay_amount_int($data['received_amount'] ?? null);
+    if ($allowPartial && $receivedRial !== null && $receivedRial > 0 && $receivedRial < $expectedRial) {
         return ['ok' => false, 'state' => 'failed', 'text' => 'پرداخت تتراپی ناقص است و شارژ نشد.'];
     }
-    return pay_accept($payment, (float) ((int) $expectedRial / 10),
-        (string) ($data['transaction_id'] ?? $data['reference'] ?? $token), $res);
+    return pay_settle((int) $payment['id'],
+        (string) ($data['transaction_id'] ?? $data['reference'] ?? $token), $res, true);
 }
 
 /**
@@ -23688,10 +23724,10 @@ function screen_pay_group(int|string $chat, ?int $messageId, string $group): voi
         $flag = $id === 'wallet' ? '♾ همیشه روشن'
             : ($state['on'] && $state['ready'] ? '🟢 فعال'
             : ($state['on'] ? '🟡 روشن ولی ناقص' : '🔴 خاموش'));
-        $text .= $meta['emoji'] . ' <b>' . e($meta['label']) . '</b> — ' . $flag . "\n";
+        $text .= '• ' . $meta['emoji'] . ' <b>درگاه ' . e($meta['label']) . '</b> — ' . $flag . "\n";
         if ($id !== 'card' && $id !== 'wallet') {
-            $text .= '   ' . money(gw_min($id)) . ' تا ' . money(gw_max($id))
-                . ' · کش‌بک ' . fa_digits(gw_cashback($id)) . "٪\n";
+            $text .= '   حداقل: ' . fa_digits(money(gw_min($id))) . ' · حداکثر: ' . fa_digits(money(gw_max($id)))
+                . ' · کش‌بک: ' . fa_digits(gw_cashback($id)) . "٪\n";
         }
         $rows[] = [btn($meta['emoji'] . ' ' . $meta['label'],
             'ad:pay:' . $id, null, $state['on'] ? 'success' : 'danger')];
@@ -23817,11 +23853,12 @@ function screen_pay_gateway(int|string $chat, ?int $messageId, string $gw): void
             }
         }
         if ($gw === 'tetrapay') {
-            $text .= 'API رسمی تولید تتراپی به‌صورت خودکار استفاده می‌شود.\n';
+            $text .= "اتصال به وب‌سرویس رسمی تتراپی به‌صورت خودکار انجام می‌شود.\n";
         }
-        $text .= 'حداقل/حداکثر: ' . money(gw_min($gw)) . ' تا ' . money(gw_max($gw)) . "\n"
+        $text .= 'حداقل مبلغ: ' . fa_digits(money(gw_min($gw))) . "\n"
+            . 'حداکثر مبلغ: ' . fa_digits(money(gw_max($gw))) . "\n"
             . 'سقف روزانهٔ پرداخت‌شده: ' . (gw_daily_limit($gw) > 0
-                ? money(gw_daily_limit($gw)) : 'بدون سقف') . "\n"
+                ? fa_digits(money(gw_daily_limit($gw))) : 'بدون سقف') . "\n"
             . 'کش‌بک: ' . fa_digits(gw_cashback($gw)) . "٪\n";
         if (gw_help($gw) !== '') {
             $text .= 'راهنمای مشتری: ✅ ثبت شده' . "\n";
@@ -23843,9 +23880,10 @@ function screen_pay_gateway(int|string $chat, ?int $messageId, string $gw): void
     if ($gw === 'card') {
         $text .= 'شماره کارت: <code>' . e(set_get('card_number') !== '' ? set_get('card_number') : 'ثبت نشده') . "</code>\n"
             . 'صاحب کارت: ' . e(set_get('card_holder') !== '' ? set_get('card_holder') : 'ثبت نشده') . "\n"
-            . 'حداقل/حداکثر: ' . money(gw_min('card')) . ' تا ' . money(gw_max('card')) . "\n"
+            . 'حداقل مبلغ: ' . fa_digits(money(gw_min('card'))) . "\n"
+            . 'حداکثر مبلغ: ' . fa_digits(money(gw_max('card'))) . "\n"
             . 'سقف روزانهٔ پرداخت‌شده: ' . (gw_daily_limit('card') > 0
-                ? money(gw_daily_limit('card')) : 'بدون سقف') . "\n"
+                ? fa_digits(money(gw_daily_limit('card'))) : 'بدون سقف') . "\n"
             . 'کش‌بک: ' . fa_digits(gw_cashback('card')) . "٪\n"
             . 'تأیید خودکار رسید: ' . (set_bool('auto_confirm_receipt') ? '🟢 روشن' : '🔴 خاموش') . "\n\n"
             . 'کاربر رسید می‌فرستد و فقط پس از تأیید مسئول مالی، مبلغ شارژ می‌شود.' . "\n";
@@ -25000,7 +25038,7 @@ const SETTING_GROUPS = [
     'kyc' => [
         'title' => '🪪 احراز هویت',
         'items' => [
-            'kyc_on'         => ['احراز هویت اجباری برای کارت‌به‌کارت', 'bool', 0],
+            'kyc_on'         => ['احراز هویت اجباری برای درگاه‌های ریالی (به‌جز تتراپی)', 'bool', 0],
             'kyc_l0_daily'   => ['سقف روزانه بدون احراز (تومان)', 'int', 0],
             'kyc_l0_monthly' => ['سقف ماهانه بدون احراز (تومان)', 'int', 0],
             'kyc_l1_daily'   => ['سقف روزانه سطح ۱ (تومان)', 'int', 0],
