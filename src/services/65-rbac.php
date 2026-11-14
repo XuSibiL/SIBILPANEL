@@ -301,7 +301,7 @@ function admin_pg_callback_capability(array $parts): string
     /* فقط مشاهده، تست، دستگاه، همگام‌سازی و نقش‌های سرور برای اپراتور است.
        هر تغییری که اتصال/ساختار سرور را عوض کند، در سطح کامل باقی می‌ماند. */
     if (in_array($id, ['new', 'newapi', 'savekey', 'newpass', 'quick'], true)
-        || in_array($op, ['key', 'edit', 'del', 'del2', 'default', 'toggle', 'cat', 'setcat'], true)) {
+        || in_array($op, ['key', 'edit', 'loginpath', 'del', 'del2', 'default', 'toggle', 'cat', 'setcat'], true)) {
         return 'full';
     }
     if ($id === 'testall' || ctype_digit($id)) {

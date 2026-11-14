@@ -173,7 +173,8 @@ final class Tg
             return null;
         }
         $url = "https://api.telegram.org/bot{$token}/{$method}";
-        [$body, $error] = http_post_json($url, $params);
+        /* Telegram gives pre-checkout only ten seconds. Never use the generic 60s budget. */
+        [$body, $error] = http_post_json($url, $params, $method === 'answerPreCheckoutQuery' ? 7 : 60);
         if ($body === null) {
             log_line('warning', "telegram $method failed: $error");
             return null;
@@ -572,7 +573,7 @@ final class Tg
         $result = self::call('getUpdates', [
             'offset'  => self::$updateOffset,
             'timeout' => $timeout,
-            'allowed_updates' => ['message', 'callback_query'],
+            'allowed_updates' => ['message', 'callback_query', 'pre_checkout_query'],
         ]);
         return $result['result'] ?? [];
     }

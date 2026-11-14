@@ -50,6 +50,11 @@ function handle_message_inner(array $message): void
         // در گروه‌ها و کانال‌ها ربات هیچ پیامی نمی‌فرستد
         return;
     }
+    /* Telegram has already charged this user: account/channel UI gates must not swallow the receipt. */
+    if (isset($message['successful_payment'])) {
+        pay_stars_success($message);
+        return;
+    }
     $name = trim((string) ($message['from']['first_name'] ?? '') . ' '
         . (string) ($message['from']['last_name'] ?? ''));
     /* «کاربر تازه» یعنی هنوز هیچ رکوردی برایش نبود — ملاک ثبت دعوت و پاداش */
@@ -67,12 +72,6 @@ function handle_message_inner(array $message): void
     if (force_join_blocked($uid)) {
         State::clear($uid);
         force_join_show($chatId, null);
-        return;
-    }
-
-    /* ── پرداخت موفق استارز ─────────────────────────────────────────── */
-    if (isset($message['successful_payment'])) {
-        pay_stars_success($message);
         return;
     }
 
@@ -594,9 +593,44 @@ function referral_credit(int $referrerId, int $newUserId, bool $isNewUser = true
     }
 }
 
+/** Answer deadline-bound pre-checkouts before slower chat work in the same poll batch.
+ * Advance by the maximum ID, not processing order, so prioritization cannot rewind polling. */
+function handle_updates_batch(array $updates): void
+{
+    $nextOffset = 0;
+    foreach ($updates as $update) {
+        $nextOffset = max($nextOffset, (int) ($update['update_id'] ?? -1) + 1);
+        if (isset($update['pre_checkout_query'])) {
+            handle_update($update);
+        }
+    }
+    foreach ($updates as $update) {
+        if (!isset($update['pre_checkout_query'])) {
+            handle_update($update);
+        }
+    }
+    if ($nextOffset > 0) {
+        Tg::setOffset($nextOffset);
+    }
+}
+
 /** اصلی‌ترین نقطهٔ ورود یک آپدیت */
 function handle_update(array $update): void
 {
+    /* Monetary protocol events must not enter the conversational/force-join router. */
+    if (isset($update['pre_checkout_query']) && is_array($update['pre_checkout_query'])) {
+        try {
+            pay_stars_pre_checkout($update['pre_checkout_query']);
+        } catch (Throwable $ex) {
+            log_line('error', 'stars pre-checkout failed: ' . $ex->getMessage());
+            Tg::call('answerPreCheckoutQuery', [
+                'pre_checkout_query_id' => (string) ($update['pre_checkout_query']['id'] ?? ''),
+                'ok' => false,
+                'error_message' => 'Unable to validate this invoice. Please try again shortly.',
+            ]);
+        }
+        return;
+    }
     if (isset($update['callback_query'])) {
         try {
             handle_callback($update['callback_query']);

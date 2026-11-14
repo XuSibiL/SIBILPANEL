@@ -795,6 +795,31 @@ function wiz_finish(int $uid, array $data): void
                  [btn('« پنل', 'ad:pg:' . $panelId, null, 'danger')]]);
             return;
 
+        case 'pg_loginpath':
+            if (!admin_can($uid, 'full')) {
+                Tg::send($uid, '⛔️ تغییر مسیر ورود فقط برای مالک/هم‌مالک مجاز است.');
+                return;
+            }
+            $panelId = (int) ($ctx['panel_id'] ?? 0);
+            $row = DB::one('SELECT * FROM pg_panels WHERE id=?', [$panelId]);
+            if ($row === null) {
+                Tg::send($uid, 'پنل پیدا نشد.');
+                return;
+            }
+            $path = panel_dashboard_path_normalize((string) ($values['dashboard_path'] ?? ''));
+            if ($path === null) {
+                Tg::send($uid, '❌ فقط یک مسیر معتبر مانند <code>/dashboard/</code> بفرستید؛ '
+                    . 'لینک کامل، پارامتر، فاصله و مسیرهای .. پذیرفته نیست.',
+                    [[btn('🔁 تنظیم دوباره', 'ad:pg:' . $panelId . ':loginpath')],
+                     [btn('« پنل', 'ad:pg:' . $panelId, null, 'danger')]]);
+                return;
+            }
+            DB::exec('UPDATE pg_panels SET dashboard_path=? WHERE id=?', [$path, $panelId]);
+            Tg::send($uid, '✅ مسیر ورود مشتری ذخیره شد؛ اتصال API بدون تغییر ماند.'
+                . "\n🌐 لینک تحویل: " . e(panel_dashboard_url((string) $row['url'], $path)),
+                [[btn('« پنل', 'ad:pg:' . $panelId, null, 'success')]]);
+            return;
+
         case 'pg_edit':
             $panelId = (int) ($ctx['panel_id'] ?? 0);
             $panelRow = DB::one('SELECT * FROM pg_panels WHERE id=?', [$panelId]);

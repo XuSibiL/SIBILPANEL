@@ -4,12 +4,12 @@
 
 **ربات فروش پنل پاسارگارد (PasarGuard) — نسخهٔ PHP**
 
-**نسخهٔ پایدار: `3.18.8`**
+**نسخهٔ پایدار: `3.18.9`**
 
 فروش پنل حجمی/ساعتی و نامحدودِ اتصال‌محور، کیف پول، درگاه‌های پرداخت ایرانی و کریپتو، احراز هویت دو سطحی،
 کد تخفیف، سیستم دعوت دوستان و پنل مدیریت کامل — بدون فریم‌ورک، بدون Composer.
 
-![version](https://img.shields.io/badge/version-3.18.8-2ea043)
+![version](https://img.shields.io/badge/version-3.18.9-2ea043)
 ![php](https://img.shields.io/badge/PHP-8.1%2B-777bb4)
 ![db](https://img.shields.io/badge/SQLite-PDO-003b57)
 ![license](https://img.shields.io/badge/license-MIT-blue)
@@ -401,6 +401,7 @@ sibil-panel/
 
 ```bash
 php tests/test_payment_iran_controls.php
+php tests/test_stars_precheckout_and_customer_path.php
 php tests/test_payment_tetrapay.php
 php tests/test_mirza_payment_selector.php
 php tests/test_metered_product_callbacks.php
@@ -453,3 +454,12 @@ bash tests/run_all.sh
 ## مجوز
 
 مجوز MIT — استفاده، تغییر و انتشار آزاد است، با حفظ متن مجوز.
+
+
+### 3.18.9 — Stars و مسیر ورود مستقل هر پنل
+
+- رفع چرخهٔ پرداخت Stars: دریافت و پاسخ سریع `pre_checkout_query`، اولویت در batch، تطبیق پرداخت/سفارش/خریدار/XTR/مبلغ/مهلت و سقف روزانه؛ بدون شارژ در مرحلهٔ تأیید اولیه.
+- رسید `successful_payment` پیش از محدودیت عضویت/مسدودی پردازش می‌شود؛ تسویهٔ اتمیک و ضدتکرار قبلی حفظ شده است.
+- «مدیریت ← پنل‌های متصل ← پنل ← 🌐 مسیر ورود مشتری»: فقط مسیر را وارد کنید، مثلاً `/sibilbord/` یا `/dashboard/sibiljkhh`. آدرس و کلید API تغییر نمی‌کنند. پیش‌فرض نصب‌های قبلی و جدید `/dashboard/` است؛ `-` پیش‌فرض را برمی‌گرداند.
+- مسیر سفارشی در تحویل خرید/تست و «پنل‌های من» استفاده می‌شود؛ پورت صریح و HTTPS حفظ می‌شوند. تغییر فقط برای مالک/هم‌مالک مجاز است.
+- تست‌ها محلی و با mock هستند؛ پرداخت واقعی Telegram و اتصال واقعی درگاه‌ها نیازمند آزمون روی نصب شماست. این اصلاح موجودی ناکافی Stars در حساب تلگرام را برطرف نمی‌کند.

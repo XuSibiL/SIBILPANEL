@@ -775,6 +775,11 @@ function screen_pg_panel(int|string $chat, ?int $messageId, int $panelId): void
             . "\n" . 'برای مدیریت این پنل یکی از گزینه‌های زیر را انتخاب کنید:';
     }
 
+    $text .= "\n🌐 مسیر ورود مشتری: <code>"
+        . e(panel_dashboard_path_normalize((string) ($panel['dashboard_path'] ?? '')) ?? '/dashboard/')
+        . "</code>\nلینک تحویل: "
+        . e(panel_dashboard_url((string) $panel['url'], (string) ($panel['dashboard_path'] ?? '')));
+
     /* اپراتور فقط ابزارهای روزانهٔ سرور را می‌بیند؛ اتصال و ساختار سرور
        (آدرس، کلید، حذف، دسته، پیش‌فرض و روشن/خاموش) برای مالک/هم‌مالک است. */
     $rows = [
@@ -787,6 +792,7 @@ function screen_pg_panel(int|string $chat, ?int $messageId, int $panelId): void
         $rows[] = [btn('🗑 حذف این پنل از ربات', 'ad:pg:' . $panelId . ':del', null, 'danger')];
         $rows[] = [btn('✏️ ویرایش نام / آدرس', 'ad:pg:' . $panelId . ':edit'),
             btn('🔑 تغییر کلید API', 'ad:pg:' . $panelId . ':key', null, 'success')];
+        $rows[] = [btn('🌐 مسیر ورود مشتری', 'ad:pg:' . $panelId . ':loginpath')];
         $rows[] = [btn('🗂 دسته', 'ad:pg:' . $panelId . ':cat')];
         $rows[] = [btn('⭐ پیش‌فرض', 'ad:pg:' . $panelId . ':default'),
             btn((int) $panel['active'] === 1 ? '🔴 خاموش کنید' : '🟢 روشن کنید',

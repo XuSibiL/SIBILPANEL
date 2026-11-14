@@ -2632,6 +2632,43 @@ function pay_stars(array $order): array
         'payment' => (int) $payment['id'], 'reused' => $reused];
 }
 
+/** Local-only Stars pre-checkout validation. No credit, provider lookup or delivery here. */
+function pay_stars_pre_checkout(array $query): void
+{
+    $queryId = trim((string) ($query['id'] ?? ''));
+    if ($queryId === '') {
+        return;
+    }
+    $payload = (string) ($query['invoice_payload'] ?? '');
+    $error = 'این فاکتور معتبر نیست؛ لطفاً از داخل ربات فاکتور تازه بسازید.';
+    $payment = null;
+    $order = null;
+    if (preg_match('/^order:(\d+):payment:(\d+)$/D', $payload, $match) === 1) {
+        $payment = DB::one("SELECT * FROM payments WHERE id=? AND order_id=? AND method='stars'",
+            [(int) $match[2], (int) $match[1]]);
+        $order = order_get((int) $match[1]);
+    }
+    $uid = (int) ($query['from']['id'] ?? 0);
+    $meta = $payment !== null ? pay_meta($payment) : [];
+    $ok = $payment !== null && $order !== null && $uid > 0
+        && (int) $payment['tg_id'] === $uid && (int) $order['tg_id'] === $uid
+        && (string) $payment['status'] === 'unpaid' && (string) $order['status'] === 'pending'
+        && !order_payment_expired($order)
+        && hash_equals((string) ($meta['stars_payload'] ?? ''), $payload)
+        && (string) ($query['currency'] ?? '') === 'XTR'
+        && (int) ($meta['stars_amount'] ?? 0) > 0
+        && (int) ($query['total_amount'] ?? 0) === (int) ($meta['stars_amount'] ?? 0);
+    if ($ok && !gw_daily_allowed('stars', (int) $payment['amount'])) {
+        $ok = false;
+        $error = 'سقف پرداخت امروز پر شده است؛ لطفاً با پشتیبانی تماس بگیرید.';
+    }
+    $answer = ['pre_checkout_query_id' => $queryId, 'ok' => $ok];
+    if (!$ok) {
+        $answer['error_message'] = $error;
+    }
+    Tg::call('answerPreCheckoutQuery', $answer);
+}
+
 /** Telegram's successful_payment update is the sole authoritative Stars settlement. */
 function pay_stars_success(array $message): void
 {
@@ -2644,6 +2681,13 @@ function pay_stars_success(array $message): void
     $paymentId = (int) $matches[2];
     $payment = DB::one("SELECT * FROM payments WHERE id=? AND order_id=? AND method='stars'", [$paymentId, $orderId]);
     if ($payment === null) {
+        return;
+    }
+    $order = order_get($orderId);
+    $payer = (int) ($message['from']['id'] ?? 0);
+    if ($order === null || $payer <= 0 || (int) $payment['tg_id'] !== $payer
+        || (int) $order['tg_id'] !== $payer) {
+        log_payment('stars payer mismatch', ['payment' => $paymentId, 'order' => $orderId]);
         return;
     }
     $meta = pay_meta($payment);

@@ -1590,7 +1590,7 @@ function screen_panel_detail(int|string $chat, ?int $messageId, int $panelId): v
     $cap = (int) ($panel['user_cap'] ?? 0) ?: (int) $panel['max_users'];
     $gb = static fn(int $bytes): string => gb_step_text($bytes);
     $pgRow = panel_pg_row($panel);
-    $panelUrl = $pgRow !== null ? panel_dashboard_url(normalize_panel_url((string) $pgRow['url'])) : '';
+    $panelUrl = $pgRow !== null ? panel_dashboard_url((string) $pgRow['url'], (string) ($pgRow['dashboard_path'] ?? '/dashboard/')) : '';
 
     $text = '🖥 <b>' . e((string) $panel['panel_username']) . '</b>'
         . ($isTrial ? ' 🧪' : ($isUnlimited ? ' ♾️' : '')) . "\n\n"

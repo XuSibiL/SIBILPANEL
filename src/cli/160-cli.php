@@ -261,10 +261,7 @@ function cli_poll(int $seconds = 0): void
         if (!$updates && (microtime(true) - $startedAt) < 1.0) {
             sleep(3);
         }
-        foreach ($updates as $update) {
-            Tg::setOffset((int) $update['update_id'] + 1);
-            handle_update($update);
-        }
+        handle_updates_batch($updates);
         /* رفع مسدودی موقت دستگاه‌ها هر ۶۰ ثانیه — مستقل از متر ۵ دقیقه‌ای */
         if (time() - $lastUnban >= 60) {
             $lastUnban = time();
@@ -449,10 +446,7 @@ function cli_main(array $argv): int
             return 0;
         case '--once':
             $updates = Tg::getUpdates(0);
-            foreach ($updates as $update) {
-                Tg::setOffset((int) $update['update_id'] + 1);
-                handle_update($update);
-            }
+            handle_updates_batch($updates);
             return 0;
         case '--test-update':
             Tg::$dry = true;

@@ -300,7 +300,7 @@ function deliver_panel_order(array $order): array
     } catch (Throwable $ex) {
         log_line('warning', 'sale report failed: ' . $ex->getMessage());
     }
-    $dashboard = panel_dashboard_url($base);
+    $dashboard = panel_dashboard_url($base, (string) ($panelRow['dashboard_path'] ?? '/dashboard/'));
     $nameNote = ($wantedName !== '' && $wantedName !== $username)
         ? '⚠️ نام دلخواه <code>' . e($wantedName) . "</code> روی پنل موجود بود؛ "
             . 'نام تازه صادر شد.' . "\n\n" : '';

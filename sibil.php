@@ -21,7 +21,7 @@
 
 declare(strict_types=1);
 
-const PANEL_VERSION = '3.18.8';
+const PANEL_VERSION = '3.18.9';
 const IRAN_OFFSET   = 3.5 * 3600;
 const DAY           = 86400;
 
@@ -213,10 +213,42 @@ function is_console_admin(int $uid): bool
     return function_exists('admin_is_console') ? admin_is_console($uid) : is_owner($uid);
 }
 
-/** آدرس داشبورد پنل کاربر (همان لینکی که خودتان باز می‌کنید) */
-function panel_dashboard_url(string $base): string
+/** Customer login suffix only. Never changes the API connection URL. */
+function panel_dashboard_path_normalize(string $path): ?string
 {
-    return rtrim($base, '/') . '/dashboard/';
+    $path = trim($path);
+    if ($path === '' || $path === '-' || $path === 'پیش‌فرض') {
+        return '/dashboard/';
+    }
+    if (!str_starts_with($path, '/')) {
+        $path = '/' . $path;
+    }
+    if (strlen($path) > 512 || str_starts_with($path, '//')
+        || preg_match('/[\x00-\x20\x7f<>"\\\\?#:]/u', $path) === 1) {
+        return null;
+    }
+    /* Reject encoded controls, URL switches and dot traversal as well. */
+    $decoded = rawurldecode($path);
+    if (str_starts_with($decoded, '//') || str_contains($decoded, '\\')
+        || preg_match('/[\x00-\x20\x7f<>"?#:]/u', $decoded) === 1
+        || preg_match('~(?:^|/)\.{1,2}(?:/|$)~', $decoded) === 1) {
+        return null;
+    }
+    return $path;
+}
+
+/** Join the origin (optional port) and this connected panel's customer path. */
+function panel_dashboard_url(string $base, string $path = '/dashboard/'): string
+{
+    $parts = parse_url(normalize_panel_url($base));
+    if (!is_array($parts) || empty($parts['host'])
+        || !in_array(strtolower((string) ($parts['scheme'] ?? '')), ['http', 'https'], true)
+        || isset($parts['user']) || isset($parts['pass'])) {
+        return '';
+    }
+    $suffix = panel_dashboard_path_normalize($path) ?? '/dashboard/';
+    return strtolower((string) $parts['scheme']) . '://' . $parts['host']
+        . (isset($parts['port']) ? ':' . (int) $parts['port'] : '') . $suffix;
 }
 
 /* ── shim: کار با UTF-8 بدون نیاز به ext-mbstring ─────────────────────── */
@@ -755,6 +787,7 @@ CREATE TABLE IF NOT EXISTS pg_panels (
     username     TEXT    NOT NULL DEFAULT '',
     password     TEXT    NOT NULL DEFAULT '',
     api_key      TEXT    NOT NULL DEFAULT '',
+    dashboard_path TEXT  NOT NULL DEFAULT '/dashboard/',
     note         TEXT,
     active       INTEGER NOT NULL DEFAULT 1,
     is_default   INTEGER NOT NULL DEFAULT 0,
@@ -1069,7 +1102,8 @@ function db_bootstrap(): void
                         'per_user_price' => 'INTEGER NOT NULL DEFAULT 0',
                         'min_users' => 'INTEGER NOT NULL DEFAULT 1',
                         'unlimited_billing_mode' => "TEXT NOT NULL DEFAULT 'legacy'"],
-        'pg_panels' => ['category_id' => 'INTEGER', 'api_key' => 'TEXT'],
+        'pg_panels' => ['category_id' => 'INTEGER', 'api_key' => 'TEXT',
+                        'dashboard_path' => "TEXT NOT NULL DEFAULT '/dashboard/'"],
         'discounts' => ['per_user' => 'INTEGER DEFAULT 1', 'first_only' => 'INTEGER DEFAULT 0',
                         'days' => 'INTEGER DEFAULT 30', 'hours' => 'INTEGER DEFAULT 0',
                         'created_at' => 'INTEGER DEFAULT 0',
@@ -1512,7 +1546,8 @@ final class Tg
             return null;
         }
         $url = "https://api.telegram.org/bot{$token}/{$method}";
-        [$body, $error] = http_post_json($url, $params);
+        /* Telegram gives pre-checkout only ten seconds. Never use the generic 60s budget. */
+        [$body, $error] = http_post_json($url, $params, $method === 'answerPreCheckoutQuery' ? 7 : 60);
         if ($body === null) {
             log_line('warning', "telegram $method failed: $error");
             return null;
@@ -1911,7 +1946,7 @@ final class Tg
         $result = self::call('getUpdates', [
             'offset'  => self::$updateOffset,
             'timeout' => $timeout,
-            'allowed_updates' => ['message', 'callback_query'],
+            'allowed_updates' => ['message', 'callback_query', 'pre_checkout_query'],
         ]);
         return $result['result'] ?? [];
     }
@@ -2618,7 +2653,7 @@ function admin_pg_callback_capability(array $parts): string
     /* فقط مشاهده، تست، دستگاه، همگام‌سازی و نقش‌های سرور برای اپراتور است.
        هر تغییری که اتصال/ساختار سرور را عوض کند، در سطح کامل باقی می‌ماند. */
     if (in_array($id, ['new', 'newapi', 'savekey', 'newpass', 'quick'], true)
-        || in_array($op, ['key', 'edit', 'del', 'del2', 'default', 'toggle', 'cat', 'setcat'], true)) {
+        || in_array($op, ['key', 'edit', 'loginpath', 'del', 'del2', 'default', 'toggle', 'cat', 'setcat'], true)) {
         return 'full';
     }
     if ($id === 'testall' || ctype_digit($id)) {
@@ -5971,7 +6006,7 @@ function screen_panel_detail(int|string $chat, ?int $messageId, int $panelId): v
     $cap = (int) ($panel['user_cap'] ?? 0) ?: (int) $panel['max_users'];
     $gb = static fn(int $bytes): string => gb_step_text($bytes);
     $pgRow = panel_pg_row($panel);
-    $panelUrl = $pgRow !== null ? panel_dashboard_url(normalize_panel_url((string) $pgRow['url'])) : '';
+    $panelUrl = $pgRow !== null ? panel_dashboard_url((string) $pgRow['url'], (string) ($pgRow['dashboard_path'] ?? '/dashboard/')) : '';
 
     $text = '🖥 <b>' . e((string) $panel['panel_username']) . '</b>'
         . ($isTrial ? ' 🧪' : ($isUnlimited ? ' ♾️' : '')) . "\n\n"
@@ -7260,6 +7295,11 @@ function screen_pg_panel(int|string $chat, ?int $messageId, int $panelId): void
             . "\n" . 'برای مدیریت این پنل یکی از گزینه‌های زیر را انتخاب کنید:';
     }
 
+    $text .= "\n🌐 مسیر ورود مشتری: <code>"
+        . e(panel_dashboard_path_normalize((string) ($panel['dashboard_path'] ?? '')) ?? '/dashboard/')
+        . "</code>\nلینک تحویل: "
+        . e(panel_dashboard_url((string) $panel['url'], (string) ($panel['dashboard_path'] ?? '')));
+
     /* اپراتور فقط ابزارهای روزانهٔ سرور را می‌بیند؛ اتصال و ساختار سرور
        (آدرس، کلید، حذف، دسته، پیش‌فرض و روشن/خاموش) برای مالک/هم‌مالک است. */
     $rows = [
@@ -7272,6 +7312,7 @@ function screen_pg_panel(int|string $chat, ?int $messageId, int $panelId): void
         $rows[] = [btn('🗑 حذف این پنل از ربات', 'ad:pg:' . $panelId . ':del', null, 'danger')];
         $rows[] = [btn('✏️ ویرایش نام / آدرس', 'ad:pg:' . $panelId . ':edit'),
             btn('🔑 تغییر کلید API', 'ad:pg:' . $panelId . ':key', null, 'success')];
+        $rows[] = [btn('🌐 مسیر ورود مشتری', 'ad:pg:' . $panelId . ':loginpath')];
         $rows[] = [btn('🗂 دسته', 'ad:pg:' . $panelId . ':cat')];
         $rows[] = [btn('⭐ پیش‌فرض', 'ad:pg:' . $panelId . ':default'),
             btn((int) $panel['active'] === 1 ? '🔴 خاموش کنید' : '🟢 روشن کنید',
@@ -13767,7 +13808,7 @@ function deliver_panel_order(array $order): array
     } catch (Throwable $ex) {
         log_line('warning', 'sale report failed: ' . $ex->getMessage());
     }
-    $dashboard = panel_dashboard_url($base);
+    $dashboard = panel_dashboard_url($base, (string) ($panelRow['dashboard_path'] ?? '/dashboard/'));
     $nameNote = ($wantedName !== '' && $wantedName !== $username)
         ? '⚠️ نام دلخواه <code>' . e($wantedName) . "</code> روی پنل موجود بود؛ "
             . 'نام تازه صادر شد.' . "\n\n" : '';
@@ -15287,6 +15328,31 @@ function wiz_finish(int $uid, array $data): void
             Tg::send($uid, ($okTest ? '✅ ' : '⚠️ ') . 'کلید API ذخیره شد.' . "\n\n" . e($note),
                 [[btn('🎭 نقش‌های این پنل', 'ad:role:' . $panelId . ':0:0', null, 'success')],
                  [btn('« پنل', 'ad:pg:' . $panelId, null, 'danger')]]);
+            return;
+
+        case 'pg_loginpath':
+            if (!admin_can($uid, 'full')) {
+                Tg::send($uid, '⛔️ تغییر مسیر ورود فقط برای مالک/هم‌مالک مجاز است.');
+                return;
+            }
+            $panelId = (int) ($ctx['panel_id'] ?? 0);
+            $row = DB::one('SELECT * FROM pg_panels WHERE id=?', [$panelId]);
+            if ($row === null) {
+                Tg::send($uid, 'پنل پیدا نشد.');
+                return;
+            }
+            $path = panel_dashboard_path_normalize((string) ($values['dashboard_path'] ?? ''));
+            if ($path === null) {
+                Tg::send($uid, '❌ فقط یک مسیر معتبر مانند <code>/dashboard/</code> بفرستید؛ '
+                    . 'لینک کامل، پارامتر، فاصله و مسیرهای .. پذیرفته نیست.',
+                    [[btn('🔁 تنظیم دوباره', 'ad:pg:' . $panelId . ':loginpath')],
+                     [btn('« پنل', 'ad:pg:' . $panelId, null, 'danger')]]);
+                return;
+            }
+            DB::exec('UPDATE pg_panels SET dashboard_path=? WHERE id=?', [$path, $panelId]);
+            Tg::send($uid, '✅ مسیر ورود مشتری ذخیره شد؛ اتصال API بدون تغییر ماند.'
+                . "\n🌐 لینک تحویل: " . e(panel_dashboard_url((string) $row['url'], $path)),
+                [[btn('« پنل', 'ad:pg:' . $panelId, null, 'success')]]);
             return;
 
         case 'pg_edit':
@@ -17388,6 +17454,21 @@ function handle_callback_inner(array $cb): void
                 screen_pg_devices($chatId, $messageId, $panelId);
                 return;
             }
+            if ($op === 'loginpath') {
+                $row = DB::one('SELECT * FROM pg_panels WHERE id=?', [$panelId]);
+                if ($row === null) {
+                    Tg::send($chatId, 'پنل پیدا نشد.');
+                    return;
+                }
+                wiz_start($uid, 'pg_loginpath', [
+                    step_def('dashboard_path', 'مسیر ورود مشتری را بفرستید؛ فقط قسمت بعد از دامنه و پورت.'
+                        . "\nمثال: <code>/dashboard/</code> یا <code>/sibilbord/</code>"
+                        . "\nمسیر فعلی: <code>" . e((string) ($row['dashboard_path'] ?? '/dashboard/')) . '</code>'
+                        . "\nبرای بازگشت به پیش‌فرض، <code>-</code> بفرستید."
+                        . "\nاین گزینه آدرس اتصال API را تغییر نمی‌دهد.", 'text', null, '🌐 مسیر ورود مشتری'),
+                ], ['panel_id' => $panelId]);
+                return;
+            }
             if ($op === 'edit') {
                 wiz_start($uid, 'pg_edit', [
                     step_def('name', 'نام تازهٔ این پنل را بفرستید.' . "\n"
@@ -17654,6 +17735,11 @@ function handle_message_inner(array $message): void
         // در گروه‌ها و کانال‌ها ربات هیچ پیامی نمی‌فرستد
         return;
     }
+    /* Telegram has already charged this user: account/channel UI gates must not swallow the receipt. */
+    if (isset($message['successful_payment'])) {
+        pay_stars_success($message);
+        return;
+    }
     $name = trim((string) ($message['from']['first_name'] ?? '') . ' '
         . (string) ($message['from']['last_name'] ?? ''));
     /* «کاربر تازه» یعنی هنوز هیچ رکوردی برایش نبود — ملاک ثبت دعوت و پاداش */
@@ -17671,12 +17757,6 @@ function handle_message_inner(array $message): void
     if (force_join_blocked($uid)) {
         State::clear($uid);
         force_join_show($chatId, null);
-        return;
-    }
-
-    /* ── پرداخت موفق استارز ─────────────────────────────────────────── */
-    if (isset($message['successful_payment'])) {
-        pay_stars_success($message);
         return;
     }
 
@@ -18198,9 +18278,44 @@ function referral_credit(int $referrerId, int $newUserId, bool $isNewUser = true
     }
 }
 
+/** Answer deadline-bound pre-checkouts before slower chat work in the same poll batch.
+ * Advance by the maximum ID, not processing order, so prioritization cannot rewind polling. */
+function handle_updates_batch(array $updates): void
+{
+    $nextOffset = 0;
+    foreach ($updates as $update) {
+        $nextOffset = max($nextOffset, (int) ($update['update_id'] ?? -1) + 1);
+        if (isset($update['pre_checkout_query'])) {
+            handle_update($update);
+        }
+    }
+    foreach ($updates as $update) {
+        if (!isset($update['pre_checkout_query'])) {
+            handle_update($update);
+        }
+    }
+    if ($nextOffset > 0) {
+        Tg::setOffset($nextOffset);
+    }
+}
+
 /** اصلی‌ترین نقطهٔ ورود یک آپدیت */
 function handle_update(array $update): void
 {
+    /* Monetary protocol events must not enter the conversational/force-join router. */
+    if (isset($update['pre_checkout_query']) && is_array($update['pre_checkout_query'])) {
+        try {
+            pay_stars_pre_checkout($update['pre_checkout_query']);
+        } catch (Throwable $ex) {
+            log_line('error', 'stars pre-checkout failed: ' . $ex->getMessage());
+            Tg::call('answerPreCheckoutQuery', [
+                'pre_checkout_query_id' => (string) ($update['pre_checkout_query']['id'] ?? ''),
+                'ok' => false,
+                'error_message' => 'Unable to validate this invoice. Please try again shortly.',
+            ]);
+        }
+        return;
+    }
     if (isset($update['callback_query'])) {
         try {
             handle_callback($update['callback_query']);
@@ -19842,10 +19957,7 @@ function cli_poll(int $seconds = 0): void
         if (!$updates && (microtime(true) - $startedAt) < 1.0) {
             sleep(3);
         }
-        foreach ($updates as $update) {
-            Tg::setOffset((int) $update['update_id'] + 1);
-            handle_update($update);
-        }
+        handle_updates_batch($updates);
         /* رفع مسدودی موقت دستگاه‌ها هر ۶۰ ثانیه — مستقل از متر ۵ دقیقه‌ای */
         if (time() - $lastUnban >= 60) {
             $lastUnban = time();
@@ -20030,10 +20142,7 @@ function cli_main(array $argv): int
             return 0;
         case '--once':
             $updates = Tg::getUpdates(0);
-            foreach ($updates as $update) {
-                Tg::setOffset((int) $update['update_id'] + 1);
-                handle_update($update);
-            }
+            handle_updates_batch($updates);
             return 0;
         case '--test-update':
             Tg::$dry = true;
@@ -23054,6 +23163,43 @@ function pay_stars(array $order): array
         'payment' => (int) $payment['id'], 'reused' => $reused];
 }
 
+/** Local-only Stars pre-checkout validation. No credit, provider lookup or delivery here. */
+function pay_stars_pre_checkout(array $query): void
+{
+    $queryId = trim((string) ($query['id'] ?? ''));
+    if ($queryId === '') {
+        return;
+    }
+    $payload = (string) ($query['invoice_payload'] ?? '');
+    $error = 'این فاکتور معتبر نیست؛ لطفاً از داخل ربات فاکتور تازه بسازید.';
+    $payment = null;
+    $order = null;
+    if (preg_match('/^order:(\d+):payment:(\d+)$/D', $payload, $match) === 1) {
+        $payment = DB::one("SELECT * FROM payments WHERE id=? AND order_id=? AND method='stars'",
+            [(int) $match[2], (int) $match[1]]);
+        $order = order_get((int) $match[1]);
+    }
+    $uid = (int) ($query['from']['id'] ?? 0);
+    $meta = $payment !== null ? pay_meta($payment) : [];
+    $ok = $payment !== null && $order !== null && $uid > 0
+        && (int) $payment['tg_id'] === $uid && (int) $order['tg_id'] === $uid
+        && (string) $payment['status'] === 'unpaid' && (string) $order['status'] === 'pending'
+        && !order_payment_expired($order)
+        && hash_equals((string) ($meta['stars_payload'] ?? ''), $payload)
+        && (string) ($query['currency'] ?? '') === 'XTR'
+        && (int) ($meta['stars_amount'] ?? 0) > 0
+        && (int) ($query['total_amount'] ?? 0) === (int) ($meta['stars_amount'] ?? 0);
+    if ($ok && !gw_daily_allowed('stars', (int) $payment['amount'])) {
+        $ok = false;
+        $error = 'سقف پرداخت امروز پر شده است؛ لطفاً با پشتیبانی تماس بگیرید.';
+    }
+    $answer = ['pre_checkout_query_id' => $queryId, 'ok' => $ok];
+    if (!$ok) {
+        $answer['error_message'] = $error;
+    }
+    Tg::call('answerPreCheckoutQuery', $answer);
+}
+
 /** Telegram's successful_payment update is the sole authoritative Stars settlement. */
 function pay_stars_success(array $message): void
 {
@@ -23066,6 +23212,13 @@ function pay_stars_success(array $message): void
     $paymentId = (int) $matches[2];
     $payment = DB::one("SELECT * FROM payments WHERE id=? AND order_id=? AND method='stars'", [$paymentId, $orderId]);
     if ($payment === null) {
+        return;
+    }
+    $order = order_get($orderId);
+    $payer = (int) ($message['from']['id'] ?? 0);
+    if ($order === null || $payer <= 0 || (int) $payment['tg_id'] !== $payer
+        || (int) $order['tg_id'] !== $payer) {
+        log_payment('stars payer mismatch', ['payment' => $paymentId, 'order' => $orderId]);
         return;
     }
     $meta = pay_meta($payment);

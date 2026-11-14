@@ -189,10 +189,42 @@ function is_console_admin(int $uid): bool
     return function_exists('admin_is_console') ? admin_is_console($uid) : is_owner($uid);
 }
 
-/** آدرس داشبورد پنل کاربر (همان لینکی که خودتان باز می‌کنید) */
-function panel_dashboard_url(string $base): string
+/** Customer login suffix only. Never changes the API connection URL. */
+function panel_dashboard_path_normalize(string $path): ?string
 {
-    return rtrim($base, '/') . '/dashboard/';
+    $path = trim($path);
+    if ($path === '' || $path === '-' || $path === 'پیش‌فرض') {
+        return '/dashboard/';
+    }
+    if (!str_starts_with($path, '/')) {
+        $path = '/' . $path;
+    }
+    if (strlen($path) > 512 || str_starts_with($path, '//')
+        || preg_match('/[\x00-\x20\x7f<>"\\\\?#:]/u', $path) === 1) {
+        return null;
+    }
+    /* Reject encoded controls, URL switches and dot traversal as well. */
+    $decoded = rawurldecode($path);
+    if (str_starts_with($decoded, '//') || str_contains($decoded, '\\')
+        || preg_match('/[\x00-\x20\x7f<>"?#:]/u', $decoded) === 1
+        || preg_match('~(?:^|/)\.{1,2}(?:/|$)~', $decoded) === 1) {
+        return null;
+    }
+    return $path;
+}
+
+/** Join the origin (optional port) and this connected panel's customer path. */
+function panel_dashboard_url(string $base, string $path = '/dashboard/'): string
+{
+    $parts = parse_url(normalize_panel_url($base));
+    if (!is_array($parts) || empty($parts['host'])
+        || !in_array(strtolower((string) ($parts['scheme'] ?? '')), ['http', 'https'], true)
+        || isset($parts['user']) || isset($parts['pass'])) {
+        return '';
+    }
+    $suffix = panel_dashboard_path_normalize($path) ?? '/dashboard/';
+    return strtolower((string) $parts['scheme']) . '://' . $parts['host']
+        . (isset($parts['port']) ? ':' . (int) $parts['port'] : '') . $suffix;
 }
 
 /* ── shim: کار با UTF-8 بدون نیاز به ext-mbstring ─────────────────────── */

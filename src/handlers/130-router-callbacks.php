@@ -2012,6 +2012,21 @@ function handle_callback_inner(array $cb): void
                 screen_pg_devices($chatId, $messageId, $panelId);
                 return;
             }
+            if ($op === 'loginpath') {
+                $row = DB::one('SELECT * FROM pg_panels WHERE id=?', [$panelId]);
+                if ($row === null) {
+                    Tg::send($chatId, 'پنل پیدا نشد.');
+                    return;
+                }
+                wiz_start($uid, 'pg_loginpath', [
+                    step_def('dashboard_path', 'مسیر ورود مشتری را بفرستید؛ فقط قسمت بعد از دامنه و پورت.'
+                        . "\nمثال: <code>/dashboard/</code> یا <code>/sibilbord/</code>"
+                        . "\nمسیر فعلی: <code>" . e((string) ($row['dashboard_path'] ?? '/dashboard/')) . '</code>'
+                        . "\nبرای بازگشت به پیش‌فرض، <code>-</code> بفرستید."
+                        . "\nاین گزینه آدرس اتصال API را تغییر نمی‌دهد.", 'text', null, '🌐 مسیر ورود مشتری'),
+                ], ['panel_id' => $panelId]);
+                return;
+            }
             if ($op === 'edit') {
                 wiz_start($uid, 'pg_edit', [
                     step_def('name', 'نام تازهٔ این پنل را بفرستید.' . "\n"
