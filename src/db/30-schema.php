@@ -318,6 +318,22 @@ CREATE TABLE IF NOT EXISTS wallet_tx (
     created_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS wallet_balance_events (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, tg_id INTEGER NOT NULL,
+ old_balance INTEGER NOT NULL, new_balance INTEGER NOT NULL, created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS wallet_panel_work (
+ panel_id INTEGER PRIMARY KEY, generation INTEGER NOT NULL DEFAULT 1,
+ due_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS wallet_panel_work_due ON wallet_panel_work(due_at,panel_id);
+CREATE TABLE IF NOT EXISTS wallet_low_notices (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, event_id INTEGER NOT NULL, tg_id INTEGER NOT NULL,
+ threshold INTEGER NOT NULL, state TEXT NOT NULL DEFAULT 'pending', created_at INTEGER NOT NULL,
+ UNIQUE(event_id,threshold)
+);
+CREATE INDEX IF NOT EXISTS wallet_low_notices_pending ON wallet_low_notices(state,id);
+
 CREATE TABLE IF NOT EXISTS usage_charges (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     panel_id   INTEGER NOT NULL,
@@ -328,6 +344,8 @@ CREATE TABLE IF NOT EXISTS usage_charges (
     kind       TEXT    NOT NULL DEFAULT 'usage',
     created_at INTEGER NOT NULL
 );
+
+CREATE INDEX IF NOT EXISTS wallet_usage_window ON usage_charges(tg_id,created_at);
 
 /* Historical v3.18.6 capacity-clock records are retained for audit only.
    v3.18.7 deactivates them and uses the per-client live-minute ledger below. */
@@ -670,6 +688,7 @@ function db_bootstrap(): void
     }
     /* نقش‌های قدیمی PANEL_ADMINS یک‌بار به سطح محدود پشتیبانی منتقل می‌شوند.
        مالک اصلی همچنان فقط از .env تعیین می‌شود. */
+    wallet_lifecycle_bootstrap();
     if (function_exists('admin_roles_bootstrap')) {
         admin_roles_bootstrap();
     }

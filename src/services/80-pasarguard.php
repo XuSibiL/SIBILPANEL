@@ -121,7 +121,8 @@ final class PgPanel
             $body = json_encode($json, JSON_UNESCAPED_UNICODE);
         }
         [$payload, $error, $status] = http_request($method, $url, $headers, $body, true,
-            max(5, min(120, set_int('panel_test_timeout', 20))));
+            isset($GLOBALS['wallet_status_timeout']) ? (int)$GLOBALS['wallet_status_timeout']
+                : max(5, min(120, set_int('panel_test_timeout', 20))));
         if ($payload === null) {
             throw new PanelError('connection failed: ' . $error);
         }

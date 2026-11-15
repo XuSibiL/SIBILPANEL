@@ -262,6 +262,7 @@ function cli_poll(int $seconds = 0): void
             sleep(3);
         }
         handle_updates_batch($updates);
+        wallet_worker_kick();
         /* رفع مسدودی موقت دستگاه‌ها هر ۶۰ ثانیه — مستقل از متر ۵ دقیقه‌ای */
         if (time() - $lastUnban >= 60) {
             $lastUnban = time();
@@ -397,6 +398,14 @@ function cli_main(array $argv): int
             $expired = payments_expire(set_int('pay_expire_minutes', 30));
             echo json_encode(['settled' => $settled, 'expired' => $expired]) . "\n";
             return 0;
+        case '--wallet-worker':
+            $walletStarted = microtime(true);
+            do {
+                $walletStats = wallet_worker_run(8);
+                if (!$walletStats['processed'] && !$walletStats['notices']) break;
+            } while (microtime(true) - $walletStarted < 12);
+            wallet_worker_kick(true); // drain additional panels without blocking the bot
+            return 0;
         case '--meter':
             /* Manual meter preserves the volume path and also runs one live
                unlimited sample/settlement so an operator can verify it. */
@@ -447,6 +456,7 @@ function cli_main(array $argv): int
         case '--once':
             $updates = Tg::getUpdates(0);
             handle_updates_batch($updates);
+        wallet_worker_kick();
             return 0;
         case '--test-update':
             Tg::$dry = true;

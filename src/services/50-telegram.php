@@ -174,7 +174,7 @@ final class Tg
         }
         $url = "https://api.telegram.org/bot{$token}/{$method}";
         /* Telegram gives pre-checkout only ten seconds. Never use the generic 60s budget. */
-        [$body, $error] = http_post_json($url, $params, $method === 'answerPreCheckoutQuery' ? 7 : 60);
+        [$body, $error] = http_post_json($url, $params, $method === 'answerPreCheckoutQuery' ? 7 : (isset($GLOBALS['wallet_worker_telegram_timeout']) ? 4 : 60));
         if ($body === null) {
             log_line('warning', "telegram $method failed: $error");
             return null;

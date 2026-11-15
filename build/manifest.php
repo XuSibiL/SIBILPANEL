@@ -30,6 +30,7 @@ return [
     'handlers/130-router-callbacks.php',
     'handlers/140-router-messages.php',
     'services/150-meter.php',
+    'services/151-wallet-lifecycle.php',
     'cli/160-cli.php',
     'services/160-force-join.php',
     'services/170-gateways.php',

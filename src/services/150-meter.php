@@ -58,7 +58,7 @@ function usage_blocks(int $bytes): int
 function panel_balance_suspension_allowed(array $panel, ?int $at = null): bool
 {
     if (panel_is_unlimited($panel)) {
-        return false;
+        return panel_is_hourly_unlimited($panel); // live-time products require a funded wallet; legacy Role products do not
     }
     $billingStart = (int) ($panel['billing_start_at'] ?? 0);
     $at = $at ?? time();
@@ -162,7 +162,7 @@ function panel_meter_amounts(array $panel, int $usedBytes, bool $hourlyEnabled,
  * هر پنل مبنای خودش را دارد، پس ده‌ها پنل روی هم نمی‌افتند.
  * خروجی: [charged, hours, gigs, skipped, suspended]
  */
-function panel_charge_once(array $panel, int $usedBytes, bool $hourlyEnabled,
+function panel_charge_once_inner(array $panel, int $usedBytes, bool $hourlyEnabled,
                            bool $perGbEnabled, int $grace = 0): array
 {
     $out = ['charged' => 0, 'hours' => 0, 'gigs' => 0, 'skipped' => false,
@@ -629,7 +629,7 @@ function panels_meter(bool $verbose = false): array
             /* اگر نسخهٔ قبلی ربات به‌علت موجودی این پنل را بسته باشد، واگذار کردن
                اختیار به Role مستلزم برداشتن همان محدودیت محلی است. */
             if (($held['suspended_reason'] ?? '') === 'balance') {
-                DB::exec('UPDATE panels SET suspended_reason=NULL WHERE id=?', [(int) $held['id']]);
+
                 if (resume_panel($held)) {
                     $stats['resumed']++;
                 }
@@ -639,10 +639,12 @@ function panels_meter(bool $verbose = false): array
         if ((int) ($held['is_trial'] ?? 0) === 1) {
             continue;
         }
-        DB::exec('UPDATE panels SET last_meter_at=? WHERE id=?', [now_ts(), (int) $held['id']]);
+        if (($held['suspended_reason'] ?? '') !== 'balance') {
+            continue; // never auto-enable manual/expired/traffic/unknown holds
+        }
         $heldBalance = balance_of((int) $held['tg_id']);
         $heldExpired = !empty($held['expires_at']) && (int) $held['expires_at'] <= now_ts();
-        if ($heldBalance > 0 && $heldBalance >= (int) $held['min_balance'] && !$heldExpired
+        if ($heldBalance > 0 && !$heldExpired
             && panel_balance_hold_can_resume($held)) {
             if (resume_panel($held)) {
                 $stats['resumed']++;
@@ -793,11 +795,13 @@ function panels_balance_enforce(bool $verbose = false): array
         }
         if (panel_is_unlimited($panel)) {
             if (panel_is_hourly_unlimited($panel)) {
-                /* Its own live-minute meter decides when this service may resume. */
+                if ($panel['status'] === 'active' && balance_of((int)$panel['tg_id']) <= 0
+                    && suspend_panel($panel, 'کمبود موجودی برای زمان آنلاین پنل نامحدود')) $out['suspended']++;
+                // Its debt must still be settled before recovery.
                 continue;
             }
             if ($panel['status'] === 'suspended' && ($panel['suspended_reason'] ?? '') === 'balance') {
-                DB::exec('UPDATE panels SET suspended_reason=NULL WHERE id=?', [(int) $panel['id']]);
+
                 if (resume_panel($panel)) {
                     $out['resumed']++;
                 }
@@ -810,7 +814,7 @@ function panels_balance_enforce(bool $verbose = false): array
         if (!panel_balance_suspension_allowed($panel)) {
             if ($panel['status'] === 'suspended' && ($panel['suspended_reason'] ?? '') === 'balance'
                 && panel_balance_hold_can_resume($panel)) {
-                DB::exec('UPDATE panels SET suspended_reason=NULL WHERE id=?', [(int) $panel['id']]);
+
                 if (resume_panel($panel)) {
                     $out['resumed']++;
                 }
@@ -821,10 +825,9 @@ function panels_balance_enforce(bool $verbose = false): array
             continue;
         }
         if ($panel['status'] === 'active' && $balance <= 0) {
-            suspend_panel($panel, 'موجودی کیف پول صفر است');
-            DB::exec('UPDATE panels SET suspended_reason=? WHERE id=?',
-                ['balance', (int) $panel['id']]);
-            $out['suspended']++;
+            if (suspend_panel($panel, 'موجودی کیف پول صفر است')) {
+                $out['suspended']++;
+            }
             if ($verbose) {
                 echo '· balance zero: ' . $panel['panel_username'] . "\n";
             }
@@ -832,7 +835,7 @@ function panels_balance_enforce(bool $verbose = false): array
         }
         if ($panel['status'] === 'suspended' && ($panel['suspended_reason'] ?? '') === 'balance'
             && $balance > 0 && panel_balance_hold_can_resume($panel)) {
-            DB::exec('UPDATE panels SET suspended_reason=NULL WHERE id=?', [(int) $panel['id']]);
+
             if (resume_panel($panel)) {
                 $out['resumed']++;
             }
@@ -1277,20 +1280,24 @@ function panels_device_guard(bool $verbose = false): array
     return $out;
 }
 
-function panel_api_status(array $panelRow, int $adminId, string $status, string $username = ''): void
+function panel_api_status(array $panelRow, int $adminId, string $status, string $username = ''): bool
 {
-    if ($adminId <= 0 && $username === '') {
-        return;
-    }
+    if ($adminId <= 0 && $username === '') return false;
+    $old = $GLOBALS['wallet_status_timeout'] ?? null;
+    $GLOBALS['wallet_status_timeout'] = 4;
     try {
-        $client = new PgPanel($panelRow);
-        $client->set_status($username !== '' ? $username : $adminId, $status);
+        (new PgPanel($panelRow))->set_status($username !== '' ? $username : $adminId, $status);
+        return true;
     } catch (Throwable $ex) {
         log_line('warning', 'set_status failed: ' . $ex->getMessage());
+        return false;
+    } finally {
+        if ($old === null) unset($GLOBALS['wallet_status_timeout']);
+        else $GLOBALS['wallet_status_timeout'] = $old;
     }
 }
 
-function suspend_panel(array $panel, string $reason, int $adminId = 0): bool
+function suspend_panel_inner(array $panel, string $reason, int $adminId = 0): bool
 {
     $fresh = DB::one('SELECT * FROM panels WHERE id=?', [(int) $panel['id']]);
     if ($fresh === null) {
@@ -1302,12 +1309,19 @@ function suspend_panel(array $panel, string $reason, int $adminId = 0): bool
     $panel = array_merge($panel, $fresh);
     $panelRow = $panel['pg_panel_id']
         ? DB::one('SELECT * FROM pg_panels WHERE id=?', [(int) $panel['pg_panel_id']]) : null;
+    if (!empty($panel['pg_panel_id']) && $panelRow === null) return false;
     if ($panelRow !== null) {
-        panel_api_status($panelRow, (int) $panel['panel_admin_id'], 'disabled',
-            (string) $panel['panel_username']);
+        if (!panel_api_status($panelRow, (int) $panel['panel_admin_id'], 'disabled',
+            (string) $panel['panel_username'])) {
+            wallet_panel_schedule((int)$panel['id'], 15);
+            return false;
+        }
     }
-    DB::exec("UPDATE panels SET status='suspended', suspended_at=? WHERE id=?",
-        [now_ts(), (int) $panel['id']]);
+    $code = $adminId > 0 ? 'manual' : (str_contains($reason, 'موجودی')
+        ? (panel_is_hourly_unlimited($panel) ? 'online_balance' : 'balance')
+        : (str_contains($reason, 'حجم') ? 'traffic' : 'expiry'));
+    DB::exec("UPDATE panels SET status='suspended', suspended_at=?, suspended_reason=? WHERE id=?",
+        [now_ts(), $code, (int) $panel['id']]);
     post_report('⛔️ <b>پنل تعلیق شد</b>' . "\n"
         . '👤 کاربر <code>' . (int) $panel['tg_id'] . "</code>\n"
         . '📦 پنل <code>' . e((string) $panel['panel_username']) . "</code>\n"
@@ -1318,7 +1332,9 @@ function suspend_panel(array $panel, string $reason, int $adminId = 0): bool
     }
     $notice = '⛔️ پنل <code>' . e((string) $panel['panel_username'])
         . "</code> تعلیق شد.\n" . 'دلیل: ' . e($reason) . "\n"
-        . 'با شارژ کیف پول، پنل خودکار فعال می‌شود.';
+        . ($code === 'balance' || $code === 'online_balance'
+            ? 'با شارژ کیف پول، پنل واجدشرایط خودکار فعال می‌شود.'
+            : 'برای بررسی وضعیت پنل با پشتیبانی تماس بگیرید.');
     $noticeKb = [[btn('💳 شارژ کیف پول', 'menu:wallet', null, 'success')]];
     if ($adminId > 0) {
         support_send_admin_message($adminId, (int) $panel['tg_id'], $notice, $noticeKb);
@@ -1328,24 +1344,31 @@ function suspend_panel(array $panel, string $reason, int $adminId = 0): bool
     return true;
 }
 
-function resume_panel(array $panel, int $adminId = 0): bool
+function resume_panel_inner(array $panel, int $adminId = 0): bool
 {
     $fresh = DB::one('SELECT * FROM panels WHERE id=?', [(int) $panel['id']]);
     if ($fresh === null) {
         return false;
     }
-    if (($fresh['status'] ?? '') === 'active') {
-        return false; // از قبل فعال است؛ پیام تکراری لازم نیست
+    if (($fresh['status'] ?? '') !== 'suspended') {
+        return false; // فقط پنل معلق قابل فعال‌سازی است
     }
+    if ($adminId === 0 && (!in_array((string)($fresh['suspended_reason'] ?? ''),
+        ['balance','online_balance','hourly_balance'], true) || !panel_balance_hold_can_resume($fresh))) {
+        return false;
+    }
+    if ($adminId === 0 && in_array((string)($fresh['suspended_reason'] ?? ''), ['balance','online_balance','hourly_balance'], true)
+        && panel_balance_suspension_allowed($fresh) && balance_of((int)$fresh['tg_id']) <= 0) return false;
     $panel = array_merge($panel, $fresh);
     $panelRow = $panel['pg_panel_id']
         ? DB::one('SELECT * FROM pg_panels WHERE id=?', [(int) $panel['pg_panel_id']]) : null;
+    if (!empty($panel['pg_panel_id']) && $panelRow === null) return false;
     if ($panelRow !== null) {
-        panel_api_status($panelRow, (int) $panel['panel_admin_id'], 'active',
-            (string) $panel['panel_username']);
+        if (!panel_api_status($panelRow, (int) $panel['panel_admin_id'], 'active',
+            (string) $panel['panel_username'])) return false;
     }
-    DB::exec("UPDATE panels SET status='active', suspended_at=NULL WHERE id=?",
-        [(int) $panel['id']]);
+    DB::exec("UPDATE panels SET status='active', suspended_at=NULL, suspended_reason=NULL, last_meter_at=? WHERE id=?",
+        [now_ts(), (int) $panel['id']]);
     post_report('✅ <b>پنل دوباره فعال شد</b>' . "\n"
         . '👤 کاربر <code>' . (int) $panel['tg_id'] . "</code>\n"
         . '📦 پنل <code>' . e((string) $panel['panel_username']) . '</code>', 'panel');
