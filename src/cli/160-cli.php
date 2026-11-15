@@ -263,6 +263,7 @@ function cli_poll(int $seconds = 0): void
         }
         handle_updates_batch($updates);
         wallet_worker_kick();
+        pay_sibil_kick();
         /* رفع مسدودی موقت دستگاه‌ها هر ۶۰ ثانیه — مستقل از متر ۵ دقیقه‌ای */
         if (time() - $lastUnban >= 60) {
             $lastUnban = time();
@@ -398,6 +399,9 @@ function cli_main(array $argv): int
             $expired = payments_expire(set_int('pay_expire_minutes', 30));
             echo json_encode(['settled' => $settled, 'expired' => $expired]) . "\n";
             return 0;
+        case '--sibilpay-worker':
+            pay_sibil_poll();
+            return 0;
         case '--wallet-worker':
             $walletStarted = microtime(true);
             do {
@@ -457,6 +461,7 @@ function cli_main(array $argv): int
             $updates = Tg::getUpdates(0);
             handle_updates_batch($updates);
         wallet_worker_kick();
+        pay_sibil_kick();
             return 0;
         case '--test-update':
             Tg::$dry = true;

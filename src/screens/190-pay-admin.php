@@ -145,6 +145,7 @@ function screen_swap(int|string $chat, ?int $messageId, bool $refreshed = false)
 
 function screen_pay_gateway(int|string $chat, ?int $messageId, string $gw): void
 {
+    if ($gw === 'sibilpay') { screen_sibilpay_gateway($chat, $messageId); return; }
     $meta = gw_meta($gw);
     if ($meta === null) {
         screen_pay_gateways($chat, $messageId);
@@ -311,3 +312,26 @@ function screen_pay_web(int|string $chat, ?int $messageId): void
     ]);
 }
 
+
+/** Only the requested six configuration controls, plus navigation. */
+function screen_sibilpay_gateway(int|string $chat, ?int $messageId): void
+{
+    [$ready,$missing]=gw_readiness('sibilpay');$on=gw_on('sibilpay');
+    $text="💳 <b>سیبیل پی (کارت به کارت آنی)</b>\n\n"
+        .'وضعیت: '.($on?'🟢 روشن':'🔴 خاموش')."\n"
+        .'آدرس درگاه: <code>'.e(set_get('pay_sibilpay_endpoint','')?:'ثبت نشده')."</code>\n"
+        .'API: '.(gw_key('sibilpay')!==''?'✅ ثبت شده (محرمانه)':'ثبت نشده')."\n"
+        .'حداقل واریز: '.money(gw_min('sibilpay'))."\n"
+        .'حداکثر واریز: '.money(gw_max('sibilpay'))."\n"
+        .'کش‌بک: '.fa_digits(gw_cashback('sibilpay'))."٪\n";
+    if (!$ready&&$on) $text.='نیازمندی: '.e(implode('، ',$missing))."\n";
+    $text.="\n<b>آموزش دریافت درگاه</b>\n"
+        ."ربات @sibilpay را استارت کنید و درخواست فروشگاه بدهید. پس از تأیید، وارد بخش «درگاه‌ها و API» شوید؛ آدرس درگاه و کلید API خود را دریافت کرده و اینجا وارد کنید.";
+    Tg::show($chat,$messageId,$text,[
+        [btn($on?'🔴 خاموش کنید':'🟢 روشن کنید','ad:pay:sibilpay:toggle')],
+        [btn('🌐 آدرس درگاه','ad:pay:sibilpay:endpoint'),btn('🔑 API','ad:pay:sibilpay:key')],
+        [btn('⬇️ حداقل واریز','ad:pay:sibilpay:min'),btn('⬆️ حداکثر واریز','ad:pay:sibilpay:max')],
+        [btn('🎁 کش‌بک ٪','ad:pay:sibilpay:cashback')],
+        [btn('« درگاه‌های ریالی','ad:paygrp:fiat')],
+    ]);
+}

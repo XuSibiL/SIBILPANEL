@@ -23,6 +23,8 @@ const PAY_GATEWAYS = [
                         'hint' => 'توکن Bearer از cubevps.ir (همان کلید، امضای کال‌بک را می‌سازد).'],
     'iranpay4'      => ['label' => 'AbanPay', 'emoji' => '🟠', 'type' => 'online',
                         'hint' => 'کلید ارتباطی (API key) به همراه آدرس سرویس درگاه (https).'],
+    'sibilpay'      => ['label' => 'سیبیل پی (کارت به کارت آنی)', 'emoji' => '💳', 'type' => 'online',
+                        'hint' => 'آدرس درگاه و کلید API فروشگاه از @sibilpay.'],
     'tetrapay'      => ['label' => 'تتراپی', 'emoji' => '🔷', 'type' => 'online',
                         'hint' => 'فقط کلید API تتراپی؛ مبلغ‌ها خودکار از تومان به ریال تبدیل می‌شوند.'],
     'nowpayment'    => ['label' => 'NowPayments', 'emoji' => '₿', 'type' => 'crypto',
@@ -50,7 +52,7 @@ function pay_setting_defaults(): array
         /* TetraPay and NowPayments new installs require only their API key.
            Any old secondary setting remains harmless legacy data and is not
            required for checkout creation or settlement. */
-        if (!in_array($id, ['tetrapay', 'nowpayment'], true)) {
+        if (!in_array($id, ['tetrapay', 'nowpayment', 'sibilpay'], true)) {
             $defaults["pay_{$id}_key2"] = '';
         }
         /* اعداد پیش‌فرض درگاه‌ها */
@@ -73,6 +75,7 @@ function pay_setting_defaults(): array
     }
     /* مسیر جداگانهٔ AbanPay؛ در نسخه‌های قدیمی گاهی اشتباهاً در key2 ذخیره می‌شد. */
     $defaults['pay_iranpay4_endpoint'] = '';
+    $defaults['pay_sibilpay_endpoint'] = '';
     $defaults['swap_api_key'] = '';
     $defaults['usd_toman_rate'] = '0';                // فقط نرخ پشتیبان، وقتی سواپ‌ولت در دسترس نیست
     return $defaults;
@@ -80,6 +83,7 @@ function pay_setting_defaults(): array
 
 function pay_settings_bootstrap(): void
 {
+    pay_sibil_schema();
     foreach (pay_setting_defaults() as $key => $value) {
         if (DB::one('SELECT key FROM settings WHERE key=?', [$key]) === null) {
             set_put($key, $value);
@@ -268,6 +272,10 @@ function gw_readiness(string $gw): array
     if ($gw === 'iranpay4' && pay_abanpay_endpoint() === '') {
         $missing[] = 'آدرس HTTPS ابان‌پی ثبت نشده';
     }
+    if ($gw === 'sibilpay') {
+        if (pay_sibil_base(set_get('pay_sibilpay_endpoint', '')) === '') $missing[] = 'آدرس HTTPS درگاه ثبت نشده';
+        if (!preg_match('/^(sibil_pay_live_|sp_live_)[A-Za-z0-9_-]+$/D', pay_sibil_key(gw_key($gw)))) $missing[] = 'کلید live معتبر ثبت نشده';
+    }
     if ($gw === 'variza' && gw_key2($gw) === '') {
         $missing[] = 'کلید امضای وب‌هوک واریزا ثبت نشده';
     }
@@ -281,7 +289,7 @@ function gw_readiness(string $gw): array
         if (tetrapay_bot_username() === '') {
             $missing[] = 'نام کاربری معتبر ربات تلگرام برای بازگشت تتراپی پیدا نشد';
         }
-    } elseif (in_array((string) $meta['type'], ['online', 'crypto'], true)
+    } elseif ($gw !== 'sibilpay' && in_array((string) $meta['type'], ['online', 'crypto'], true)
         && !gw_https_url(pay_callback_url($gw))) {
         $missing[] = 'آدرس HTTPS کال‌بک ثبت نشده';
     }
@@ -792,6 +800,7 @@ function pay_start(array $order, string $gw): array
     if ($gw === 'stars') {
         return pay_stars($order);
     }
+    if ($gw === 'sibilpay') return pay_sibil_start($order);
     /* لمس دوبارهٔ دکمه نباید برای یک سفارش چند فاکتور درگاه بسازد. */
     $existing = DB::one("SELECT * FROM payments WHERE order_id=? AND method=? AND status='unpaid' "
         . "AND authority<>'' ORDER BY id DESC LIMIT 1", [(int) $order['id'], $gw]);
@@ -2893,6 +2902,7 @@ function payments_poll(): int
        signed-webhook-only, and Stars is Telegram-authoritative, so none is
        guessed or polled with invented endpoints. */
     $settled = payments_recover_paid_topups();
+    $settled += pay_sibil_poll();
     $pollable = ['zarinpal', 'aqayepardakht', 'iranpay4', 'tetrapay', 'nowpayment', 'plisio', 'trx'];
     foreach ($pollable as $method) {
         /* Separate bounded queues mean a backlog at one provider cannot starve

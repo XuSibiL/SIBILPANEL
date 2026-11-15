@@ -410,7 +410,22 @@ function wiz_finish(int $uid, array $data): void
                 return;
             }
             $value = trim((string) $values['value']);
-            if ($field === 'endpoint' && $gw !== 'iranpay4') {
+            if ($gw === 'sibilpay') {
+                if (!admin_can($uid, 'full')) { Tg::send($uid,'⛔️ دسترسی تغییر درگاه ندارید.'); return; }
+                if (!in_array($field,['endpoint','key','min','max','cashback'],true)) { Tg::send($uid,'این تنظیم برای سیبیل پی وجود ندارد.'); return; }
+                if ($field === 'endpoint') {
+                    $value=pay_sibil_base($value);
+                    if ($value==='') { Tg::send($uid,'آدرس HTTPS معتبر با پورت صحیح وارد کنید.'); return; }
+                }
+                if ($field === 'key') {
+                    $value=pay_sibil_key($value);
+                    if (!preg_match('/^(sibil_pay_live_|sp_live_)[A-Za-z0-9_-]+$/D',$value)) { Tg::send($uid,'کلید live معتبر وارد کنید.'); return; }
+                }
+                if (($field==='cashback'&&((int)$value<0||(int)$value>100))
+                    ||($field==='min'&&((int)$value<1000||(int)$value>gw_max($gw)))
+                    ||($field==='max'&&(int)$value<gw_min($gw))) { Tg::send($uid,'محدوده مبلغ یا درصد معتبر نیست.'); return; }
+            }
+            if ($field === 'endpoint' && !in_array($gw, ['iranpay4','sibilpay'], true)) {
                 Tg::send($uid, '❌ فقط آدرس سرویس ابان‌پی قابل تنظیم است.',
                     [[btn('« درگاه', 'ad:pay:' . $gw, null, 'danger')]]);
                 return;
@@ -430,7 +445,7 @@ function wiz_finish(int $uid, array $data): void
             $settingKey = match ($field) {
                 'minfiat' => 'pay_' . $gw . '_min_fiat',
                 'daily' => 'pay_' . $gw . '_daily_limit',
-                'endpoint' => 'pay_iranpay4_endpoint',
+                'endpoint' => 'pay_' . $gw . '_endpoint',
                 'help' => 'pay_' . $gw . '_help',
                 default => 'pay_' . $gw . '_' . $field,
             };
@@ -440,7 +455,7 @@ function wiz_finish(int $uid, array $data): void
                 set_put('pay_' . $gw . '_min_at', '0');
             }
             /* فقط کلید اصلی می‌تواند درگاه را روشن کند؛ readiness همچنان همهٔ رازها/کال‌بک‌ها را می‌سنجد. */
-            if ($field === 'key' && $value !== '' && set_get('pay_' . $gw . '_on') !== '1' && $gw !== 'card') {
+            if ($field === 'key' && $value !== '' && set_get('pay_' . $gw . '_on') !== '1' && !in_array($gw, ['card','sibilpay'], true)) {
                 set_put('pay_' . $gw . '_on', '1');
             }
             $saved = in_array($field, ['key', 'key2'], true)

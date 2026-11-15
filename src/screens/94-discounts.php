@@ -3863,6 +3863,7 @@ const KYC_RIAL_PAYMENT_METHODS = [
     'iranpay2',
     'iranpay4',
     'variza',
+    'sibilpay',
 ];
 
 function gw_requires_kyc(string $gw): bool

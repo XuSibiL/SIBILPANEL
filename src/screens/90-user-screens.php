@@ -359,7 +359,7 @@ function discount_allowed_for(string $orderKind): bool
     TetraPay is inserted immediately after Aban as SIBIL's additional rial method. */
 function mirza_payment_gateway_order(): array
 {
-    return ['card', 'plisio', 'nowpayment', 'trx', 'iranpay1', 'iranpay2', 'iranpay4',
+    return ['card', 'plisio', 'nowpayment', 'trx', 'iranpay1', 'iranpay2', 'iranpay4', 'sibilpay',
         'tetrapay', 'aqayepardakht', 'zarinpal', 'variza', 'stars'];
 }
 
@@ -373,6 +373,7 @@ function mirza_payment_button_label(string $gateway, array $meta = []): string
         'iranpay1'      => '💸 درگاه پرداخت ریالی',
         'iranpay2'      => '💸 CubePay',
         'iranpay4'      => '💳 آبان گیت وی (کارت به کارت)',
+        'sibilpay'      => '💳 سیبیل پی (کارت به کارت آنی)',
         'tetrapay'      => '🔷 تتراپی (درگاه انلاین،بدون احراز)',
         'aqayepardakht' => '🔵 درگاه آقای پرداخت',
         'zarinpal'      => '🟡 زرین پال',

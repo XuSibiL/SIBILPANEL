@@ -533,7 +533,7 @@ function handle_callback_inner(array $cb): void
                         return;
                     }
                     pay_note_message((int) $order['id'], $gw, (int) $messageId);
-                    $rows = [[btn('💳 پرداخت ' . money((int) $order['payable']),
+                    $rows = [[btn('💳 پرداخت ' . ($gw === 'sibilpay' ? pay_sibil_toman((int)(pay_meta($paymentRow)['sibilpay_payable_rial'] ?? 0)) . ' تومان' : money((int) $order['payable'])),
                         null, (string) $result['url'], 'success')]];
                     $alternate = trim((string) ($result['alt_url'] ?? ''));
                     if ($alternate !== '' && preg_match('~^https://~i', $alternate) === 1) {
@@ -541,6 +541,10 @@ function handle_callback_inner(array $cb): void
                     }
                     $rows[] = [btn('« بازگشت', 'inv:gw:' . $order['id'], null, 'danger')];
                     $pendingNotice = pay_created_notice($order, $paymentRow);
+                    if ($gw === 'sibilpay') {
+                        $sm = pay_meta($paymentRow);
+                        $pendingNotice .= "\n\n💲 مبلغ دقیق واریز: <b>" . pay_sibil_toman((int)($sm['sibilpay_payable_rial'] ?? 0)) . "</b> تومان\nمبلغ را دقیقاً مطابق صفحه درگاه واریز کنید؛ تأیید پرداخت خودکار است.";
+                    }
                     /* NowPayments/Plisio keep their useful invoice guidance, but its
                        wording is strictly pending until provider verification. */
                     if ((PAY_GATEWAYS[$gw]['type'] ?? '') === 'crypto') {
@@ -1181,6 +1185,7 @@ function handle_callback_inner(array $cb): void
                 return;
             }
             $op = (string) ($parts[3] ?? '');
+            if ($gw === 'sibilpay' && !in_array($op, ['', 'toggle', 'key', 'endpoint', 'min', 'max', 'cashback'], true)) { screen_pay_gateway($chatId, $messageId, $gw); return; }
             if ($op === 'toggle' && isset(PAY_GATEWAYS[$gw])) {
                 set_put('pay_' . $gw . '_on', set_get('pay_' . $gw . '_on', '1') === '1' ? '0' : '1');
                 screen_pay_gateway($chatId, $messageId, $gw);
@@ -1199,7 +1204,7 @@ function handle_callback_inner(array $cb): void
                      [btn('« ' . PAY_GATEWAYS[$gw]['label'], 'ad:pay:' . $gw, null, 'danger')]]);
                 return;
             }
-            if ($op === 'endpoint' && $gw !== 'iranpay4') {
+            if ($op === 'endpoint' && !in_array($gw, ['iranpay4','sibilpay'], true)) {
                 Tg::answer($cbId, 'آدرس سرویس فقط برای ابان‌پی قابل تنظیم است.', true);
                 screen_pay_gateway($chatId, $messageId, $gw);
                 return;
@@ -1227,7 +1232,7 @@ function handle_callback_inner(array $cb): void
                            'max' => 'حداکثر مبلغ برای این درگاه (تومان)',
                            'daily' => 'سقف مجموع تراکنش‌های تأییدشدهٔ امروز (تومان؛ 0 = بدون سقف)',
                            'minfiat' => 'حداقل تراکنش این درگاه (دلار، 0 = خودکار از خود درگاه)',
-                           'endpoint' => 'آدرس HTTPS سرویس AbanPay (بدون /create؛ خالی = غیرفعال)',
+                           'endpoint' => $gw === 'sibilpay' ? 'آدرس HTTPS درگاه سیبیل پی همراه پورت، دقیقاً مطابق بخش درگاه‌ها و API' : 'آدرس HTTPS سرویس AbanPay (بدون /create؛ خالی = غیرفعال)',
                            'cashback' => 'درصد کش‌بک این درگاه (0 = بدون کش‌بک)',
                            'help' => 'راهنمای کوتاه مشتری پس از ساخت فاکتور (برای پاک‌کردن: -)'];
                 $current = match ($op) {
@@ -1237,7 +1242,7 @@ function handle_callback_inner(array $cb): void
                     'max' => (string) gw_max($gw),
                     'daily' => (string) gw_daily_limit($gw),
                     'minfiat' => (string) (int) set_get('pay_' . $gw . '_min_fiat', '0'),
-                    'endpoint' => set_get('pay_iranpay4_endpoint', ''),
+                    'endpoint' => set_get('pay_' . $gw . '_endpoint', ''),
                     'help' => gw_help($gw),
                     default => (string) gw_cashback($gw),
                 };

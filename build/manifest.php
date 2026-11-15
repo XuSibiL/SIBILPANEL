@@ -34,6 +34,7 @@ return [
     'cli/160-cli.php',
     'services/160-force-join.php',
     'services/170-gateways.php',
+    'services/171-sibilpay.php',
     'web/180-web.php',
     'screens/190-pay-admin.php',
     'screens/200-roles.php',

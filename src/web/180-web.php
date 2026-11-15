@@ -191,6 +191,14 @@ function web_handle(): void
      * پرسیده می‌شود و فقط جواب مثبتِ آن، سفارش را تحویل می‌دهد.
      */
 
+    if ($gw === 'sibilpay' || $gw === 'sibilpay/webhook') {
+        $fields=web_callback_fields($input);
+        pay_sibil_hint(web_callback_value($fields,['order_id','order']));
+        if ($method === 'POST') web_json(200,['ok'=>true]);
+        else web_html(pay_result_page('waiting'));
+        return;
+    }
+
     /* وبهوک واریزا */
     if ($gw === 'variza/webhook') {
         $result = pay_variza_webhook($input['json'], $input['raw'],
