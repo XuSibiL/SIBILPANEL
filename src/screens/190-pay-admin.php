@@ -324,6 +324,7 @@ function screen_sibilpay_gateway(int|string $chat, ?int $messageId): void
         .'حداقل واریز: '.money(gw_min('sibilpay'))."\n"
         .'حداکثر واریز: '.money(gw_max('sibilpay'))."\n"
         .'کش‌بک: '.fa_digits(gw_cashback('sibilpay'))."٪\n";
+    $text.='وبهوک: '.e(pay_sibil_hook_status_text())."\n";
     if (!$ready&&$on) $text.='نیازمندی: '.e(implode('، ',$missing))."\n";
     $text.="\n<b>آموزش دریافت درگاه</b>\n"
         ."ربات @sibilpay را استارت کنید و درخواست فروشگاه بدهید. پس از تأیید، وارد بخش «درگاه‌ها و API» شوید؛ آدرس درگاه و کلید API خود را دریافت کرده و اینجا وارد کنید.";

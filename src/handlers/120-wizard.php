@@ -450,6 +450,7 @@ function wiz_finish(int $uid, array $data): void
                 default => 'pay_' . $gw . '_' . $field,
             };
             set_put($settingKey, $value);
+            if ($gw === 'sibilpay' && in_array($field,['endpoint','key'],true)) set_put('pay_sibilpay_hook_next','0');
             if ($field === 'minfiat') {
                 set_put('pay_' . $gw . '_min_cache', '0');
                 set_put('pay_' . $gw . '_min_at', '0');

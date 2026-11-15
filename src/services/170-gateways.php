@@ -2902,6 +2902,7 @@ function payments_poll(): int
        signed-webhook-only, and Stars is Telegram-authoritative, so none is
        guessed or polled with invented endpoints. */
     $settled = payments_recover_paid_topups();
+    foreach(DB::all('SELECT payment_id FROM sibilpay_hook_wakes WHERE due_at<=? ORDER BY due_at LIMIT 5',[now_ts()]) as $wake) pay_sibil_hook_work((int)$wake['payment_id']);
     $settled += pay_sibil_poll();
     $pollable = ['zarinpal', 'aqayepardakht', 'iranpay4', 'tetrapay', 'nowpayment', 'plisio', 'trx'];
     foreach ($pollable as $method) {

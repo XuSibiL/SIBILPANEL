@@ -399,7 +399,12 @@ function cli_main(array $argv): int
             $expired = payments_expire(set_int('pay_expire_minutes', 30));
             echo json_encode(['settled' => $settled, 'expired' => $expired]) . "\n";
             return 0;
+        case '--sibilpay-hook':
+            pay_sibil_hook_work((int)($argv[2] ?? 0));
+            return 0;
         case '--sibilpay-worker':
+            pay_sibil_hook_sync();
+            foreach(DB::all('SELECT payment_id FROM sibilpay_hook_wakes WHERE due_at<=? ORDER BY due_at LIMIT 5',[now_ts()]) as $wake) pay_sibil_hook_work((int)$wake['payment_id']);
             pay_sibil_poll();
             return 0;
         case '--wallet-worker':

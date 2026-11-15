@@ -12,6 +12,7 @@ function pay_sibil_schema(): void
         payment_url TEXT NOT NULL DEFAULT '', expires_at INTEGER NOT NULL DEFAULT 0,
         next_check INTEGER NOT NULL DEFAULT 0, last_hint INTEGER NOT NULL DEFAULT 0, last_error TEXT NOT NULL DEFAULT '');
         CREATE INDEX IF NOT EXISTS sibilpay_due ON sibilpay_invoices(state,next_check);");
+    pay_sibil_hook_schema();
     static $registered = false;
     if (!$registered && !in_array('--sibilpay-worker', $GLOBALS['argv'] ?? [], true)) {
         $registered = true;
@@ -139,7 +140,11 @@ function pay_sibil_process(array $payment,bool $forceCheck=false): array
     return pay_sibil_guard('order-'.(int)$payment['order_id'],static function()use($payment,$forceCheck):array {
         $id=(int)$payment['id'];$fresh=pay_get($id);
         if (!$fresh||$fresh['method']!=='sibilpay') return ['ok'=>false,'state'=>'notfound'];
-        if ($fresh['status']==='paid') return pay_settle($id);
+        if ($fresh['status']==='paid') {
+            $done=pay_settle($id);
+            DB::exec('UPDATE sibilpay_invoices SET state=? WHERE payment_id=?',[!empty($done['ok'])?'done':'paid',$id]);
+            return $done;
+        }
         $s=DB::one('SELECT * FROM sibilpay_invoices WHERE payment_id=?',[$id]);
         if (!$s||in_array($s['state'],['rejected','done','late'],true)) return ['ok'=>false,'state'=>'closed'];
         if (!$forceCheck&&(int)$s['next_check']>now_ts()) return ['ok'=>false,'state'=>'waiting'];
@@ -217,7 +222,7 @@ function pay_sibil_start(array $order): array
 function pay_sibil_hint(string $ref): void
 {
     if (!preg_match('/^sp-[a-f0-9]{32}$/D',$ref)) return;
-    DB::update("UPDATE sibilpay_invoices SET next_check=MIN(next_check,?),last_hint=? WHERE order_ref=? AND last_hint<=? AND state IN ('creating','unknown','pending','closed')",[now_ts(),now_ts(),$ref,now_ts()-30]);
+    pay_sibil_hook_enqueue($ref);
 }
 function pay_sibil_poll(): int
 {
@@ -233,11 +238,12 @@ function pay_sibil_poll(): int
 }
 function pay_sibil_kick(): void
 {
-    if (Tg::$dry||!function_exists('shell_exec')||in_array('--sibilpay-worker',$GLOBALS['argv']??[],true)) return;
+    if (Tg::$dry||!function_exists('shell_exec')||in_array('--sibilpay-worker',$GLOBALS['argv']??[],true)||in_array('--sibilpay-hook',$GLOBALS['argv']??[],true)) return;
     static $last=0;if ($last===time()) return;$last=time();
     try {
-        if (!DB::val("SELECT 1 FROM sibilpay_invoices WHERE next_check<=? AND state IN ('creating','unknown','pending','closed') LIMIT 1",[now_ts()])) return;
-        $script=realpath(__FILE__);if (!$script||!is_file(PHP_BINARY)) return;
-        @shell_exec('PANEL_HOME='.escapeshellarg(panel_home()).' PANEL_ENV='.escapeshellarg(env_file_path()).' nohup '.escapeshellarg(PHP_BINARY).' '.escapeshellarg($script).' --sibilpay-worker >/dev/null 2>&1 &');
-    }catch(Throwable $e){/* Main poll sweep remains the durable fallback. */}
+        // Priority jobs do not wait behind another provider's or another order's poll backlog.
+        foreach(DB::all('SELECT payment_id FROM sibilpay_hook_wakes WHERE due_at<=? ORDER BY due_at LIMIT 5',[now_ts()])as$wake)
+            pay_sibil_spawn('--sibilpay-hook '.(int)$wake['payment_id']);
+        if(pay_sibil_hook_due()||DB::val("SELECT 1 FROM sibilpay_invoices WHERE next_check<=? AND state IN ('creating','unknown','pending','closed') LIMIT 1",[now_ts()]))pay_sibil_spawn('--sibilpay-worker');
+    }catch(Throwable $e){/* Existing normal poll remains the durable fallback. */}
 }
