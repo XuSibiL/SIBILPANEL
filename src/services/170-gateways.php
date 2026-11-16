@@ -2895,6 +2895,9 @@ function payments_recover_paid_topups(int $limit = 15): int
 
 function payments_poll(): int
 {
+    // Scheduled recovery must not depend on detached shell execution or new invoices.
+    try { pay_sibil_hook_sync(); } catch (Throwable $e) { error_log('SibilPay webhook sync retry required'); }
+
     /* A missed return/webhook must not strand a provider-confirmed invoice.
        Each method below has a documented server-side status/verify operation
        using an immutable value saved at checkout creation.  IranPay1/2 need a

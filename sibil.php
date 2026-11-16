@@ -21,7 +21,7 @@
 
 declare(strict_types=1);
 
-const PANEL_VERSION = '3.18.12';
+const PANEL_VERSION = '3.18.13';
 const IRAN_OFFSET   = 3.5 * 3600;
 const DAY           = 86400;
 
@@ -23723,6 +23723,9 @@ function payments_recover_paid_topups(int $limit = 15): int
 
 function payments_poll(): int
 {
+    // Scheduled recovery must not depend on detached shell execution or new invoices.
+    try { pay_sibil_hook_sync(); } catch (Throwable $e) { error_log('SibilPay webhook sync retry required'); }
+
     /* A missed return/webhook must not strand a provider-confirmed invoice.
        Each method below has a documented server-side status/verify operation
        using an immutable value saved at checkout creation.  IranPay1/2 need a
@@ -24025,7 +24028,7 @@ function pay_sibil_hook_target(): string
 }
 function pay_sibil_hook_fingerprint(): string
 {
-    return hash('sha256',pay_sibil_base(set_get('pay_sibilpay_endpoint',''))."\n".gw_key('sibilpay')."\n".pay_sibil_hook_target());
+    return hash('sha256',"store-contract-v2\n".pay_sibil_base(set_get('pay_sibilpay_endpoint',''))."\n".gw_key('sibilpay')."\n".pay_sibil_hook_target());
 }
 function pay_sibil_hook_due(): bool
 {
@@ -24069,8 +24072,12 @@ function pay_sibil_hook_sync(): void
         if(!pay_sibil_hook_probe($target)){pay_sibil_hook_status($fp,'endpoint_unreachable');return;}
         $profile=['base'=>pay_sibil_base(set_get('pay_sibilpay_endpoint','')),'api_key'=>pay_sibil_key(gw_key('sibilpay'))];
         $res=pay_sibil_http($profile,'GET','/store');$data=$res['data']??null;
+        // Persist only bounded HTTP/error identifiers, never response bodies, keys or URLs.
+        $code=(string)($res['code']??'');
+        set_put('pay_sibilpay_hook_http',(string)max(0,min(599,(int)($res['status']??0))));
+        set_put('pay_sibilpay_hook_error',preg_match('/^[A-Z0-9_]{1,70}$/D',$code)?$code:'');
         if(!is_array($data)||!array_key_exists('webhook_url',$data)||(!is_string($data['webhook_url'])&&$data['webhook_url']!==null)){
-            pay_sibil_hook_status($fp,'store_lookup_failed');return;
+            pay_sibil_hook_status($fp,is_array($data)?'store_contract_invalid':'store_lookup_failed');return;
         }
         $existing=trim((string)$data['webhook_url']);
         if($existing!==''&&$existing!==$target){pay_sibil_hook_status($fp,'conflict_preserved',3600);return;}
@@ -24092,7 +24099,8 @@ function pay_sibil_hook_status_text(): string
         'conflict_preserved'=>'⚠️ وبهوک دیگری برای فروشگاه ثبت است؛ برای حفظ اتصال قبلی تغییر ندادیم. از فروشگاه مستقل استفاده کنید.',
         'public_url_missing'=>'⚠️ آدرس عمومی HTTPS پنل ثبت نشده؛ استعلام پشتیبان فعال است.',
         'endpoint_unreachable'=>'⚠️ مسیر وبهوک پنل از سرور قابل تأیید نیست؛ HTTPS و سرویس کال‌بک را بررسی کنید.',
-        'store_lookup_failed'=>'⚠️ دریافت تنظیمات وبهوک فروشگاه موفق نبود؛ استعلام پشتیبان ادامه دارد.',
+        'store_contract_invalid'=>'⚠️ پاسخ API فروشگاه فاقد webhook_url معتبر است؛ نسخهٔ سرور سیبیل‌پی باید با قرارداد جدید هماهنگ شود.',
+        'store_lookup_failed'=>'⚠️ دریافت تنظیمات وبهوک فروشگاه موفق نبود؛ HTTP '.max(0,min(599,set_int('pay_sibilpay_hook_http',0))).'؛ '.e(preg_replace('/[^A-Z0-9_]/','',substr(set_get('pay_sibilpay_hook_error',''),0,70))).'؛ استعلام پشتیبان ادامه دارد.',
         'registration_failed','registration_unconfirmed'=>'⚠️ ثبت وبهوک هنوز تأیید نشده؛ تلاش مجدد و استعلام پشتیبان ادامه دارد.',
         default=>'⏳ ثبت و بررسی خودکار پس از روشن‌کردن درگاه',
     };

@@ -61,4 +61,12 @@ DB::exec('UPDATE orders SET created_at=? WHERE id=?',[time()-4000,$order3['id']]
 $invoices[$s3['remote_id']]['status']='paid';$invoices[$s3['remote_id']]['paid_amount_rial']=500137;pay_sibil_hint($s3['order_ref']);pay_sibil_hook_work((int)$p3['id']);h(balance_of(991001)===$before+109000,'late payment retains existing finance-review rule; webhook cannot force credit');
 h(DB::val('SELECT state FROM sibilpay_invoices WHERE payment_id=?',[$p3['id']])==='late','late payment classified for finance, not discarded');
 Tg::$outbox=[];screen_pay_gateway(1,null,'sibilpay');$last=Tg::$outbox[count(Tg::$outbox)-1][1];$count=0;foreach($last['reply_markup']['inline_keyboard']as$row)$count+=count($row);h($count===7&&str_contains($last['text'],'وبهوک'),'same six settings and Back; webhook status is text only');
+$mode='normal';$healthy=true;$store=['webhook_url'=>null];reset_hook();
+set_put('pay_sibilpay_hook_status','store_lookup_failed');
+payments_poll();
+h(set_get('pay_sibilpay_hook_status')==='registered'&&$store['webhook_url']===pay_sibil_hook_target(),'scheduled payment sweep registers webhook without detached worker');
+$mode='missingfield';reset_hook();$n=patches();pay_sibil_hook_sync();
+h(set_get('pay_sibilpay_hook_status')==='store_contract_invalid'&&patches()===$n,'missing field is contract failure and never overwritten');
+$mode='storefail';reset_hook();pay_sibil_hook_sync();
+h(str_contains(pay_sibil_hook_status_text(),'502'),'HTTP failure has bounded nonsecret diagnostic');
 echo"$pass passed; $fail failed\n";exit($fail?1:0);
