@@ -105,7 +105,7 @@ function pay_sibil_http(array $profile,string $method,string $path,?array $body=
 function pay_sibil_error(string $code): string
 {
     return match ($code) {
-        'WALLET_INSUFFICIENT'=>'اعتبار کیف کارمزد فروشگاه کافی نیست؛ لطفاً روش دیگری انتخاب کنید یا به پشتیبانی اطلاع دهید.',
+        'WALLET_INSUFFICIENT'=>'درگاه موقتاً در دسترس نیست؛ کمی بعد تلاش کنید یا روش دیگری انتخاب کنید.',
         'INVALID_TOKEN','KEY_DISABLED','STORE_INACTIVE','STORE_BLOCKED','CONFIG_INVALID'=>'تنظیمات اتصال سیبیل پی نیاز به بررسی پشتیبانی دارد.',
         'NO_CARD_AVAILABLE','AMOUNT_POOL_EXHAUSTED','GATEWAY_DISABLED','UNKNOWN_GATEWAY'=>'درگاه فعلاً امکان ساخت فاکتور ندارد؛ کمی بعد یا با روش دیگری تلاش کنید.',
         'INVALID_AMOUNT','TOPUP_TOO_SMALL','VALIDATION_ERROR'=>'درگاه مبلغ یا اطلاعات درخواست را نپذیرفت؛ با پشتیبانی هماهنگ کنید.',

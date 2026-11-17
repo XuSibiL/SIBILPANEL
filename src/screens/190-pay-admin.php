@@ -319,16 +319,15 @@ function screen_sibilpay_gateway(int|string $chat, ?int $messageId): void
     [$ready,$missing]=gw_readiness('sibilpay');$on=gw_on('sibilpay');
     $text="💳 <b>سیبیل پی (کارت به کارت آنی)</b>\n\n"
         .'وضعیت: '.($on?'🟢 روشن':'🔴 خاموش')."\n"
-        .'آدرس درگاه: <code>'.e(pay_sibil_storefront()?:'هنوز دریافت نشده؛ لینک اختصاصی /g/... را وارد کنید')."</code>\n"
-         .'آدرس API (اتصال سرور): <code>'.e(pay_sibil_base(set_get('pay_sibilpay_endpoint',''))?:'ثبت نشده')."</code>\n"
-        .'کلید API: '.(gw_key('sibilpay')!==''?'✅ ثبت شده (محرمانه)':'ثبت نشده')."\n"
+        .'آدرس درگاه: <code>'.e(pay_sibil_storefront()?:'ثبت نشده')."</code>\n"
+        .'کلید API: '.(gw_key('sibilpay')!==''?'✅ ثبت شده':'ثبت نشده')."\n"
         .'حداقل واریز: '.money(gw_min('sibilpay'))."\n"
         .'حداکثر واریز: '.money(gw_max('sibilpay'))."\n"
         .'کش‌بک: '.fa_digits(gw_cashback('sibilpay'))."٪\n";
     $text.='وبهوک: '.e(pay_sibil_hook_status_text())."\n";
     if (!$ready&&$on) $text.='نیازمندی: '.e(implode('، ',$missing))."\n";
-    $text.="\n<b>آموزش دریافت درگاه</b>\n"
-        ."ربات @sibilpay را استارت کنید و درخواست فروشگاه بدهید. پس از تأیید، وارد بخش «درگاه‌ها و API» شوید؛ لینک اختصاصی درگاه با شکل /g/شناسه‌فروشگاه را در «آدرس درگاه» و کلید را در «کلید API» وارد کنید. آدرس API برای اتصال سرور است؛ لینک پرداخت مشتری همان payment_url هر فاکتور است، نه /api/v1. تنظیمات قبلی معتبر حفظ می‌شوند.";
+    $text.="\n<b>راهنمای اتصال</b>\n"
+        ."در ربات @sibilpay فروشگاه بسازید. سپس آدرس درگاه و کلید API را اینجا ثبت کنید؛ وبهوک خودکار وصل می‌شود.";
     Tg::show($chat,$messageId,$text,[
         [btn($on?'🔴 خاموش کنید':'🟢 روشن کنید','ad:pay:sibilpay:toggle')],
         [btn('🌐 آدرس درگاه','ad:pay:sibilpay:endpoint'),btn('🔑 کلید API','ad:pay:sibilpay:key')],

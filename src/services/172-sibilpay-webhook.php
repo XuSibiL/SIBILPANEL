@@ -64,7 +64,8 @@ function pay_sibil_hook_sync(): void
         $fp=pay_sibil_hook_fingerprint();$target=pay_sibil_hook_target();
         pay_sibil_hook_status($fp,'checking',60);
         if($target===''){pay_sibil_hook_status($fp,'public_url_missing');return;}
-        if(!pay_sibil_hook_probe($target)){pay_sibil_hook_status($fp,'endpoint_unreachable');return;}
+        // Do not require this host to reach its own public URL (hairpin/DNS).
+        // Provider test delivery + authenticated polling remain authoritative.
         $profile=['base'=>pay_sibil_base(set_get('pay_sibilpay_endpoint','')),'api_key'=>pay_sibil_key(gw_key('sibilpay'))];
         $request=static function(string $method,string $path,?array $body=null)use($profile):array{
             $res=pay_sibil_http($profile,$method,$path,$body);
@@ -107,7 +108,10 @@ function pay_sibil_hook_sync(): void
             try{if($fp===pay_sibil_hook_fingerprint())pay_sibil_cache_storefront($request('GET','/store'));}catch(Throwable $ignored){}
             if($fresh){try{$request('POST','/hooks/self/test',['id'=>$id]);}catch(Throwable $ignored){}}
         }catch(Throwable $e){
-            DB::exec("UPDATE sibilpay_hook_endpoints SET state='error' WHERE scope=?",[$fp]);
+            // Preserve last confirmed explicit endpoint during transient metadata failures.
+            // Never fall back to another integration's first/default endpoint.
+            if(in_array($e->getMessage(),['WEBHOOK_DISABLED','WEBHOOK_REGISTRATION_UNCONFIRMED','WEBHOOK_CONTRACT_MISMATCH','WEBHOOK_SECRET_MISSING','UNKNOWN_ENDPOINT'],true))
+                DB::exec("UPDATE sibilpay_hook_endpoints SET state='error' WHERE scope=?",[$fp]);
             $code=$e->getMessage();set_put('pay_sibilpay_hook_error',preg_match('/^[A-Z0-9_]{1,70}$/D',$code)?$code:'HOOK_API_FAILED');
             pay_sibil_hook_status($fp,'self_registration_failed',60);
         }
@@ -143,17 +147,17 @@ function pay_sibil_hook_receive(string $token,string $raw,string $signature,stri
 }
 function pay_sibil_hook_status_text(): string
 {
-    if(set_get('pay_sibilpay_hook_fingerprint','')!==pay_sibil_hook_fingerprint())return '⏳ پیکربندی جدید در انتظار بررسی و ثبت خودکار';
+    if(set_get('pay_sibilpay_hook_fingerprint','')!==pay_sibil_hook_fingerprint())return '⏳ در حال اتصال';
     return match(set_get('pay_sibilpay_hook_status','')){
-        'registered'=>'✅ مقصد مستقل و امضاشده ثبت و بازخوانی شده',
-        'self_registration_failed'=>'⚠️ ثبت مقصد نیازمند بررسی: '.e(set_get('pay_sibilpay_hook_error','HOOK_API_FAILED')).'؛ استعلام پرداخت‌های قبلی ادامه دارد',
-        'conflict_preserved'=>'⚠️ وبهوک دیگری برای فروشگاه ثبت است؛ برای حفظ اتصال قبلی تغییر ندادیم. از فروشگاه مستقل استفاده کنید.',
-        'public_url_missing'=>'⚠️ آدرس عمومی HTTPS پنل ثبت نشده؛ استعلام پشتیبان فعال است.',
-        'endpoint_unreachable'=>'⚠️ مسیر وبهوک پنل از سرور قابل تأیید نیست؛ HTTPS و سرویس کال‌بک را بررسی کنید.',
-        'store_contract_invalid'=>'⚠️ پاسخ API فروشگاه فاقد webhook_url معتبر است؛ نسخهٔ سرور سیبیل‌پی باید با قرارداد جدید هماهنگ شود.',
-        'store_lookup_failed'=>'⚠️ دریافت تنظیمات وبهوک فروشگاه موفق نبود؛ HTTP '.max(0,min(599,set_int('pay_sibilpay_hook_http',0))).'؛ '.e(preg_replace('/[^A-Z0-9_]/','',substr(set_get('pay_sibilpay_hook_error',''),0,70))).'؛ استعلام پشتیبان ادامه دارد.',
-        'registration_failed','registration_unconfirmed'=>'⚠️ ثبت وبهوک هنوز تأیید نشده؛ تلاش مجدد و استعلام پشتیبان ادامه دارد.',
-        default=>'⏳ ثبت و بررسی خودکار پس از روشن‌کردن درگاه',
+        'registered'=>'✅ ثبت شده',
+        'self_registration_failed'=>match(set_get('pay_sibilpay_hook_error','')){
+            'LIMIT_REACHED'=>'⚠️ ظرفیت وبهوک‌های این کلید پر است',
+            'INVALID_TOKEN','KEY_DISABLED'=>'⚠️ کلید API را بررسی کنید',
+            'CONCURRENT_UPDATE'=>'⏳ در حال تلاش مجدد',
+            default=>'⚠️ اتصال ناموفق؛ آدرس درگاه و API را بررسی کنید',
+        },
+        'public_url_missing'=>'⚠️ آدرس HTTPS پنل ثبت نشده',
+        default=>'⏳ در حال اتصال',
     };
 }
 function pay_sibil_hook_enqueue(string $ref): void

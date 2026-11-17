@@ -10,6 +10,7 @@ $healthy=true;$store=['webhook_url'=>null];$calls=[];$mode='normal';$invoices=[]
 $GLOBALS['sibilpay_hook_probe']=function($url)use(&$healthy){return $healthy;};
 require __DIR__.'/self_hook_fixture.php';
 $GLOBALS['sibilpay_transport']=function($profile,$method,$path,$body)use(&$store,&$calls,&$mode,&$invoices){
+ if($path==='/hooks/self'&&$method==='GET'&&$mode==='hooksfail')return ['status'=>503,'code'=>'HTTP_503'];
  if(str_starts_with($path,'/hooks/'))return test_self_hook($profile,$method,$path,$body);
  $calls[]=[$method,$path,$body];
  if($path==='/store'){
@@ -34,7 +35,7 @@ $ep=DB::one('SELECT * FROM sibilpay_hook_endpoints WHERE scope=?',[pay_sibil_hoo
 h(str_starts_with($ep['url'],pay_sibil_hook_target().'?hook=')&&strlen($ep['secret'])>16,'random-token URL and endpoint secret durably stored');
 $epCount=count($GLOBALS['self_hook_eps'][$ep['profile']]);reset_hook();pay_sibil_hook_sync();h(count($GLOBALS['self_hook_eps'][$ep['profile']])===$epCount&&empty($GLOBALS['self_hook_rotations']),'repeat registration neither duplicates nor rotates');
 h(patches()===0,'legacy store callback never patched');
-$healthy=false;reset_hook();pay_sibil_hook_sync();h(set_get('pay_sibilpay_hook_status')==='endpoint_unreachable','unreachable endpoint not registered');$healthy=true;reset_hook();pay_sibil_hook_sync();
+$healthy=false;reset_hook();pay_sibil_hook_sync();h(set_get('pay_sibilpay_hook_status')==='registered','failed self-probe does not block authenticated endpoint registration');$healthy=true;reset_hook();pay_sibil_hook_sync();
 $_SERVER=['REQUEST_URI'=>'/pay/sibilpay/webhook','REQUEST_METHOD'=>'GET'];$_GET=[];$_POST=[];ob_start();web_handle();$ready=json_decode(ob_get_clean(),true);h(($ready['ready']??false)&&($ready['service']??'')==='SIBILPANEL','public GET health is nonfinancial and directly discoverable');
 user_ensure(991001,'Hook','test');$order=create_order(991001,'topup',50000);$created=pay_start($order,'sibilpay');$p=pay_get((int)$created['payment']);$s=DB::one('SELECT * FROM sibilpay_invoices WHERE payment_id=?',[$p['id']]);
 $before=balance_of(991001);$n=count($calls);pay_sibil_hint($s['order_ref']);h(count($calls)===$n&&balance_of(991001)===$before,'webhook ingress performs no network request or financial mutation');
@@ -83,6 +84,11 @@ h(($GLOBALS['self_hook_rotations']??0)===1&&DB::val('SELECT secret FROM sibilpay
 foreach([0,1,5,9,10]as$gap)h(pay_sibil_paid_amount_ok(['status'=>'paid','amount_rial'=>300000,'payable_rial'=>300075,'paid_amount_rial'=>300075-$gap]),'documented suffix gap '.$gap.' accepted');
 h(!pay_sibil_paid_amount_ok(['status'=>'paid','amount_rial'=>300000,'payable_rial'=>300075,'paid_amount_rial'=>300064]),'11 rial gap refused');
 h(!pay_sibil_paid_amount_ok(['status'=>'paid','amount_rial'=>300075,'payable_rial'=>300075,'paid_amount_rial'=>300070]),'principal shortfall refused');
+$mode='hooksfail';reset_hook();pay_sibil_hook_sync();
+$existing=DB::one('SELECT * FROM sibilpay_hook_endpoints WHERE scope=?',[pay_sibil_hook_fingerprint()]);
+h($existing['state']==='ready'&&pay_sibil_hook_endpoint()===$existing['remote_id'],'transient metadata failure preserves confirmed explicit endpoint');
+$rr=pay_start(create_order(991001,'topup',35000),'sibilpay');h(!empty($rr['ok']),'temporary metadata outage does not block creation on known endpoint');
+$mode='normal';reset_hook();pay_sibil_hook_sync();
 $oldScope=pay_sibil_hook_fingerprint();set_put('pay_sibilpay_key','sibil_pay_live_LIMITKEY');$GLOBALS['self_hook_limit']=true;reset_hook();pay_sibil_hook_sync();
 h(set_get('pay_sibilpay_hook_error')==='LIMIT_REACHED'&&DB::val('SELECT state FROM sibilpay_hook_endpoints WHERE scope=?',[$oldScope])==='ready','limit reached preserves existing integration');
 $GLOBALS['self_hook_limit']=false;reset_hook();pay_sibil_hook_sync();
@@ -93,7 +99,7 @@ set_put('pay_sibilpay_endpoint','https://pay.example.test:2053/api/v1');
 pay_sibil_cache_storefront(['slug'=>'shop046806']);
 h(pay_sibil_storefront()==='https://pay.example.test:2053/g/shop046806','authenticated slug derives storefront preserving port');
 Tg::$outbox=[];screen_sibilpay_gateway(1,null);$text=Tg::$outbox[count(Tg::$outbox)-1][1]['text'];
-h(str_contains($text,'آدرس درگاه: <code>https://pay.example.test:2053/g/shop046806</code>')&&str_contains($text,'آدرس API (اتصال سرور):'),'storefront and API have distinct accurate labels');
+h(str_contains($text,'آدرس درگاه: <code>https://pay.example.test:2053/g/shop046806</code>')&&!str_contains($text,'آدرس API (اتصال سرور):')&&!str_contains($text,'payment_url')&&!str_contains($text,'/api/v1'),'concise admin screen shows storefront without internal API jargon');
 set_put('pay_sibilpay_key','sibil_pay_live_OTHER');
 h(pay_sibil_storefront()==='','changed merchant key hides stale storefront cache');
 set_put('pay_sibilpay_endpoint','https://pay.example.test:2053/g/manualshop');

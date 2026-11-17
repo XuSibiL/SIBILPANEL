@@ -75,7 +75,7 @@ $mode='generic404';pay_sibil_process($xp,true);oks(pay_get((int)$xp['id'])['stat
 $mode='auth';pay_sibil_process($xp,true);oks(pay_get((int)$xp['id'])['status']==='unpaid','revoked key never proves absence');
 $mode='normal';pay_sibil_process($xp,true);oks(pay_get((int)$xp['id'])['status']==='expire','only explicit INVOICE_NOT_FOUND releases unknown attempt');
 $retry=pay_start($ox,'sibilpay');oks($retry['ok']&&(int)$retry['payment']!==(int)$xp['id'],'confirmed absence allows fresh unique attempt for same order');
-$mode='wallet';$wo=so();$wr=pay_start($wo,'sibilpay');$wp=DB::one('SELECT * FROM payments WHERE order_id=?',[$wo['id']]);oks(!$wr['ok']&&$wp['status']==='expire'&&str_contains($wr['text'],'کارمزد'),'definitive wallet rejection is nonblocking and explained');
+$mode='wallet';$wo=so();$wr=pay_start($wo,'sibilpay');$wp=DB::one('SELECT * FROM payments WHERE order_id=?',[$wo['id']]);oks(!$wr['ok']&&$wp['status']==='expire'&&str_contains($wr['text'],'موقتاً')&&!str_contains($wr['text'],'کارمزد'),'definitive wallet rejection is nonblocking and explained');
 $mode='redirect';$ro=so();$rr=pay_start($ro,'sibilpay');oks(!$rr['ok']&&str_contains($rr['text'],'تغییر مسیر'),'HTTP 302 gives configuration guidance, never follows redirect');
 $mode='normal';$po=so();$pr=pay_start($po,'sibilpay');$pp=pay_get((int)$pr['payment']);
 set_put('pay_sibilpay_endpoint','https://other.example.com');set_put('pay_sibilpay_key','sibil_pay_live_OTHER');$before=count($calls);pay_sibil_process($pp,true);$profile=$calls[$before][0];oks($profile['base']==='https://pay.example.com:2053/api/v1'&&$profile['api_key']==='sibil_pay_live_TEST','site/key changes preserve original invoice connection');
