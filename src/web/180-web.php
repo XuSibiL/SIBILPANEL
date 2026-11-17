@@ -193,6 +193,12 @@ function web_handle(): void
 
     if ($gw === 'sibilpay' || $gw === 'sibilpay/webhook') {
         if ($gw === 'sibilpay/webhook' && $method === 'GET') { web_json(200,['service'=>'SIBILPANEL','webhook'=>'sibilpay','ready'=>true]); return; }
+        if($gw==='sibilpay/webhook'&&isset($input['get']['hook'])){
+            if($method!=='POST'){web_json(405,['ok'=>false]);return;}
+            try{$res=pay_sibil_hook_receive((string)$input['get']['hook'],(string)$input['raw'],web_header('X-SIBILPAY-Signature'),web_header('X-SIBILPAY-Delivery'),web_header('X-SIBILPAY-Event'));web_json($res['code'],['ok'=>$res['code']===200]);}
+            catch(Throwable $e){web_json(503,['ok'=>false]);}
+            return;
+        }
         $fields=web_callback_fields($input);
         pay_sibil_hint(web_callback_value($fields,['order_id','order']));
         if ($method === 'POST') web_json(200,['ok'=>true,'state'=>'queued_for_api_verification']);

@@ -273,7 +273,7 @@ function gw_readiness(string $gw): array
         $missing[] = 'آدرس HTTPS ابان‌پی ثبت نشده';
     }
     if ($gw === 'sibilpay') {
-        if (pay_sibil_base(set_get('pay_sibilpay_endpoint', '')) === '') $missing[] = 'آدرس HTTPS درگاه ثبت نشده';
+        if (pay_sibil_base(set_get('pay_sibilpay_endpoint', '')) === '') $missing[] = 'آدرس اتصال HTTPS سیبیل پی ثبت نشده';
         if (!preg_match('/^(sibil_pay_live_|sp_live_)[A-Za-z0-9_-]+$/D', pay_sibil_key(gw_key($gw)))) $missing[] = 'کلید live معتبر ثبت نشده';
     }
     if ($gw === 'variza' && gw_key2($gw) === '') {

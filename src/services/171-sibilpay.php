@@ -30,9 +30,30 @@ function pay_sibil_base(string $url): string
     if (!gw_https_url($url) || str_contains($url, '\\')) return '';
     $u = parse_url($url);
     if (isset($u['query']) || isset($u['fragment'])) return '';
+    if (!preg_match('~^(?:/api/v1|/g/[A-Za-z0-9_-]+)?$~D', (string)($u['path']??''))) return '';
     $url = (string)preg_replace('~/g/[A-Za-z0-9_-]+$~D', '', $url);
     $url = (string)preg_replace('~/api/v1$~D', '', $url);
     return $url . '/api/v1';
+}
+/** Public storefront and API endpoint are different addresses; never send the API base to customers. */
+function pay_sibil_address_scope(): string
+{
+    return hash('sha256',pay_sibil_base(set_get('pay_sibilpay_endpoint',''))."\n".gw_key('sibilpay'));
+}
+function pay_sibil_storefront(): string
+{
+    $raw=rtrim(trim(set_get('pay_sibilpay_endpoint','')),'/');
+    if(pay_sibil_base($raw)!==''&&preg_match('~/g/[A-Za-z0-9_-]+$~D',$raw))return $raw;
+    if(set_get('pay_sibilpay_storefront_scope','')!==pay_sibil_address_scope())return '';
+    $url=set_get('pay_sibilpay_storefront','');
+    return pay_sibil_base($url)===pay_sibil_base($raw)&&preg_match('~/g/[A-Za-z0-9_-]+$~D',$url)?$url:'';
+}
+function pay_sibil_cache_storefront(array $data): void
+{
+    $slug=$data['slug']??null;$base=pay_sibil_base(set_get('pay_sibilpay_endpoint',''));
+    if(!is_string($slug)||!preg_match('/^[A-Za-z0-9_-]{1,120}$/D',$slug)||$base==='')return;
+    set_put('pay_sibilpay_storefront',substr($base,0,-7).'/g/'.$slug);
+    set_put('pay_sibilpay_storefront_scope',pay_sibil_address_scope());
 }
 function pay_sibil_toman(int $rial): string
 {
@@ -161,14 +182,14 @@ function pay_sibil_process(array $payment,bool $forceCheck=false): array
         $d=$res['data'];
         if (!pay_sibil_adopt($fresh,$s,$d,$profile)) return ['ok'=>false,'state'=>'waiting'];
         if ($d['status']!=='paid') return ['ok'=>false,'state'=>'waiting'];
-        if (!is_int($d['paid_amount_rial']??null)||$d['paid_amount_rial']<$d['payable_rial']) {pay_sibil_log_error($id,'INVOICE_UNDERPAID');return ['ok'=>false,'state'=>'waiting'];}
+        if (!pay_sibil_paid_amount_ok($d)) {pay_sibil_log_error($id,'INVOICE_UNDERPAID');return ['ok'=>false,'state'=>'waiting'];}
         $verify=pay_sibil_http($profile,'POST','/invoices/'.rawurlencode($d['id']).'/verify',[]);
         $verified=($verify['data']['verified']??null)===true&&($verify['data']['invoice_id']??'')===$d['id'];
         if (!$verified&&($verify['status']??0)===409&&($verify['code']??'')==='INVOICE_ALREADY_VERIFIED') {
             $status=pay_sibil_http($profile,'GET','/invoices/'.rawurlencode($d['id']).'/status');$v=$status['data']??[];
             $verified=($v['id']??'')===$d['id']&&($v['status']??'')==='paid'&&($v['verified']??null)===true
                 &&($v['amount_rial']??null)===$d['amount_rial']&&($v['payable_rial']??null)===$d['payable_rial']
-                &&is_int($v['paid_amount_rial']??null)&&$v['paid_amount_rial']>=$d['payable_rial'];
+                &&pay_sibil_paid_amount_ok($v);
         }
         if (!$verified) {pay_sibil_log_error($id,(string)($verify['code']??'VERIFY_FAILED'));return ['ok'=>false,'state'=>'waiting'];}
         $result=pay_accept($fresh,(float)$fresh['amount'],$d['id'],['invoice_id'=>$d['id'],'verified'=>true]);
@@ -176,6 +197,12 @@ function pay_sibil_process(array $payment,bool $forceCheck=false): array
             ($result['state']??'')==='expired'?'late':(!empty($result['ok'])?'done':'paid'),now_ts()+60,$id]);
         return $result;
     },['ok'=>false,'state'=>'busy']);
+}
+/** Provider docs18: <=10 rial suffix rounding, never principal loss. */
+function pay_sibil_paid_amount_ok(array $d): bool
+{
+    if(($d['status']??'')!=='paid'||!is_int($d['amount_rial']??null)||!is_int($d['payable_rial']??null)||!is_int($d['paid_amount_rial']??null))return false;
+    return $d['amount_rial']>0&&$d['payable_rial']>=$d['amount_rial']&&$d['paid_amount_rial']>=$d['amount_rial']&&($d['paid_amount_rial']>=$d['payable_rial']||$d['payable_rial']-$d['paid_amount_rial']<=10);
 }
 function pay_sibil_start(array $order): array
 {
@@ -192,6 +219,8 @@ function pay_sibil_start(array $order): array
         if ((int)$order['payable']<1||(int)$order['payable']>intdiv(PHP_INT_MAX,10)) return ['ok'=>false,'url'=>'','text'=>'مبلغ معتبر نیست.'];
         $base=pay_sibil_base(set_get('pay_sibilpay_endpoint',''));$key=pay_sibil_key(gw_key('sibilpay'));
         if ($base===''||!preg_match('/^(sibil_pay_live_|sp_live_)[A-Za-z0-9_-]+$/D',$key)) return ['ok'=>false,'url'=>'','text'=>pay_sibil_error('CONFIG_INVALID')];
+        $hookEndpoint=pay_sibil_hook_endpoint();
+        if($hookEndpoint==='')return ['ok'=>false,'url'=>'','text'=>'درگاه موقتاً در دسترس نیست؛ کمی بعد تلاش کنید.'];
         $created=DB::tx(static function()use($order,$base,$key):array {
             $profile=hash('sha256',$base."\n".$key);
             DB::exec('INSERT OR IGNORE INTO sibilpay_connections(id,base,api_key,created_at) VALUES(?,?,?,?)',[$profile,$base,$key,now_ts()]);
@@ -201,7 +230,7 @@ function pay_sibil_start(array $order): array
             return [$p,$ref,$profile];
         });
         [$p,$ref,$profileId]=$created;$profile=['base'=>$base,'api_key'=>$key];
-        $body=['amount_rial'=>(int)$p['amount']*10,'order_id'=>$ref,'description'=>'SIBILPANEL '.$ref,'expiry_minutes'=>30];
+        $body=['webhook_endpoint'=>$hookEndpoint,'amount_rial'=>(int)$p['amount']*10,'order_id'=>$ref,'description'=>'SIBILPANEL '.$ref,'expiry_minutes'=>30];
         $callback=pay_callback_url('sibilpay');if (gw_https_url($callback)) $body['callback_url']=$callback.'?order='.rawurlencode($ref);
         $res=pay_sibil_http($profile,'POST','/invoices',$body);
         $s=DB::one('SELECT * FROM sibilpay_invoices WHERE payment_id=?',[(int)$p['id']]);

@@ -18,7 +18,11 @@ oks(pay_sibil_toman(500868)==='50,086.8','exact payable amount never rounded');
 set_put('pay_sibilpay_endpoint','https://pay.example.com:2053');set_put('pay_sibilpay_key','sibil_pay_live_TEST');set_put('pay_sibilpay_on','1');set_put('pay_sibilpay_cashback','7');
 [$ready]=gw_readiness('sibilpay');oks($ready,'site/key are sufficient; no webhook-secret configuration required');
 $invoices=[];$calls=[];$mode='normal';
+require __DIR__.'/self_hook_fixture.php';
+$GLOBALS['sibilpay_hook_probe']=fn()=>true;set_put('web_url','https://panel.example.test');
 $GLOBALS['sibilpay_transport']=function($profile,$method,$path,$body)use(&$invoices,&$calls,&$mode){
+    if(str_starts_with($path,'/hooks/'))return test_self_hook($profile,$method,$path,$body);
+    if($path==='/store')return ['status'=>200,'data'=>['slug'=>'testshop','webhook_url'=>'https://existing.example/hook']];
     $calls[]=[$profile,$method,$path,$body];
     if($method==='POST'&&$path==='/invoices'){
         if($mode==='timeout')return ['status'=>0,'code'=>'CONNECTION_FAILED'];

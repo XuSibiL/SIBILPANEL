@@ -1232,7 +1232,7 @@ function handle_callback_inner(array $cb): void
                            'max' => 'حداکثر مبلغ برای این درگاه (تومان)',
                            'daily' => 'سقف مجموع تراکنش‌های تأییدشدهٔ امروز (تومان؛ 0 = بدون سقف)',
                            'minfiat' => 'حداقل تراکنش این درگاه (دلار، 0 = خودکار از خود درگاه)',
-                           'endpoint' => $gw === 'sibilpay' ? 'آدرس HTTPS درگاه سیبیل پی همراه پورت، دقیقاً مطابق بخش درگاه‌ها و API' : 'آدرس HTTPS سرویس AbanPay (بدون /create؛ خالی = غیرفعال)',
+                           'endpoint' => $gw === 'sibilpay' ? 'لینک اختصاصی HTTPS درگاه با شکل https://SERVER/g/SHOP را بفرستید؛ نه لینک فاکتور /pay/... . آدرس API برای اتصال داخلی جدا نگهداری می‌شود (ورودی قدیمی /api/v1 نیز سازگار است).' : 'آدرس HTTPS سرویس AbanPay (بدون /create؛ خالی = غیرفعال)',
                            'cashback' => 'درصد کش‌بک این درگاه (0 = بدون کش‌بک)',
                            'help' => 'راهنمای کوتاه مشتری پس از ساخت فاکتور (برای پاک‌کردن: -)'];
                 $current = match ($op) {
@@ -1242,7 +1242,7 @@ function handle_callback_inner(array $cb): void
                     'max' => (string) gw_max($gw),
                     'daily' => (string) gw_daily_limit($gw),
                     'minfiat' => (string) (int) set_get('pay_' . $gw . '_min_fiat', '0'),
-                    'endpoint' => set_get('pay_' . $gw . '_endpoint', ''),
+                    'endpoint' => $gw === 'sibilpay' ? pay_sibil_storefront() : set_get('pay_' . $gw . '_endpoint', ''),
                     'help' => gw_help($gw),
                     default => (string) gw_cashback($gw),
                 };

@@ -414,6 +414,7 @@ function wiz_finish(int $uid, array $data): void
                 if (!admin_can($uid, 'full')) { Tg::send($uid,'⛔️ دسترسی تغییر درگاه ندارید.'); return; }
                 if (!in_array($field,['endpoint','key','min','max','cashback'],true)) { Tg::send($uid,'این تنظیم برای سیبیل پی وجود ندارد.'); return; }
                 if ($field === 'endpoint') {
+                    $sibilInput=rtrim($value,'/');
                     $value=pay_sibil_base($value);
                     if ($value==='') { Tg::send($uid,'آدرس HTTPS معتبر با پورت صحیح وارد کنید.'); return; }
                 }
@@ -450,7 +451,13 @@ function wiz_finish(int $uid, array $data): void
                 default => 'pay_' . $gw . '_' . $field,
             };
             set_put($settingKey, $value);
-            if ($gw === 'sibilpay' && in_array($field,['endpoint','key'],true)) set_put('pay_sibilpay_hook_next','0');
+            if ($gw === 'sibilpay' && in_array($field,['endpoint','key'],true)) {
+                if($field==='endpoint'&&preg_match('~/g/[A-Za-z0-9_-]+$~D',$sibilInput??'')) {
+                    set_put('pay_sibilpay_storefront',$sibilInput);
+                    set_put('pay_sibilpay_storefront_scope',pay_sibil_address_scope());
+                }
+                set_put('pay_sibilpay_hook_next','0');
+            }
             if ($field === 'minfiat') {
                 set_put('pay_' . $gw . '_min_cache', '0');
                 set_put('pay_' . $gw . '_min_at', '0');
