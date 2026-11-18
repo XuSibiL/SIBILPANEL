@@ -23,7 +23,7 @@ const PAY_GATEWAYS = [
                         'hint' => 'توکن Bearer از cubevps.ir (همان کلید، امضای کال‌بک را می‌سازد).'],
     'iranpay4'      => ['label' => 'AbanPay', 'emoji' => '🟠', 'type' => 'online',
                         'hint' => 'کلید ارتباطی (API key) به همراه آدرس سرویس درگاه (https).'],
-    'sibilpay'      => ['label' => 'سیبیل پی (کارت به کارت آنی)', 'emoji' => '💳', 'type' => 'online',
+    'sibilpay'      => ['label' => 'سیبیل پی (آنی:ریالی-ارزی)', 'emoji' => '💳', 'type' => 'online',
                         'hint' => 'آدرس درگاه و کلید API فروشگاه از @sibilpay.'],
     'tetrapay'      => ['label' => 'تتراپی', 'emoji' => '🔷', 'type' => 'online',
                         'hint' => 'فقط کلید API تتراپی؛ مبلغ‌ها خودکار از تومان به ریال تبدیل می‌شوند.'],

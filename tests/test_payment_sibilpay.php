@@ -28,7 +28,7 @@ $GLOBALS['sibilpay_transport']=function($profile,$method,$path,$body)use(&$invoi
         if($mode==='timeout')return ['status'=>0,'code'=>'CONNECTION_FAILED'];
         if($mode==='redirect')return ['status'=>302,'code'=>'HTTP_302'];
         if($mode==='wallet')return ['status'=>402,'code'=>'WALLET_INSUFFICIENT','definite'=>true];
-        $id='inv_'.bin2hex(random_bytes(6));$d=['id'=>$id,'order_id'=>$body['order_id'],'amount_rial'=>$body['amount_rial'],'payable_rial'=>$body['amount_rial']+137,'status'=>'pending','test_mode'=>false,'payment_url'=>'https://pay.example.com:2053/pay/'.$id,'expires_at'=>date(DATE_ATOM,time()+1800),'paid_amount_rial'=>0];
+        $id='inv_'.bin2hex(random_bytes(6));$d=['id'=>$id,'order_id'=>$body['order_id'],'amount_rial'=>$body['amount_rial'],'payable_rial'=>$body['amount_rial']+($GLOBALS['responseGap']??137),'status'=>'pending','test_mode'=>false,'payment_url'=>'https://pay.example.com:2053/pay/'.$id,'expires_at'=>(!empty($GLOBALS['responseNaive'])?gmdate('Y-m-d\TH:i:s',time()+1800).'.901362':date(DATE_ATOM,time()+1800)),'paid_amount_rial'=>0];
         $invoices[$id]=$d;return ['status'=>201,'data'=>$d];
     }
     if(str_contains($path,'/by-order/')){
@@ -86,5 +86,20 @@ oks(str_contains($msg['text'],'@sibilpay')&&!str_contains($msg['text'],'sibil_pa
 wiz_finish(1,['flow'=>'gwfield','ctx'=>['gw'=>'sibilpay','field'=>'cashback'],'values'=>['value'=>'101']]);oks(gw_cashback('sibilpay')===7,'cashback above 100 rejected');
 set_put('pay_sibilpay_on','0');wiz_finish(1,['flow'=>'gwfield','ctx'=>['gw'=>'sibilpay','field'=>'key'],'values'=>['value'=>" sibil_pay_live_NEW\nKEY "]]);oks(!gw_on('sibilpay')&&gw_key('sibilpay')==='sibil_pay_live_NEWKEY','saving key normalizes formatting but does not auto-enable gateway');
 $old=gw_key('sibilpay');wiz_finish(901001,['flow'=>'gwfield','ctx'=>['gw'=>'sibilpay','field'=>'key'],'values'=>['value'=>'sibil_pay_live_FORGED']]);oks(gw_key('sibilpay')===$old,'revoked/unprivileged wizard cannot change secret');
-oks(in_array('sibilpay',mirza_payment_gateway_order(),true)&&mirza_payment_button_label('sibilpay')==='💳 سیبیل پی (کارت به کارت آنی)','buyer gateway selector includes exact requested label');
+oks(in_array('sibilpay',mirza_payment_gateway_order(),true)&&mirza_payment_button_label('sibilpay')==='💳 سیبیل پی (آنی:ریالی-ارزی)','buyer gateway selector includes exact requested label');
+$oldTz=date_default_timezone_get();date_default_timezone_set('Asia/Tehran');
+oks(pay_sibil_api_timestamp('2026-11-18T19:02:27.901362')===pay_sibil_api_timestamp('2026-11-18T19:02:27.901362Z'),'naive API time is UTC independent of bot timezone');
+oks(pay_sibil_api_timestamp('2026-11-18T22:32:27.901362+03:30')===pay_sibil_api_timestamp('2026-11-18T19:02:27.901362Z'),'explicit API offset honored');
+oks(pay_sibil_api_timestamp('2026-02-30T12:00:00')===false&&pay_sibil_api_timestamp('tomorrow')===false,'invalid API dates rejected');
+set_put('pay_sibilpay_on','1');set_put('pay_sibilpay_key','sibil_pay_live_TEST');$mode='normal';$GLOBALS['responseNaive']=true;
+foreach([1441,6214,7067,12000]as$gap){$GLOBALS['responseGap']=$gap;$new=pay_start(so(),'sibilpay');$np=pay_get((int)$new['payment']);$ns=DB::one('SELECT * FROM sibilpay_invoices WHERE payment_id=?',[$np['id']]);oks(!empty($new['ok'])&&(int)$ns['payable_rial']===500000+$gap&&$ns['expires_at']>now_ts(),'checkout accepts authoritative suffix '.$gap.' and UTC-naive expiry');}
+$bal=balance_of(901001);$invoices[$ns['remote_id']]['status']='paid';$invoices[$ns['remote_id']]['paid_amount_rial']=$invoices[$ns['remote_id']]['payable_rial'];pay_sibil_process($np,true);pay_sibil_process($np,true);
+oks(balance_of(901001)===$bal+53500,'large suffix settlement credits only principal plus configured cashback once');
+$mode='timeout';$recoverOrder=so();pay_start($recoverOrder,'sibilpay');$rp=DB::one('SELECT * FROM payments WHERE order_id=?',[$recoverOrder['id']]);$rs=DB::one('SELECT * FROM sibilpay_invoices WHERE payment_id=?',[$rp['id']]);
+$d=$real;$d['id']='inv_new_recover_naive';$d['order_id']=$rs['order_ref'];$d['payable_rial']=506214;$d['expires_at']=gmdate('Y-m-d\TH:i:s',time()+1800).'.901362';$d['payment_url']='https://pay.example.com:2053/pay/'.$d['id'];$invoices[$d['id']]=$d;
+$mode='normal';pay_sibil_process($rp,true);$rs=DB::one('SELECT * FROM sibilpay_invoices WHERE payment_id=?',[$rp['id']]);oks($rs['state']==='pending'&&(int)$rs['payable_rial']===506214&&$rs['expires_at']>now_ts(),'old unknown creation recovers via GET by-order with larger suffix and correct UTC expiry');
+$invoices[$d['id']]['expires_at']=gmdate('Y-m-d\TH:i:s',time()-60).'.901362';DB::exec('UPDATE sibilpay_invoices SET next_check=0 WHERE payment_id=?',[$rp['id']]);
+$countPosts=count(array_filter($calls,fn($c)=>$c[1]==='POST'&&$c[2]==='/invoices'));$expiredRetry=pay_start($recoverOrder,'sibilpay');
+oks(empty($expiredRetry['url'])&&count(array_filter($calls,fn($c)=>$c[1]==='POST'&&$c[2]==='/invoices'))===$countPosts,'expired recovered link is not returned or blindly recreated');
+date_default_timezone_set($oldTz);
 echo "$pass passed; $fail failed\n";exit($fail?1:0);

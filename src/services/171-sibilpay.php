@@ -123,13 +123,26 @@ function pay_sibil_log_error(int $id,string $code): void
     DB::exec('UPDATE sibilpay_invoices SET last_error=?,next_check=? WHERE payment_id=?',[substr($code,0,70),now_ts()+60,$id]);
     log_payment('SibilPay request failed',['payment'=>$id,'code'=>substr($code,0,70)]);
 }
+/** API timestamps without an offset are UTC, NOT the bot's local timezone.
+ * Offset-bearing ISO timestamps retain their explicit timezone.
+ */
+function pay_sibil_api_timestamp(string $value): int|false {
+    if(!preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:?\d{2})?$/D',$value))return false;
+    try{
+        $d=new DateTimeImmutable($value,new DateTimeZone('UTC'));
+        $errors=DateTimeImmutable::getLastErrors();
+        if(is_array($errors)&&($errors['warning_count']||$errors['error_count']))return false;
+        return $d->getTimestamp();
+    }catch(Throwable $e){return false;}
+}
+
 function pay_sibil_adopt(array $payment,array $s,array $d,array $profile): bool
 {
     $url=(string)($d['payment_url']??'');$u=parse_url($url);$o=parse_url($profile['base']);$rial=(int)$payment['amount']*10;
-    $exp=strtotime((string)($d['expires_at']??''));
+    $exp=pay_sibil_api_timestamp((string)($d['expires_at']??''));
     if (!is_string($d['id']??null)||!preg_match('/^[A-Za-z0-9_-]{4,120}$/D',$d['id'])
         ||($d['order_id']??null)!==$s['order_ref']||($d['amount_rial']??null)!==$rial
-        ||!is_int($d['payable_rial']??null)||$d['payable_rial']<$rial||$d['payable_rial']>$rial+999
+        ||!is_int($d['payable_rial']??null)||$d['payable_rial']<$rial
         ||($d['test_mode']??null)!==false||!in_array($d['status']??'', ['pending','partially_paid','paid','expired','cancelled'],true)
         ||!gw_https_url($url)||str_contains($url,'\\')||isset($u['query'])||isset($u['fragment'])
         ||strtolower($u['host']??'')!==strtolower($o['host']??'')||!$exp||$exp>now_ts()+10900) {
@@ -213,7 +226,7 @@ function pay_sibil_start(array $order): array
             $row=DB::one('SELECT * FROM sibilpay_invoices WHERE payment_id=?',[(int)$row['payment_id']]);
             $p=pay_get((int)$row['payment_id']);
             if ($p['status']==='paid') return ['ok'=>true,'url'=>'','text'=>'پرداخت این سفارش تأیید شده است.'];
-            if ($row['state']==='pending'&&$row['payment_url']!=='') return ['ok'=>true,'url'=>$row['payment_url'],'text'=>'سیبیل پی (کارت به کارت آنی)','payment'=>(int)$p['id']];
+            if ($row['state']==='pending'&&$row['payment_url']!==''&&(int)$row['expires_at']>now_ts()) return ['ok'=>true,'url'=>$row['payment_url'],'text'=>'سیبیل پی (آنی:ریالی-ارزی)','payment'=>(int)$p['id']];
             if ($row['state']!=='rejected') return ['ok'=>false,'url'=>'','text'=>pay_sibil_error($row['last_error']).' کد پیگیری: '.$row['order_ref']];
         }
         if ((int)$order['payable']<1||(int)$order['payable']>intdiv(PHP_INT_MAX,10)) return ['ok'=>false,'url'=>'','text'=>'مبلغ معتبر نیست.'];
@@ -236,7 +249,7 @@ function pay_sibil_start(array $order): array
         $s=DB::one('SELECT * FROM sibilpay_invoices WHERE payment_id=?',[(int)$p['id']]);
         if (isset($res['data'])&&pay_sibil_adopt($p,$s,$res['data'],$profile)) {
             $s=DB::one('SELECT * FROM sibilpay_invoices WHERE payment_id=?',[(int)$p['id']]);
-            if ($res['data']['status']==='pending'&&$s['expires_at']>now_ts()) return ['ok'=>true,'url'=>$s['payment_url'],'text'=>'سیبیل پی (کارت به کارت آنی)','payment'=>(int)$p['id']];
+            if ($res['data']['status']==='pending'&&$s['expires_at']>now_ts()) return ['ok'=>true,'url'=>$s['payment_url'],'text'=>'سیبیل پی (آنی:ریالی-ارزی)','payment'=>(int)$p['id']];
             pay_sibil_process($p,true);
             return ['ok'=>false,'url'=>'','text'=>'وضعیت فاکتور در حال پیگیری است؛ برای همین سفارش دوباره پرداخت نکنید.'];
         }

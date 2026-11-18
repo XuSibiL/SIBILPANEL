@@ -317,7 +317,7 @@ function screen_pay_web(int|string $chat, ?int $messageId): void
 function screen_sibilpay_gateway(int|string $chat, ?int $messageId): void
 {
     [$ready,$missing]=gw_readiness('sibilpay');$on=gw_on('sibilpay');
-    $text="💳 <b>سیبیل پی (کارت به کارت آنی)</b>\n\n"
+    $text="💳 <b>سیبیل پی (آنی:ریالی-ارزی)</b>\n\n"
         .'وضعیت: '.($on?'🟢 روشن':'🔴 خاموش')."\n"
         .'آدرس درگاه: <code>'.e(pay_sibil_storefront()?:'ثبت نشده')."</code>\n"
         .'کلید API: '.(gw_key('sibilpay')!==''?'✅ ثبت شده':'ثبت نشده')."\n"
