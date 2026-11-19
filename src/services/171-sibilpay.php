@@ -105,6 +105,8 @@ function pay_sibil_http(array $profile,string $method,string $path,?array $body=
 function pay_sibil_error(string $code): string
 {
     return match ($code) {
+        'RATE_LIMIT_EXCEEDED'=>'تعداد درخواست‌ها زیاد است؛ یک دقیقه دیگر تلاش کنید.',
+        'INVALID_API_KEY'=>'تنظیمات اتصال درگاه نیازمند بررسی است.',
         'WALLET_INSUFFICIENT'=>'درگاه موقتاً در دسترس نیست؛ کمی بعد تلاش کنید یا روش دیگری انتخاب کنید.',
         'INVALID_TOKEN','KEY_DISABLED','STORE_INACTIVE','STORE_BLOCKED','CONFIG_INVALID'=>'تنظیمات اتصال سیبیل پی نیاز به بررسی پشتیبانی دارد.',
         'NO_CARD_AVAILABLE','AMOUNT_POOL_EXHAUSTED','GATEWAY_DISABLED','UNKNOWN_GATEWAY'=>'درگاه فعلاً امکان ساخت فاکتور ندارد؛ کمی بعد یا با روش دیگری تلاش کنید.',
@@ -136,8 +138,14 @@ function pay_sibil_api_timestamp(string $value): int|false {
     }catch(Throwable $e){return false;}
 }
 
+/** Keep the provider's canonical checkout URL; accept documented aliases only when absent. */
+function pay_sibil_invoice_aliases(array $d): array {
+    if(!isset($d['payment_url'])||$d['payment_url']==='')foreach(['pay_url','short_payment_url']as$k)if(is_string($d[$k]??null)&&$d[$k]!==''){$d['payment_url']=$d[$k];break;}
+    return $d;
+}
 function pay_sibil_adopt(array $payment,array $s,array $d,array $profile): bool
 {
+    $d=pay_sibil_invoice_aliases($d);
     $url=(string)($d['payment_url']??'');$u=parse_url($url);$o=parse_url($profile['base']);$rial=(int)$payment['amount']*10;
     $exp=pay_sibil_api_timestamp((string)($d['expires_at']??''));
     if (!is_string($d['id']??null)||!preg_match('/^[A-Za-z0-9_-]{4,120}$/D',$d['id'])
@@ -233,7 +241,7 @@ function pay_sibil_start(array $order): array
         $base=pay_sibil_base(set_get('pay_sibilpay_endpoint',''));$key=pay_sibil_key(gw_key('sibilpay'));
         if ($base===''||!preg_match('/^(sibil_pay_live_|sp_live_)[A-Za-z0-9_-]+$/D',$key)) return ['ok'=>false,'url'=>'','text'=>pay_sibil_error('CONFIG_INVALID')];
         $hookEndpoint=pay_sibil_hook_endpoint();
-        if($hookEndpoint==='')return ['ok'=>false,'url'=>'','text'=>'درگاه موقتاً در دسترس نیست؛ کمی بعد تلاش کنید.'];
+        if($hookEndpoint===null)return ['ok'=>false,'url'=>'','text'=>'درگاه موقتاً در دسترس نیست؛ کمی بعد تلاش کنید.'];
         $created=DB::tx(static function()use($order,$base,$key):array {
             $profile=hash('sha256',$base."\n".$key);
             DB::exec('INSERT OR IGNORE INTO sibilpay_connections(id,base,api_key,created_at) VALUES(?,?,?,?)',[$profile,$base,$key,now_ts()]);
@@ -243,9 +251,19 @@ function pay_sibil_start(array $order): array
             return [$p,$ref,$profile];
         });
         [$p,$ref,$profileId]=$created;$profile=['base'=>$base,'api_key'=>$key];
-        $body=['webhook_endpoint'=>$hookEndpoint,'amount_rial'=>(int)$p['amount']*10,'order_id'=>$ref,'description'=>'SIBILPANEL '.$ref,'expiry_minutes'=>30];
+        $body=['amount_rial'=>(int)$p['amount']*10,'order_id'=>$ref,'description'=>'SIBILPANEL '.$ref,'expiry_minutes'=>30];
         $callback=pay_callback_url('sibilpay');if (gw_https_url($callback)) $body['callback_url']=$callback.'?order='.rawurlencode($ref);
+        if($hookEndpoint!=='')$body['webhook_endpoint']=$hookEndpoint;
         $res=pay_sibil_http($profile,'POST','/invoices',$body);
+        if(is_array($res['data']??null)){
+            $d=pay_sibil_invoice_aliases($res['data']);$missing=false;
+            foreach(['id','order_id','status','amount_rial','payable_rial','test_mode','expires_at','payment_url']as$k)if(!array_key_exists($k,$d))$missing=true;
+            if($missing){
+                $get=pay_sibil_http($profile,'GET','/invoices/by-order/'.rawurlencode($ref));
+                if(is_array($get['data']??null)&&(!isset($d['id'])||($get['data']['id']??null)===$d['id']))$d=pay_sibil_invoice_aliases($get['data']);
+            }
+            $res['data']=$d;
+        }
         $s=DB::one('SELECT * FROM sibilpay_invoices WHERE payment_id=?',[(int)$p['id']]);
         if (isset($res['data'])&&pay_sibil_adopt($p,$s,$res['data'],$profile)) {
             $s=DB::one('SELECT * FROM sibilpay_invoices WHERE payment_id=?',[(int)$p['id']]);

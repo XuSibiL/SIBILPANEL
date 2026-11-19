@@ -75,8 +75,10 @@ function pay_sibil_hook_sync(): void
             }
             return $res['data'];
         };
+        $stage='discovery';
         try{
             $list=$request('GET','/hooks/self');
+            $stage='registration';
             if(!is_array($list['endpoints']??null)||!is_string($list['key']??null))throw new RuntimeException('WEBHOOK_CONTRACT_MISMATCH');
             if($fp!==pay_sibil_hook_fingerprint()||!gw_on('sibilpay'))return;
             $saved=DB::one('SELECT * FROM sibilpay_hook_endpoints WHERE scope=?',[$fp]);
@@ -108,6 +110,12 @@ function pay_sibil_hook_sync(): void
             try{if($fp===pay_sibil_hook_fingerprint())pay_sibil_cache_storefront($request('GET','/store'));}catch(Throwable $ignored){}
             if($fresh){try{$request('POST','/hooks/self/test',['id'=>$id]);}catch(Throwable $ignored){}}
         }catch(Throwable $e){
+            if($stage==='discovery'&&in_array($e->getMessage(),['NOT_FOUND','HTTP_404','HTTP_502','HTTP_503','HTTP_504','CONNECTION_FAILED'],true)){
+                try{
+                    $gateways=$request('GET','/gateways');
+                    if(array_is_list($gateways)&&count($gateways)>0){pay_sibil_hook_status($fp,'polling_only',60);return;}
+                }catch(Throwable $ignored){}
+            }
             // Preserve last confirmed explicit endpoint during transient metadata failures.
             // Never fall back to another integration's first/default endpoint.
             if(in_array($e->getMessage(),['WEBHOOK_DISABLED','WEBHOOK_REGISTRATION_UNCONFIRMED','WEBHOOK_CONTRACT_MISMATCH','WEBHOOK_SECRET_MISSING','UNKNOWN_ENDPOINT'],true))
@@ -117,11 +125,12 @@ function pay_sibil_hook_sync(): void
         }
     });
 }
-function pay_sibil_hook_endpoint(): string
+function pay_sibil_hook_endpoint(): ?string
 {
     pay_sibil_hook_sync();
+    if(set_get('pay_sibilpay_hook_fingerprint','')===pay_sibil_hook_fingerprint()&&set_get('pay_sibilpay_hook_status','')==='polling_only')return '';
     $e=DB::one("SELECT remote_id FROM sibilpay_hook_endpoints WHERE scope=? AND state='ready' AND secret<>''",[pay_sibil_hook_fingerprint()]);
-    return (string)($e['remote_id']??'');
+    return isset($e['remote_id'])?(string)$e['remote_id']:null;
 }
 /** Timestamped endpoint HMAC. Financial authority is still GET invoice + verify. */
 function pay_sibil_hook_receive(string $token,string $raw,string $signature,string $delivery,string $headerEvent): array
@@ -134,6 +143,7 @@ function pay_sibil_hook_receive(string $token,string $raw,string $signature,stri
       ||abs(now_ts()-(int)$m[1])>300||!hash_equals(hash_hmac('sha256',$m[1].'.'.$raw,$ep['secret']),$m[2]))return ['code'=>401];
     $j=json_decode($raw,true);$event=$j['event']??null;
     if(!is_array($j)||!is_string($event)||!preg_match('/^[a-z_.]{1,80}$/D',$event)||($headerEvent!==''&&$event!==$headerEvent)||!preg_match('/^[A-Za-z0-9_-]{4,150}$/D',$delivery))return ['code'=>400];
+    if(!isset($j['data'])&&isset($j['invoice_id']))$j['data']=['id'=>$j['invoice_id'],'order_id'=>$j['order_id']??'','test_mode'=>$j['test_mode']??null];
     return DB::tx(static function()use($ep,$raw,$delivery,$j,$event):array{
         $old=DB::one('SELECT body_hash FROM sibilpay_hook_events WHERE scope=? AND delivery=?',[$ep['scope'],$delivery]);$hash=hash('sha256',$raw);
         if($old)return ['code'=>hash_equals($old['body_hash'],$hash)?200:409];
@@ -149,6 +159,7 @@ function pay_sibil_hook_status_text(): string
 {
     if(set_get('pay_sibilpay_hook_fingerprint','')!==pay_sibil_hook_fingerprint())return '⏳ در حال اتصال';
     return match(set_get('pay_sibilpay_hook_status','')){
+        'polling_only'=>'⚠️ وبهوک در دسترس نیست؛ استعلام خودکار فعال است',
         'registered'=>'✅ ثبت شده',
         'self_registration_failed'=>match(set_get('pay_sibilpay_hook_error','')){
             'LIMIT_REACHED'=>'⚠️ ظرفیت وبهوک‌های این کلید پر است',

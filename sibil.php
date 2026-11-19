@@ -21,7 +21,7 @@
 
 declare(strict_types=1);
 
-const PANEL_VERSION = '3.18.17';
+const PANEL_VERSION = '3.18.18';
 const IRAN_OFFSET   = 3.5 * 3600;
 const DAY           = 86400;
 
@@ -23878,6 +23878,8 @@ function pay_sibil_http(array $profile,string $method,string $path,?array $body=
 function pay_sibil_error(string $code): string
 {
     return match ($code) {
+        'RATE_LIMIT_EXCEEDED'=>'تعداد درخواست‌ها زیاد است؛ یک دقیقه دیگر تلاش کنید.',
+        'INVALID_API_KEY'=>'تنظیمات اتصال درگاه نیازمند بررسی است.',
         'WALLET_INSUFFICIENT'=>'درگاه موقتاً در دسترس نیست؛ کمی بعد تلاش کنید یا روش دیگری انتخاب کنید.',
         'INVALID_TOKEN','KEY_DISABLED','STORE_INACTIVE','STORE_BLOCKED','CONFIG_INVALID'=>'تنظیمات اتصال سیبیل پی نیاز به بررسی پشتیبانی دارد.',
         'NO_CARD_AVAILABLE','AMOUNT_POOL_EXHAUSTED','GATEWAY_DISABLED','UNKNOWN_GATEWAY'=>'درگاه فعلاً امکان ساخت فاکتور ندارد؛ کمی بعد یا با روش دیگری تلاش کنید.',
@@ -23909,8 +23911,14 @@ function pay_sibil_api_timestamp(string $value): int|false {
     }catch(Throwable $e){return false;}
 }
 
+/** Keep the provider's canonical checkout URL; accept documented aliases only when absent. */
+function pay_sibil_invoice_aliases(array $d): array {
+    if(!isset($d['payment_url'])||$d['payment_url']==='')foreach(['pay_url','short_payment_url']as$k)if(is_string($d[$k]??null)&&$d[$k]!==''){$d['payment_url']=$d[$k];break;}
+    return $d;
+}
 function pay_sibil_adopt(array $payment,array $s,array $d,array $profile): bool
 {
+    $d=pay_sibil_invoice_aliases($d);
     $url=(string)($d['payment_url']??'');$u=parse_url($url);$o=parse_url($profile['base']);$rial=(int)$payment['amount']*10;
     $exp=pay_sibil_api_timestamp((string)($d['expires_at']??''));
     if (!is_string($d['id']??null)||!preg_match('/^[A-Za-z0-9_-]{4,120}$/D',$d['id'])
@@ -24006,7 +24014,7 @@ function pay_sibil_start(array $order): array
         $base=pay_sibil_base(set_get('pay_sibilpay_endpoint',''));$key=pay_sibil_key(gw_key('sibilpay'));
         if ($base===''||!preg_match('/^(sibil_pay_live_|sp_live_)[A-Za-z0-9_-]+$/D',$key)) return ['ok'=>false,'url'=>'','text'=>pay_sibil_error('CONFIG_INVALID')];
         $hookEndpoint=pay_sibil_hook_endpoint();
-        if($hookEndpoint==='')return ['ok'=>false,'url'=>'','text'=>'درگاه موقتاً در دسترس نیست؛ کمی بعد تلاش کنید.'];
+        if($hookEndpoint===null)return ['ok'=>false,'url'=>'','text'=>'درگاه موقتاً در دسترس نیست؛ کمی بعد تلاش کنید.'];
         $created=DB::tx(static function()use($order,$base,$key):array {
             $profile=hash('sha256',$base."\n".$key);
             DB::exec('INSERT OR IGNORE INTO sibilpay_connections(id,base,api_key,created_at) VALUES(?,?,?,?)',[$profile,$base,$key,now_ts()]);
@@ -24016,9 +24024,19 @@ function pay_sibil_start(array $order): array
             return [$p,$ref,$profile];
         });
         [$p,$ref,$profileId]=$created;$profile=['base'=>$base,'api_key'=>$key];
-        $body=['webhook_endpoint'=>$hookEndpoint,'amount_rial'=>(int)$p['amount']*10,'order_id'=>$ref,'description'=>'SIBILPANEL '.$ref,'expiry_minutes'=>30];
+        $body=['amount_rial'=>(int)$p['amount']*10,'order_id'=>$ref,'description'=>'SIBILPANEL '.$ref,'expiry_minutes'=>30];
         $callback=pay_callback_url('sibilpay');if (gw_https_url($callback)) $body['callback_url']=$callback.'?order='.rawurlencode($ref);
+        if($hookEndpoint!=='')$body['webhook_endpoint']=$hookEndpoint;
         $res=pay_sibil_http($profile,'POST','/invoices',$body);
+        if(is_array($res['data']??null)){
+            $d=pay_sibil_invoice_aliases($res['data']);$missing=false;
+            foreach(['id','order_id','status','amount_rial','payable_rial','test_mode','expires_at','payment_url']as$k)if(!array_key_exists($k,$d))$missing=true;
+            if($missing){
+                $get=pay_sibil_http($profile,'GET','/invoices/by-order/'.rawurlencode($ref));
+                if(is_array($get['data']??null)&&(!isset($d['id'])||($get['data']['id']??null)===$d['id']))$d=pay_sibil_invoice_aliases($get['data']);
+            }
+            $res['data']=$d;
+        }
         $s=DB::one('SELECT * FROM sibilpay_invoices WHERE payment_id=?',[(int)$p['id']]);
         if (isset($res['data'])&&pay_sibil_adopt($p,$s,$res['data'],$profile)) {
             $s=DB::one('SELECT * FROM sibilpay_invoices WHERE payment_id=?',[(int)$p['id']]);
@@ -24136,8 +24154,10 @@ function pay_sibil_hook_sync(): void
             }
             return $res['data'];
         };
+        $stage='discovery';
         try{
             $list=$request('GET','/hooks/self');
+            $stage='registration';
             if(!is_array($list['endpoints']??null)||!is_string($list['key']??null))throw new RuntimeException('WEBHOOK_CONTRACT_MISMATCH');
             if($fp!==pay_sibil_hook_fingerprint()||!gw_on('sibilpay'))return;
             $saved=DB::one('SELECT * FROM sibilpay_hook_endpoints WHERE scope=?',[$fp]);
@@ -24169,6 +24189,12 @@ function pay_sibil_hook_sync(): void
             try{if($fp===pay_sibil_hook_fingerprint())pay_sibil_cache_storefront($request('GET','/store'));}catch(Throwable $ignored){}
             if($fresh){try{$request('POST','/hooks/self/test',['id'=>$id]);}catch(Throwable $ignored){}}
         }catch(Throwable $e){
+            if($stage==='discovery'&&in_array($e->getMessage(),['NOT_FOUND','HTTP_404','HTTP_502','HTTP_503','HTTP_504','CONNECTION_FAILED'],true)){
+                try{
+                    $gateways=$request('GET','/gateways');
+                    if(array_is_list($gateways)&&count($gateways)>0){pay_sibil_hook_status($fp,'polling_only',60);return;}
+                }catch(Throwable $ignored){}
+            }
             // Preserve last confirmed explicit endpoint during transient metadata failures.
             // Never fall back to another integration's first/default endpoint.
             if(in_array($e->getMessage(),['WEBHOOK_DISABLED','WEBHOOK_REGISTRATION_UNCONFIRMED','WEBHOOK_CONTRACT_MISMATCH','WEBHOOK_SECRET_MISSING','UNKNOWN_ENDPOINT'],true))
@@ -24178,11 +24204,12 @@ function pay_sibil_hook_sync(): void
         }
     });
 }
-function pay_sibil_hook_endpoint(): string
+function pay_sibil_hook_endpoint(): ?string
 {
     pay_sibil_hook_sync();
+    if(set_get('pay_sibilpay_hook_fingerprint','')===pay_sibil_hook_fingerprint()&&set_get('pay_sibilpay_hook_status','')==='polling_only')return '';
     $e=DB::one("SELECT remote_id FROM sibilpay_hook_endpoints WHERE scope=? AND state='ready' AND secret<>''",[pay_sibil_hook_fingerprint()]);
-    return (string)($e['remote_id']??'');
+    return isset($e['remote_id'])?(string)$e['remote_id']:null;
 }
 /** Timestamped endpoint HMAC. Financial authority is still GET invoice + verify. */
 function pay_sibil_hook_receive(string $token,string $raw,string $signature,string $delivery,string $headerEvent): array
@@ -24195,6 +24222,7 @@ function pay_sibil_hook_receive(string $token,string $raw,string $signature,stri
       ||abs(now_ts()-(int)$m[1])>300||!hash_equals(hash_hmac('sha256',$m[1].'.'.$raw,$ep['secret']),$m[2]))return ['code'=>401];
     $j=json_decode($raw,true);$event=$j['event']??null;
     if(!is_array($j)||!is_string($event)||!preg_match('/^[a-z_.]{1,80}$/D',$event)||($headerEvent!==''&&$event!==$headerEvent)||!preg_match('/^[A-Za-z0-9_-]{4,150}$/D',$delivery))return ['code'=>400];
+    if(!isset($j['data'])&&isset($j['invoice_id']))$j['data']=['id'=>$j['invoice_id'],'order_id'=>$j['order_id']??'','test_mode'=>$j['test_mode']??null];
     return DB::tx(static function()use($ep,$raw,$delivery,$j,$event):array{
         $old=DB::one('SELECT body_hash FROM sibilpay_hook_events WHERE scope=? AND delivery=?',[$ep['scope'],$delivery]);$hash=hash('sha256',$raw);
         if($old)return ['code'=>hash_equals($old['body_hash'],$hash)?200:409];
@@ -24210,6 +24238,7 @@ function pay_sibil_hook_status_text(): string
 {
     if(set_get('pay_sibilpay_hook_fingerprint','')!==pay_sibil_hook_fingerprint())return '⏳ در حال اتصال';
     return match(set_get('pay_sibilpay_hook_status','')){
+        'polling_only'=>'⚠️ وبهوک در دسترس نیست؛ استعلام خودکار فعال است',
         'registered'=>'✅ ثبت شده',
         'self_registration_failed'=>match(set_get('pay_sibilpay_hook_error','')){
             'LIMIT_REACHED'=>'⚠️ ظرفیت وبهوک‌های این کلید پر است',
