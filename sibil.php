@@ -21,7 +21,7 @@
 
 declare(strict_types=1);
 
-const PANEL_VERSION = '3.18.18';
+const PANEL_VERSION = '3.18.19';
 const IRAN_OFFSET   = 3.5 * 3600;
 const DAY           = 86400;
 
@@ -23869,12 +23869,20 @@ function pay_sibil_http(array $profile,string $method,string $path,?array $body=
     if ($body!==null) curl_setopt($ch,CURLOPT_POSTFIELDS,$body===[]?'{}':json_encode($body,JSON_THROW_ON_ERROR|JSON_UNESCAPED_UNICODE));
     $ok=curl_exec($ch);$status=(int)curl_getinfo($ch,CURLINFO_HTTP_CODE);curl_close($ch);
     if ($ok===false || $tooLarge) return ['status'=>$status,'code'=>'CONNECTION_FAILED'];
-    $j=json_decode($raw,true);
-    if ($status>=200 && $status<300 && is_array($j) && ($j['success']??null)===true && is_array($j['data']??null)) return ['status'=>$status,'data'=>$j['data']];
-    $code=is_array($j)?($j['error']['code']??''):'';
-    return ['status'=>$status,'code'=>is_string($code)&&preg_match('/^[A-Z0-9_]{1,70}$/D',$code)?$code:'HTTP_'.$status,
-        'definite'=>$status>=400&&$status<500&&is_array($j)&&($j['success']??null)===false];
+    return pay_sibil_decode_api_response($raw,$status);
 }
+/** Accept both documented envelopes, never conflicting explicit failures. */
+function pay_sibil_decode_api_response(string $raw,int $status): array {
+    $j=json_decode($raw,true);
+    $accepted=is_array($j)&&(($j['success']??null)===true||($j['ok']??null)===true)
+        &&(!array_key_exists('success',$j)||is_bool($j['success']))&&(!array_key_exists('ok',$j)||is_bool($j['ok']))
+        &&($j['success']??null)!==false&&($j['ok']??null)!==false;
+    if($status>=200&&$status<300&&$accepted&&is_array($j['data']??null))return ['status'=>$status,'data'=>$j['data']];
+    $err=is_array($j)&&is_array($j['error']??null)?$j['error']:[];$code=$err['code']??'';
+    return ['status'=>$status,'code'=>is_string($code)&&preg_match('/^[A-Z0-9_]{1,70}$/D',$code)?$code:($status>=200&&$status<300?'INVALID_API_RESPONSE':'HTTP_'.$status),
+        'definite'=>$status>=400&&$status<500&&is_array($j)&&(($j['success']??null)===false||($j['ok']??null)===false)];
+}
+
 function pay_sibil_error(string $code): string
 {
     return match ($code) {
@@ -23992,11 +24000,11 @@ function pay_sibil_process(array $payment,bool $forceCheck=false): array
         return $result;
     },['ok'=>false,'state'=>'busy']);
 }
-/** Provider docs18: <=10 rial suffix rounding, never principal loss. */
+/** Docs29/30: a fully paid/manual-confirmed invoice may record only the principal. */
 function pay_sibil_paid_amount_ok(array $d): bool
 {
     if(($d['status']??'')!=='paid'||!is_int($d['amount_rial']??null)||!is_int($d['payable_rial']??null)||!is_int($d['paid_amount_rial']??null))return false;
-    return $d['amount_rial']>0&&$d['payable_rial']>=$d['amount_rial']&&$d['paid_amount_rial']>=$d['amount_rial']&&($d['paid_amount_rial']>=$d['payable_rial']||$d['payable_rial']-$d['paid_amount_rial']<=10);
+    return $d['amount_rial']>0&&$d['payable_rial']>=$d['amount_rial']&&$d['paid_amount_rial']>=$d['amount_rial'];
 }
 function pay_sibil_start(array $order): array
 {
@@ -24027,6 +24035,8 @@ function pay_sibil_start(array $order): array
         $body=['amount_rial'=>(int)$p['amount']*10,'order_id'=>$ref,'description'=>'SIBILPANEL '.$ref,'expiry_minutes'=>30];
         $callback=pay_callback_url('sibilpay');if (gw_https_url($callback)) $body['callback_url']=$callback.'?order='.rawurlencode($ref);
         if($hookEndpoint!=='')$body['webhook_endpoint']=$hookEndpoint;
+        $hook=DB::one('SELECT url FROM sibilpay_hook_endpoints WHERE scope=? AND state=\'ready\' AND secret<>\'\'',[pay_sibil_hook_fingerprint()]);
+        if(is_string($hook['url']??null)&&$hook['url']!=='')$body['webhook_url']=$hook['url'];
         $res=pay_sibil_http($profile,'POST','/invoices',$body);
         if(is_array($res['data']??null)){
             $d=pay_sibil_invoice_aliases($res['data']);$missing=false;
@@ -24214,24 +24224,34 @@ function pay_sibil_hook_endpoint(): ?string
 /** Timestamped endpoint HMAC. Financial authority is still GET invoice + verify. */
 function pay_sibil_hook_receive(string $token,string $raw,string $signature,string $delivery,string $headerEvent): array
 {
-    if(!preg_match('/^[a-f0-9]{64}$/D',$token))return ['code'=>404];
+    if(!preg_match('/^[a-f0-9]{64}$/D',$token))return ['code'=>401];
     $ep=DB::one('SELECT * FROM sibilpay_hook_endpoints WHERE token=?',[$token]);
-    if(!$ep)return ['code'=>404];
+    if(!$ep)return ['code'=>401];
     if(strlen($raw)>262144)return ['code'=>413];
     if(strlen($ep['secret'])<16||!preg_match('/^t=(\d{1,12}),v1=([a-f0-9]{64})$/D',trim($signature),$m)
-      ||abs(now_ts()-(int)$m[1])>300||!hash_equals(hash_hmac('sha256',$m[1].'.'.$raw,$ep['secret']),$m[2]))return ['code'=>401];
+      ||abs(now_ts()-(int)$m[1])>300||!hash_equals(hash_hmac('sha256',$m[1].'.'.$raw,$ep['secret']),$m[2]))return ['code'=>401,'body'=>['ok'=>false,'error'=>'bad_signature']];
     $j=json_decode($raw,true);$event=$j['event']??null;
-    if(!is_array($j)||!is_string($event)||!preg_match('/^[a-z_.]{1,80}$/D',$event)||($headerEvent!==''&&$event!==$headerEvent)||!preg_match('/^[A-Za-z0-9_-]{4,150}$/D',$delivery))return ['code'=>400];
-    if(!isset($j['data'])&&isset($j['invoice_id']))$j['data']=['id'=>$j['invoice_id'],'order_id'=>$j['order_id']??'','test_mode'=>$j['test_mode']??null];
-    return DB::tx(static function()use($ep,$raw,$delivery,$j,$event):array{
+    if(!is_array($j)||!is_string($event)||!preg_match('/^[a-z_.]{1,80}$/D',$event)||($headerEvent!==''&&$event!==$headerEvent))return ['code'=>400];
+    if($delivery==='')$delivery='sha-'.hash('sha256',$raw);
+    if(!preg_match('/^[A-Za-z0-9_-]{4,150}$/D',$delivery))return ['code'=>400];
+    $d=is_array($j['data']??null)?$j['data']:$j;$ref=$d['order_id']??$j['order_id']??'';$payment=null;$s=null;
+    if($event==='invoice.paid'){
+        $s=is_string($ref)?DB::one('SELECT * FROM sibilpay_invoices WHERE order_ref=? AND profile=?',[$ref,$ep['profile']]):null;
+        if(!$s)return ['code'=>200,'body'=>['ok'=>false,'error'=>'unknown_order']];
+        $payment=pay_get((int)$s['payment_id']);
+        if(!$payment)return ['code'=>200,'body'=>['ok'=>false,'error'=>'unknown_order']];
+        if($payment['status']==='paid')return ['code'=>200,'body'=>['ok'=>true,'state'=>'already']];
+        if(!is_int($d['amount_rial']??null)||$d['amount_rial']!==(int)$payment['amount']*10)return ['code'=>200,'body'=>['ok'=>false,'error'=>'amount_mismatch']];
+        $remote=$d['id']??$d['invoice_id']??null;
+        if(!empty($s['remote_id'])&&$remote!==null&&$remote!==$s['remote_id'])return ['code'=>200,'body'=>['ok'=>false,'error'=>'invoice_mismatch']];
+        if(($j['livemode']??null)===false||($d['test_mode']??null)===true)return ['code'=>200,'body'=>['ok'=>false,'error'=>'test_event']];
+    }
+    return DB::tx(static function()use($ep,$raw,$delivery,$j,$event,$ref,$s):array{
         $old=DB::one('SELECT body_hash FROM sibilpay_hook_events WHERE scope=? AND delivery=?',[$ep['scope'],$delivery]);$hash=hash('sha256',$raw);
-        if($old)return ['code'=>hash_equals($old['body_hash'],$hash)?200:409];
+        if($old)return ['code'=>hash_equals($old['body_hash'],$hash)?200:409,'body'=>hash_equals($old['body_hash'],$hash)?['ok'=>true,'state'=>'already']:['ok'=>false,'error'=>'delivery_conflict']];
         DB::exec('INSERT INTO sibilpay_hook_events(scope,delivery,body_hash) VALUES(?,?,?)',[$ep['scope'],$delivery,$hash]);
-        if(in_array($event,['invoice.paid','invoice.verified'],true)&&($j['livemode']??null)!==false&&($j['data']['test_mode']??null)!==true){
-            $ref=(string)($j['data']['order_id']??'');$s=DB::one('SELECT * FROM sibilpay_invoices WHERE order_ref=? AND profile=?',[$ref,$ep['profile']]);
-            if($s&&($s['remote_id']===(string)($j['data']['id']??'')||empty($s['remote_id'])&&in_array($s['state'],['creating','unknown'],true)))pay_sibil_hook_enqueue($ref);
-        }
-        return ['code'=>200];
+        if($event==='invoice.paid'&&$s)pay_sibil_hook_enqueue($ref);
+        return ['code'=>200,'body'=>['ok'=>true,'state'=>$event==='invoice.paid'?'queued':'ignored']];
     });
 }
 function pay_sibil_hook_status_text(): string
@@ -24476,7 +24496,7 @@ function web_handle(): void
         if ($gw === 'sibilpay/webhook' && $method === 'GET') { web_json(200,['service'=>'SIBILPANEL','webhook'=>'sibilpay','ready'=>true]); return; }
         if($gw==='sibilpay/webhook'&&isset($input['get']['hook'])){
             if($method!=='POST'){web_json(405,['ok'=>false]);return;}
-            try{$res=pay_sibil_hook_receive((string)$input['get']['hook'],(string)$input['raw'],web_header('X-SIBILPAY-Signature'),web_header('X-SIBILPAY-Delivery'),web_header('X-SIBILPAY-Event'));web_json($res['code'],['ok'=>$res['code']===200]);}
+            try{$res=pay_sibil_hook_receive((string)$input['get']['hook'],(string)$input['raw'],web_header('X-SIBILPAY-Signature'),web_header('X-SIBILPAY-Delivery'),web_header('X-SIBILPAY-Event'));web_json($res['code'],$res['body']??['ok'=>$res['code']===200]);}
             catch(Throwable $e){web_json(503,['ok'=>false]);}
             return;
         }

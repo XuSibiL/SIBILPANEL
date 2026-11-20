@@ -59,7 +59,7 @@ $id=$s['remote_id'];$real=$invoices[$id];$invoices[$id]['status']='paid';$invoic
 $paid=$invoices[$id];$invoices[$id]['amount_rial']++;pay_sibil_process($p,true);oks(balance_of(901001)===$oldBalance,'wrong amount rejected');$invoices[$id]=$paid;
 $invoices[$id]['order_id']='wrong';pay_sibil_process($p,true);oks(balance_of(901001)===$oldBalance,'wrong remote order rejected');$invoices[$id]=$paid;
 $invoices[$id]['test_mode']=true;pay_sibil_process($p,true);oks(balance_of(901001)===$oldBalance,'test response cannot credit live wallet');$invoices[$id]=$paid;
-$invoices[$id]['paid_amount_rial']=500000;pay_sibil_process($p,true);oks(balance_of(901001)===$oldBalance,'underpayment rejected');$invoices[$id]=$paid;
+$invoices[$id]['paid_amount_rial']=499999;pay_sibil_process($p,true);oks(balance_of(901001)===$oldBalance,'underpayment rejected');$invoices[$id]=$paid;
 $invoices[$id]['payment_url']='https://evil.example.com/pay/'.$id;pay_sibil_process($p,true);oks(balance_of(901001)===$oldBalance,'foreign checkout host rejected');$invoices[$id]=$paid;
 $mode='badverify';pay_sibil_process($p,true);oks(balance_of(901001)===$oldBalance,'wrong verify invoice cannot settle');
 $mode='already';$r=pay_sibil_process($p,true);oks($r['ok']&&balance_of(901001)===$oldBalance+53500,'already-verified payment rechecks API identity and credits configured 7 percent');
@@ -102,4 +102,13 @@ $invoices[$d['id']]['expires_at']=gmdate('Y-m-d\TH:i:s',time()-60).'.901362';DB:
 $countPosts=count(array_filter($calls,fn($c)=>$c[1]==='POST'&&$c[2]==='/invoices'));$expiredRetry=pay_start($recoverOrder,'sibilpay');
 oks(empty($expiredRetry['url'])&&count(array_filter($calls,fn($c)=>$c[1]==='POST'&&$c[2]==='/invoices'))===$countPosts,'expired recovered link is not returned or blindly recreated');
 date_default_timezone_set($oldTz);
+foreach(['success','ok']as$flag){$d=pay_sibil_decode_api_response(json_encode([$flag=>true,'data'=>['id'=>'inv_test']]),201);oks(($d['data']['id']??'')==='inv_test','API envelope '.$flag.' accepted');}
+foreach([['ok'=>true,'success'=>false],['ok'=>false,'success'=>true],['ok'=>'true'],[]]as$bad)oks(!isset(pay_sibil_decode_api_response(json_encode($bad+['data'=>[]]),201)['data']),'conflicting/malformed API envelope rejected');
+$err=pay_sibil_decode_api_response('{"ok":false,"error":{"code":"WALLET_INSUFFICIENT"}}',402);oks(($err['code']??'')==='WALLET_INSUFFICIENT'&&!empty($err['definite']),'ok:false preserves definite wallet rejection');
+$mode='normal';$x=pay_start(so(),'sibilpay');$xp=pay_get((int)$x['payment']);$xs=DB::one('SELECT * FROM sibilpay_invoices WHERE payment_id=?',[$xp['id']]);$bal=balance_of(901001);
+$invoices[$xs['remote_id']]['status']='paid';$invoices[$xs['remote_id']]['paid_amount_rial']=500000;
+$mode='badverify';pay_sibil_process($xp,true);oks(balance_of(901001)===$bal,'principal-paid manual invoice still requires valid verify');
+$mode='normal';$rx=pay_sibil_process($xp,true);pay_sibil_process($xp,true);oks(!empty($rx['ok'])&&balance_of(901001)===$bal+53500,'principal-only manual confirmation settles exactly once with configured cashback');
+$body=end($calls)[3]??[];$creates=array_values(array_filter($calls,fn($c)=>$c[1]==='POST'&&$c[2]==='/invoices'));$body=end($creates)[3];
+oks(str_contains($body['webhook_url']??'','/pay/sibilpay/webhook?hook=')&&str_contains($body['callback_url']??'','/pay/sibilpay?order='),'per-invoice webhook URL distinct from browser callback');
 echo "$pass passed; $fail failed\n";exit($fail?1:0);

@@ -135,24 +135,34 @@ function pay_sibil_hook_endpoint(): ?string
 /** Timestamped endpoint HMAC. Financial authority is still GET invoice + verify. */
 function pay_sibil_hook_receive(string $token,string $raw,string $signature,string $delivery,string $headerEvent): array
 {
-    if(!preg_match('/^[a-f0-9]{64}$/D',$token))return ['code'=>404];
+    if(!preg_match('/^[a-f0-9]{64}$/D',$token))return ['code'=>401];
     $ep=DB::one('SELECT * FROM sibilpay_hook_endpoints WHERE token=?',[$token]);
-    if(!$ep)return ['code'=>404];
+    if(!$ep)return ['code'=>401];
     if(strlen($raw)>262144)return ['code'=>413];
     if(strlen($ep['secret'])<16||!preg_match('/^t=(\d{1,12}),v1=([a-f0-9]{64})$/D',trim($signature),$m)
-      ||abs(now_ts()-(int)$m[1])>300||!hash_equals(hash_hmac('sha256',$m[1].'.'.$raw,$ep['secret']),$m[2]))return ['code'=>401];
+      ||abs(now_ts()-(int)$m[1])>300||!hash_equals(hash_hmac('sha256',$m[1].'.'.$raw,$ep['secret']),$m[2]))return ['code'=>401,'body'=>['ok'=>false,'error'=>'bad_signature']];
     $j=json_decode($raw,true);$event=$j['event']??null;
-    if(!is_array($j)||!is_string($event)||!preg_match('/^[a-z_.]{1,80}$/D',$event)||($headerEvent!==''&&$event!==$headerEvent)||!preg_match('/^[A-Za-z0-9_-]{4,150}$/D',$delivery))return ['code'=>400];
-    if(!isset($j['data'])&&isset($j['invoice_id']))$j['data']=['id'=>$j['invoice_id'],'order_id'=>$j['order_id']??'','test_mode'=>$j['test_mode']??null];
-    return DB::tx(static function()use($ep,$raw,$delivery,$j,$event):array{
+    if(!is_array($j)||!is_string($event)||!preg_match('/^[a-z_.]{1,80}$/D',$event)||($headerEvent!==''&&$event!==$headerEvent))return ['code'=>400];
+    if($delivery==='')$delivery='sha-'.hash('sha256',$raw);
+    if(!preg_match('/^[A-Za-z0-9_-]{4,150}$/D',$delivery))return ['code'=>400];
+    $d=is_array($j['data']??null)?$j['data']:$j;$ref=$d['order_id']??$j['order_id']??'';$payment=null;$s=null;
+    if($event==='invoice.paid'){
+        $s=is_string($ref)?DB::one('SELECT * FROM sibilpay_invoices WHERE order_ref=? AND profile=?',[$ref,$ep['profile']]):null;
+        if(!$s)return ['code'=>200,'body'=>['ok'=>false,'error'=>'unknown_order']];
+        $payment=pay_get((int)$s['payment_id']);
+        if(!$payment)return ['code'=>200,'body'=>['ok'=>false,'error'=>'unknown_order']];
+        if($payment['status']==='paid')return ['code'=>200,'body'=>['ok'=>true,'state'=>'already']];
+        if(!is_int($d['amount_rial']??null)||$d['amount_rial']!==(int)$payment['amount']*10)return ['code'=>200,'body'=>['ok'=>false,'error'=>'amount_mismatch']];
+        $remote=$d['id']??$d['invoice_id']??null;
+        if(!empty($s['remote_id'])&&$remote!==null&&$remote!==$s['remote_id'])return ['code'=>200,'body'=>['ok'=>false,'error'=>'invoice_mismatch']];
+        if(($j['livemode']??null)===false||($d['test_mode']??null)===true)return ['code'=>200,'body'=>['ok'=>false,'error'=>'test_event']];
+    }
+    return DB::tx(static function()use($ep,$raw,$delivery,$j,$event,$ref,$s):array{
         $old=DB::one('SELECT body_hash FROM sibilpay_hook_events WHERE scope=? AND delivery=?',[$ep['scope'],$delivery]);$hash=hash('sha256',$raw);
-        if($old)return ['code'=>hash_equals($old['body_hash'],$hash)?200:409];
+        if($old)return ['code'=>hash_equals($old['body_hash'],$hash)?200:409,'body'=>hash_equals($old['body_hash'],$hash)?['ok'=>true,'state'=>'already']:['ok'=>false,'error'=>'delivery_conflict']];
         DB::exec('INSERT INTO sibilpay_hook_events(scope,delivery,body_hash) VALUES(?,?,?)',[$ep['scope'],$delivery,$hash]);
-        if(in_array($event,['invoice.paid','invoice.verified'],true)&&($j['livemode']??null)!==false&&($j['data']['test_mode']??null)!==true){
-            $ref=(string)($j['data']['order_id']??'');$s=DB::one('SELECT * FROM sibilpay_invoices WHERE order_ref=? AND profile=?',[$ref,$ep['profile']]);
-            if($s&&($s['remote_id']===(string)($j['data']['id']??'')||empty($s['remote_id'])&&in_array($s['state'],['creating','unknown'],true)))pay_sibil_hook_enqueue($ref);
-        }
-        return ['code'=>200];
+        if($event==='invoice.paid'&&$s)pay_sibil_hook_enqueue($ref);
+        return ['code'=>200,'body'=>['ok'=>true,'state'=>$event==='invoice.paid'?'queued':'ignored']];
     });
 }
 function pay_sibil_hook_status_text(): string

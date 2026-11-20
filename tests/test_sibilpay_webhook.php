@@ -62,7 +62,7 @@ Tg::$outbox=[];screen_pay_gateway(1,null,'sibilpay');$last=Tg::$outbox[count(Tg:
 $co=pay_start(create_order(991001,'topup',30000),'sibilpay');$pp=pay_get((int)$co['payment']);$ss=DB::one('SELECT * FROM sibilpay_invoices WHERE payment_id=?',[$pp['id']]);
 $endpoint=DB::one('SELECT * FROM sibilpay_hook_endpoints WHERE scope=?',[pay_sibil_hook_fingerprint()]);
 $invoices[$ss['remote_id']]['status']='paid';$invoices[$ss['remote_id']]['paid_amount_rial']=300127;
-$event=json_encode(['event'=>'invoice.paid','livemode'=>true,'data'=>['id'=>$ss['remote_id'],'order_id'=>$ss['order_ref'],'status'=>'paid']]);
+$event=json_encode(['event'=>'invoice.paid','livemode'=>true,'data'=>['id'=>$ss['remote_id'],'order_id'=>$ss['order_ref'],'status'=>'paid','amount_rial'=>300000]]);
 $t=now_ts();$signature='t='.$t.',v1='.hash_hmac('sha256',$t.'.'.$event,$endpoint['secret']);$bal=balance_of(991001);
 $res=pay_sibil_hook_receive($endpoint['token'],$event,$signature,'whd_live_round_100','invoice.paid');
 h($res['code']===200&&balance_of(991001)===$bal,'signed paid request queues without any financial effect');
@@ -82,7 +82,7 @@ h(pay_sibil_hook_receive($ep['token'],$raw.' ',$sign($raw),'whd_tamper_100','hoo
 DB::exec("UPDATE sibilpay_hook_endpoints SET secret='' WHERE scope=?",[$ep['scope']]);reset_hook();pay_sibil_hook_sync();
 h(($GLOBALS['self_hook_rotations']??0)===1&&DB::val('SELECT secret FROM sibilpay_hook_endpoints WHERE scope=?',[$ep['scope']])!==$ep['secret'],'lost secret rotates only owned endpoint');
 foreach([0,1,5,9,10]as$gap)h(pay_sibil_paid_amount_ok(['status'=>'paid','amount_rial'=>300000,'payable_rial'=>300075,'paid_amount_rial'=>300075-$gap]),'documented suffix gap '.$gap.' accepted');
-h(!pay_sibil_paid_amount_ok(['status'=>'paid','amount_rial'=>300000,'payable_rial'=>300075,'paid_amount_rial'=>300064]),'11 rial gap refused');
+h(pay_sibil_paid_amount_ok(['status'=>'paid','amount_rial'=>300000,'payable_rial'=>300075,'paid_amount_rial'=>300000]),'docs29/30 principal-only manual paid accepted');
 h(!pay_sibil_paid_amount_ok(['status'=>'paid','amount_rial'=>300075,'payable_rial'=>300075,'paid_amount_rial'=>300070]),'principal shortfall refused');
 $mode='hooksfail';reset_hook();pay_sibil_hook_sync();
 $existing=DB::one('SELECT * FROM sibilpay_hook_endpoints WHERE scope=?',[pay_sibil_hook_fingerprint()]);
@@ -104,4 +104,16 @@ set_put('pay_sibilpay_key','sibil_pay_live_OTHER');
 h(pay_sibil_storefront()==='','changed merchant key hides stale storefront cache');
 set_put('pay_sibilpay_endpoint','https://pay.example.test:2053/g/manualshop');
 h(pay_sibil_storefront()==='https://pay.example.test:2053/g/manualshop','legacy stored storefront input remains readable');
+// Restore current endpoint's profile and exercise nested modern ingress precisely.
+set_put('pay_sibilpay_key','sibil_pay_live_TEST');set_put('pay_sibilpay_endpoint','https://pay.example.test:2053');reset_hook();pay_sibil_hook_sync();
+$ep=DB::one('SELECT * FROM sibilpay_hook_endpoints WHERE scope=?',[pay_sibil_hook_fingerprint()]);
+$co=pay_start(create_order(991001,'topup',50000),'sibilpay');$pp=pay_get((int)$co['payment']);$ss=DB::one('SELECT * FROM sibilpay_invoices WHERE payment_id=?',[$pp['id']]);
+$b=['event'=>'invoice.paid','livemode'=>true,'data'=>['id'=>$ss['remote_id'],'order_id'=>$ss['order_ref'],'amount_rial'=>500000,'paid_amount_rial'=>500000,'status'=>'paid','test_mode'=>false]];$raw=json_encode($b);$t=now_ts();$sig='t='.$t.',v1='.hash_hmac('sha256',$t.'.'.$raw,$ep['secret']);
+$r=pay_sibil_hook_receive($ep['token'],$raw,$sig,'','invoice.paid');h(($r['body']['state']??'')==='queued','nested modern event queues without delivery header');
+$r=pay_sibil_hook_receive($ep['token'],$raw,$sig,'','invoice.paid');h(($r['body']['state']??'')==='already','replayed modern event returns already');
+h(pay_sibil_hook_receive($ep['token'],$raw,'t='.$t.',v1='.hash_hmac('sha256',$raw,$ep['secret']),'whd_legacy_reject','invoice.paid')['code']===401,'raw-only legacy signature rejected');
+$b['data']['order_id']='sp-'.str_repeat('f',32);$raw=json_encode($b);$sig='t='.$t.',v1='.hash_hmac('sha256',$t.'.'.$raw,$ep['secret']);$rr=pay_sibil_hook_receive($ep['token'],$raw,$sig,'whd_unknown_new','invoice.paid');h(($rr['body']['error']??'')==='unknown_order','signed unknown order reports logical error rather than fake success');
+$fakeScope=hash('sha256','other-deployment');$otherToken=bin2hex(random_bytes(32));$otherSecret='whsec_'.bin2hex(random_bytes(24));
+DB::exec("INSERT INTO sibilpay_hook_endpoints(scope,profile,token,url,remote_id,secret,state) VALUES(?,?,?,?,?,?,'ready')",[$fakeScope,'different_api_key_profile',$otherToken,'https://other.example/hook','ep_other',$otherSecret]);
+$raw=json_encode(['event'=>'invoice.paid','data'=>['id'=>$ss['remote_id'],'order_id'=>$ss['order_ref'],'amount_rial'=>500000]]);$sig='t='.$t.',v1='.hash_hmac('sha256',$t.'.'.$raw,$otherSecret);$cross=pay_sibil_hook_receive($otherToken,$raw,$sig,'whd_crossdomain','invoice.paid');h(($cross['body']['error']??'')==='unknown_order','valid signature for another deployment cannot bind this invoice');
 echo"$pass passed; $fail failed\n";exit($fail?1:0);

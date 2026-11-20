@@ -96,12 +96,20 @@ function pay_sibil_http(array $profile,string $method,string $path,?array $body=
     if ($body!==null) curl_setopt($ch,CURLOPT_POSTFIELDS,$body===[]?'{}':json_encode($body,JSON_THROW_ON_ERROR|JSON_UNESCAPED_UNICODE));
     $ok=curl_exec($ch);$status=(int)curl_getinfo($ch,CURLINFO_HTTP_CODE);curl_close($ch);
     if ($ok===false || $tooLarge) return ['status'=>$status,'code'=>'CONNECTION_FAILED'];
-    $j=json_decode($raw,true);
-    if ($status>=200 && $status<300 && is_array($j) && ($j['success']??null)===true && is_array($j['data']??null)) return ['status'=>$status,'data'=>$j['data']];
-    $code=is_array($j)?($j['error']['code']??''):'';
-    return ['status'=>$status,'code'=>is_string($code)&&preg_match('/^[A-Z0-9_]{1,70}$/D',$code)?$code:'HTTP_'.$status,
-        'definite'=>$status>=400&&$status<500&&is_array($j)&&($j['success']??null)===false];
+    return pay_sibil_decode_api_response($raw,$status);
 }
+/** Accept both documented envelopes, never conflicting explicit failures. */
+function pay_sibil_decode_api_response(string $raw,int $status): array {
+    $j=json_decode($raw,true);
+    $accepted=is_array($j)&&(($j['success']??null)===true||($j['ok']??null)===true)
+        &&(!array_key_exists('success',$j)||is_bool($j['success']))&&(!array_key_exists('ok',$j)||is_bool($j['ok']))
+        &&($j['success']??null)!==false&&($j['ok']??null)!==false;
+    if($status>=200&&$status<300&&$accepted&&is_array($j['data']??null))return ['status'=>$status,'data'=>$j['data']];
+    $err=is_array($j)&&is_array($j['error']??null)?$j['error']:[];$code=$err['code']??'';
+    return ['status'=>$status,'code'=>is_string($code)&&preg_match('/^[A-Z0-9_]{1,70}$/D',$code)?$code:($status>=200&&$status<300?'INVALID_API_RESPONSE':'HTTP_'.$status),
+        'definite'=>$status>=400&&$status<500&&is_array($j)&&(($j['success']??null)===false||($j['ok']??null)===false)];
+}
+
 function pay_sibil_error(string $code): string
 {
     return match ($code) {
@@ -219,11 +227,11 @@ function pay_sibil_process(array $payment,bool $forceCheck=false): array
         return $result;
     },['ok'=>false,'state'=>'busy']);
 }
-/** Provider docs18: <=10 rial suffix rounding, never principal loss. */
+/** Docs29/30: a fully paid/manual-confirmed invoice may record only the principal. */
 function pay_sibil_paid_amount_ok(array $d): bool
 {
     if(($d['status']??'')!=='paid'||!is_int($d['amount_rial']??null)||!is_int($d['payable_rial']??null)||!is_int($d['paid_amount_rial']??null))return false;
-    return $d['amount_rial']>0&&$d['payable_rial']>=$d['amount_rial']&&$d['paid_amount_rial']>=$d['amount_rial']&&($d['paid_amount_rial']>=$d['payable_rial']||$d['payable_rial']-$d['paid_amount_rial']<=10);
+    return $d['amount_rial']>0&&$d['payable_rial']>=$d['amount_rial']&&$d['paid_amount_rial']>=$d['amount_rial'];
 }
 function pay_sibil_start(array $order): array
 {
@@ -254,6 +262,8 @@ function pay_sibil_start(array $order): array
         $body=['amount_rial'=>(int)$p['amount']*10,'order_id'=>$ref,'description'=>'SIBILPANEL '.$ref,'expiry_minutes'=>30];
         $callback=pay_callback_url('sibilpay');if (gw_https_url($callback)) $body['callback_url']=$callback.'?order='.rawurlencode($ref);
         if($hookEndpoint!=='')$body['webhook_endpoint']=$hookEndpoint;
+        $hook=DB::one('SELECT url FROM sibilpay_hook_endpoints WHERE scope=? AND state=\'ready\' AND secret<>\'\'',[pay_sibil_hook_fingerprint()]);
+        if(is_string($hook['url']??null)&&$hook['url']!=='')$body['webhook_url']=$hook['url'];
         $res=pay_sibil_http($profile,'POST','/invoices',$body);
         if(is_array($res['data']??null)){
             $d=pay_sibil_invoice_aliases($res['data']);$missing=false;
